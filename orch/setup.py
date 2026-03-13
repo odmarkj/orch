@@ -43,12 +43,13 @@ def install_iterm_profile():
     ITERM_DYNAMIC_PROFILES.mkdir(parents=True, exist_ok=True)
     dest = ITERM_DYNAMIC_PROFILES / "orch-iterm2-profile.json"
 
-    # Remove old symlink or back up existing file
-    if dest.is_symlink():
+    # Remove old file (symlink or copy) — keeping a .bak causes duplicate GUID errors
+    if dest.exists() or dest.is_symlink():
         dest.unlink()
-    elif dest.exists():
-        dest.rename(dest.with_suffix(".json.bak"))
-        print(f"  → Backed up existing profile to {dest.with_suffix('.json.bak')}")
+    # Also clean up any stale backup
+    bak = dest.with_suffix(".json.bak")
+    if bak.exists():
+        bak.unlink()
 
     # Copy instead of symlink — iTerm2 does not follow symlinks in DynamicProfiles
     shutil.copy2(PROFILE_SRC, dest)

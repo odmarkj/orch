@@ -153,6 +153,7 @@ def open_input_tab(project: Project) -> None:
         tell application "iTerm2"
             activate
             set orchWindow to missing value
+            set isNewWindow to false
             repeat with w in windows
                 if name of w contains "{window_title}" then
                     set orchWindow to w
@@ -165,18 +166,16 @@ def open_input_tab(project: Project) -> None:
                 on error
                     set orchWindow to (create window with default profile)
                 end try
-                tell orchWindow
-                    tell current session
-                        set name to "{window_title}"
-                    end tell
-                end tell
+                set isNewWindow to true
             end if
             tell orchWindow
-                try
-                    create tab with profile "{profile}"
-                on error
-                    create tab with default profile
-                end try
+                if not isNewWindow then
+                    try
+                        create tab with profile "{profile}"
+                    on error
+                        create tab with default profile
+                    end try
+                end if
                 tell current session
                     set name to "{project_name}"
                     write text "cd {project_path} && {claude_cmd}"
@@ -190,19 +189,23 @@ def open_input_tab(project: Project) -> None:
         script = f"""
         tell application "iTerm2"
             activate
+            set isNewWindow to false
             if (count of windows) is 0 then
                 try
                     create window with profile "{profile}"
                 on error
                     create window with default profile
                 end try
+                set isNewWindow to true
             end if
             tell current window
-                try
-                    create tab with profile "{profile}"
-                on error
-                    create tab with default profile
-                end try
+                if not isNewWindow then
+                    try
+                        create tab with profile "{profile}"
+                    on error
+                        create tab with default profile
+                    end try
+                end if
                 tell current session
                     set name to "{project_name}"
                     write text "cd {project_path} && {claude_cmd}"

@@ -10,7 +10,6 @@ from textual.containers import Container, Horizontal, Vertical
 from textual.reactive import reactive
 from textual.timer import Timer
 from textual.widgets import (
-    Footer,
     Header,
     Label,
     ListItem,
@@ -29,7 +28,7 @@ from .discovery import discover_projects
 from .iterm import notify_input_needed, notify_resumed, clear_stale_handle, open_input_tab
 from .container import (
     clear_stale_container, is_running as container_is_running,
-    ensure_running, exec_claude_in_iterm,
+    ensure_running, exec_claude_in_iterm, stop as container_stop,
 )
 
 
@@ -274,6 +273,7 @@ def _build_iterm_tab_script(*, profile: str, dedicated: bool, window_title: str,
         tell application "iTerm2"
             activate
             set orchWindow to missing value
+            set isNewWindow to false
             repeat with w in windows
                 if name of w contains "{window_title}" then
                     set orchWindow to w
@@ -286,13 +286,16 @@ def _build_iterm_tab_script(*, profile: str, dedicated: bool, window_title: str,
                 on error
                     set orchWindow to (create window with default profile)
                 end try
+                set isNewWindow to true
             end if
             tell orchWindow
-                try
-                    create tab with profile "{profile}"
-                on error
-                    create tab with default profile
-                end try
+                if not isNewWindow then
+                    try
+                        create tab with profile "{profile}"
+                    on error
+                        create tab with default profile
+                    end try
+                end if
                 tell current session
                     set name to "{tab_name}"
                     write text "{cmd}"
@@ -306,19 +309,23 @@ def _build_iterm_tab_script(*, profile: str, dedicated: bool, window_title: str,
         return f"""
         tell application "iTerm2"
             activate
+            set isNewWindow to false
             if (count of windows) is 0 then
                 try
                     create window with profile "{profile}"
                 on error
                     create window with default profile
                 end try
+                set isNewWindow to true
             end if
             tell current window
-                try
-                    create tab with profile "{profile}"
-                on error
-                    create tab with default profile
-                end try
+                if not isNewWindow then
+                    try
+                        create tab with profile "{profile}"
+                    on error
+                        create tab with default profile
+                    end try
+                end if
                 tell current session
                     set name to "{tab_name}"
                     write text "{cmd}"
@@ -384,7 +391,9 @@ class OrchApp(App):
     }
 
     #input-row {
-        height: 3;
+        height: auto;
+        min-height: 3;
+        max-height: 5;
         padding: 0 1;
         border-top: solid $panel;
         layout: horizontal;
@@ -435,9 +444,11 @@ class OrchApp(App):
     BINDINGS = [
         Binding("q", "quit", "Quit"),
         Binding("r", "refresh", "Refresh"),
-        Binding("t", "focus_input", "Task", show=True),
+        Binding("t", "focus_input_task", "Task", show=True),
+        Binding("a", "focus_input_todo", "Add Todo", show=True),
         Binding("e", "exec_shell", "Shell", show=True),
         Binding("c", "container_up", "Container", show=True),
+        Binding("d", "container_down_press", "Down(dd)", show=True),
         Binding("l", "open_logs", "Logs", show=True),
         Binding("p", "open_plan", "Plan", show=True),
         Binding("b", "toggle_bridge", "Bridge", show=True),
@@ -455,6 +466,8 @@ class OrchApp(App):
         self._observer: Observer | None = None
         self._bridge_running = False
         self._input_mode: str = "task"  # "task" or "stage"
+        self._d_pressed: bool = False
+        self._d_timer: Timer | None = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -471,13 +484,17 @@ class OrchApp(App):
                 yield Static("todos", id="right-title")
                 yield Markdown("", id="todos-view")
         yield Static(
-            "[bold]Keybindings[/]\n"
+            "[dim]t[/]ask  [dim]a[/]dd todo  [dim]e[/]xec  [dim]c[/]ontainer  [dim]dd[/] down  "
+            "[dim]l[/]ogs  [dim]p[/]lan  [dim]b[/]ridge  [dim]s[/]tage  "
+            "[dim]i[/]gnore  [dim]r[/]efresh  [dim]q[/]uit  [dim]?[/] toggle help\n"
             "\n"
             "  [bold cyan]j/k[/] [dim]or[/] [bold cyan]arrows[/]  Navigate projects\n"
             "  [bold cyan]Enter[/]          Select project (auto-starts container)\n"
-            "  [bold cyan]t[/]              Send task to Claude in container\n"
+            "  [bold cyan]t[/]              Send task to Claude (fire-and-forget)\n"
+            "  [bold cyan]a[/]              Add todo to TODOS.md\n"
             "  [bold cyan]e[/]              Open iTerm2 tab with Claude (host)\n"
             "  [bold cyan]c[/]              Open iTerm2 tab with Claude (container)\n"
+            "  [bold cyan]dd[/]             Stop and remove container (double-press)\n"
             "  [bold cyan]l[/]              Tail docker logs in iTerm2 tab\n"
             "  [bold cyan]p[/]              Generate day plan in iTerm2 tab\n"
             "  [bold cyan]b[/]              Toggle mobile web bridge on/off\n"
@@ -489,9 +506,7 @@ class OrchApp(App):
             "  [bold cyan]Esc[/]            Cancel input",
             id="help-bar",
             markup=True,
-            classes="hidden",
         )
-        yield Footer()
 
     def on_mount(self) -> None:
         self.projects = discover_projects()
@@ -669,18 +684,36 @@ class OrchApp(App):
 
     # ── Actions ──────────────────────────────────────────────────────────────
 
+    @property
+    def _input_focused(self) -> bool:
+        """True when the task input box has focus — suppress keybindings."""
+        return isinstance(self.focused, Input)
+
     def action_refresh(self) -> None:
         """Rescan ~/Sites for new/removed projects."""
+        if self._input_focused: return
         self.projects = discover_projects()
         self._populate_list()
         if self.selected_project:
             self._refresh_panes()
         self.notify("Projects refreshed")
 
-    def action_focus_input(self) -> None:
+    def action_focus_input_task(self) -> None:
+        if self._input_focused: return
         self._input_mode = "task"
         inp = self.query_one("#task-input", Input)
         inp.placeholder = "Send task to Claude… (Enter to send, Esc to cancel)"
+        inp.focus()
+
+    def action_focus_input_todo(self) -> None:
+        if self._input_focused: return
+        p = self.selected_project
+        if not p:
+            self.notify("No project selected", severity="warning")
+            return
+        self._input_mode = "todo"
+        inp = self.query_one("#task-input", Input)
+        inp.placeholder = "Add todo… (Enter to add, Esc to cancel)"
         inp.focus()
 
     def action_blur_input(self) -> None:
@@ -692,6 +725,7 @@ class OrchApp(App):
 
     def action_ignore_project(self) -> None:
         """Ignore the selected project so it no longer appears in orch."""
+        if self._input_focused: return
         p = self.selected_project
         if not p:
             self.notify("No project selected", severity="warning")
@@ -702,11 +736,13 @@ class OrchApp(App):
         self.action_refresh()
 
     def action_toggle_help(self) -> None:
+        if self._input_focused: return
         bar = self.query_one("#help-bar")
         bar.toggle_class("hidden")
 
     def action_container_up(self) -> None:
         """Open an iTerm2 tab with Claude running inside the container."""
+        if self._input_focused: return
         p = self.selected_project
         if not p:
             self.notify("No project selected", severity="warning")
@@ -726,8 +762,44 @@ class OrchApp(App):
 
         self.run_worker(_launch, thread=True)
 
+    def action_container_down_press(self) -> None:
+        """First d press primes, second d within 0.5s stops the container."""
+        if self._input_focused: return
+        if self._d_pressed:
+            # Second press — execute
+            self._d_pressed = False
+            if self._d_timer:
+                self._d_timer.stop()
+                self._d_timer = None
+            self._do_container_down()
+        else:
+            # First press — prime and start timeout
+            self._d_pressed = True
+            self.notify("Press [bold]d[/] again to stop container", markup=True)
+            self._d_timer = self.set_timer(0.8, self._reset_d_press)
+
+    def _reset_d_press(self) -> None:
+        self._d_pressed = False
+        self._d_timer = None
+
+    def _do_container_down(self) -> None:
+        """Stop and remove the container for the selected project."""
+        p = self.selected_project
+        if not p:
+            self.notify("No project selected", severity="warning")
+            return
+        if not container_is_running(p):
+            self.notify(f"No container running for {p.name}", severity="warning")
+            return
+
+        container_stop(p)
+        self.notify(f"Container stopped for {p.name}")
+        self._refresh_project_item(p)
+        self._refresh_panes()
+
     def action_exec_shell(self) -> None:
         """Open an iTerm2 tab with Claude on the host (no container)."""
+        if self._input_focused: return
         p = self.selected_project
         if not p:
             self.notify("No project selected", severity="warning")
@@ -748,6 +820,7 @@ class OrchApp(App):
         self.run_worker(_open, thread=True)
 
     def action_open_logs(self) -> None:
+        if self._input_focused: return
         p = self.selected_project
         if not p:
             self.notify("No project selected", severity="warning")
@@ -769,6 +842,7 @@ class OrchApp(App):
 
     def action_open_plan(self) -> None:
         """Open day plan in an iTerm2 tab."""
+        if self._input_focused: return
         pane = self.query_one("#status-pane", StatusPane)
         pane.start_spinner("Generating day plan — calling Claude API")
 
@@ -793,6 +867,7 @@ class OrchApp(App):
 
     def action_toggle_bridge(self) -> None:
         """Toggle the mobile web bridge on/off."""
+        if self._input_focused: return
         from .bridge import start_bridge, stop_bridge, bridge_running
         if bridge_running():
             stop_bridge()
@@ -808,6 +883,7 @@ class OrchApp(App):
 
     def action_set_stage(self) -> None:
         """Prompt for a new stage via the input bar."""
+        if self._input_focused: return
         p = self.selected_project
         if not p:
             self.notify("No project selected", severity="warning")
@@ -826,6 +902,8 @@ class OrchApp(App):
 
         if self._input_mode == "stage":
             self._handle_stage_input(self.selected_project, value)
+        elif self._input_mode == "todo":
+            self._add_todo(self.selected_project, value)
         else:
             self._send_task(self.selected_project, value)
 
@@ -857,31 +935,50 @@ class OrchApp(App):
 
     def _send_task(self, project: Project, task: str) -> None:
         """
-        Write task to .claude/pending_task AND launch Claude in the container
-        with the task as the initial prompt so it actually gets executed.
+        Fire-and-forget: run Claude headlessly in the container with the task.
+        No iTerm tab — Claude runs in the background. Status dot updates as it works.
         """
-        pending = project.claude_dir / "pending_task"
-        pending.write_text(task)
-
-        # Launch Claude in container with the task as the prompt
         cid = container_is_running(project)
-        if cid:
-            from .container import _send_task_to_container
-            pane = self.query_one("#status-pane", StatusPane)
-            pane.start_spinner("Sending task to Claude", project)
+        if not cid:
+            # Write to pending_task for pickup when a session starts
+            project.claude_dir.mkdir(parents=True, exist_ok=True)
+            (project.claude_dir / "pending_task").write_text(task)
+            self.notify(f"Task queued for {project.name} (no container — will run on next session)")
+            return
 
-            def _send():
-                try:
-                    _send_task_to_container(project, task)
-                    self.call_from_thread(self._stop_spinner_and_refresh, project,
-                                          f"Task sent to {project.name}")
-                except Exception as e:
-                    self.call_from_thread(self._stop_spinner_and_refresh, project,
-                                          f"Task failed: {e}", "error")
+        from .container import _run_task_headless
+        pane = self.query_one("#status-pane", StatusPane)
+        pane.start_spinner("Running task in background", project)
 
-            self.run_worker(_send, thread=True)
+        def _run():
+            try:
+                _run_task_headless(project, task)
+                self.call_from_thread(self._stop_spinner_and_refresh, project,
+                                      f"Task running for {project.name}")
+            except Exception as e:
+                self.call_from_thread(self._stop_spinner_and_refresh, project,
+                                      f"Task failed: {e}", "error")
+
+        self.run_worker(_run, thread=True)
+
+    def _add_todo(self, project: Project, text: str) -> None:
+        """Append a todo item to the project's TODOS.md."""
+        todos_file = project.path / "TODOS.md"
+        if not todos_file.exists():
+            todos_file.write_text("## Pending\n")
+
+        content = todos_file.read_text()
+
+        # Insert under ## Pending section, or append at end
+        new_item = f"- [ ] {text}\n"
+        if "## Pending" in content:
+            content = content.replace("## Pending\n", f"## Pending\n{new_item}", 1)
         else:
-            self.notify(f"Task queued for {project.name} (no container running)")
+            content = f"## Pending\n{new_item}\n" + content
+
+        todos_file.write_text(content)
+        self.notify(f"Todo added to {project.name}")
+        self._refresh_panes()
 
     def on_unmount(self) -> None:
         if self._observer:

@@ -183,11 +183,16 @@ def _ensure_devcontainer_json(project: "Project") -> Path:
             container_env[var] = host_val
     config["containerEnv"] = container_env
 
-    # Add mounts for .claude config
+    # Mount Claude config and auth from host so container skips login/setup
     claude_host = Path.home() / ".claude"
+    claude_json = Path.home() / ".claude.json"
     config["mounts"] = [
         f"source={claude_host},target={CONTAINER_HOME}/.claude,type=bind",
     ]
+    if claude_json.exists():
+        config["mounts"].append(
+            f"source={claude_json},target={CONTAINER_HOME}/.claude.json,type=bind"
+        )
 
     dc_json.write_text(json.dumps(config, indent=2) + "\n")
     return dc_json
@@ -274,14 +279,21 @@ def _docker_run(project: "Project") -> str:
             env_args += ["-e", f"{var}={val}"]
 
     claude_host = Path.home() / ".claude"
+    claude_json = Path.home() / ".claude.json"
+
+    mount_args = [
+        "-v", f"{project.path}:{WORKSPACE_DIR}",
+        "-v", f"{claude_host}:{CONTAINER_HOME}/.claude",
+    ]
+    if claude_json.exists():
+        mount_args += ["-v", f"{claude_json}:{CONTAINER_HOME}/.claude.json"]
 
     cmd = [
         "docker", "run", "-d",
         "--name", container_name,
         f"--memory={memory}",
         f"--memory-swap={memory}",
-        "-v", f"{project.path}:{WORKSPACE_DIR}",
-        "-v", f"{claude_host}:{CONTAINER_HOME}/.claude",
+    ] + mount_args + [
         "-w", WORKSPACE_DIR,
         "--label", f"devcontainer.local_folder={project.path}",
         "--label", "orch.managed=true",
@@ -326,17 +338,61 @@ def _install_claude_in_container(cid: str) -> None:
 
 # ── Permission setup ─────────────────────────────────────────────────────────
 
-def _setup_permissions(cid: str) -> None:
-    """Write settings.local.json inside the container to allow all Claude tools."""
+def _setup_permissions(cid: str, project: "Project | None" = None) -> None:
+    """Write settings.local.json and mark onboarding complete inside the container."""
     settings_json = json.dumps(SETTINGS_LOCAL, indent=2)
+    workdir = _container_workdir(cid, project)
 
-    # Write to the project's .claude dir inside the container
+    # Write to the project's .claude dir inside the container (as vscode user)
     subprocess.run(
-        ["docker", "exec", cid, "bash", "-c",
-         f"mkdir -p {WORKSPACE_DIR}/.claude && "
-         f"cat > {WORKSPACE_DIR}/.claude/settings.local.json << 'ORCHEOF'\n"
+        ["docker", "exec", "-u", CONTAINER_USER, cid, "bash", "-c",
+         f"mkdir -p {workdir}/.claude && "
+         f"cat > {workdir}/.claude/settings.local.json << 'ORCHEOF'\n"
          f"{settings_json}\n"
          f"ORCHEOF"],
+        capture_output=True,
+        timeout=10,
+    )
+
+    # Merge onboarding flags into the user-level .claude.json so Claude
+    # doesn't prompt for theme, subscription, or dangerous-mode acceptance.
+    # The host ~/.claude.json is mounted at $HOME/.claude.json but Claude
+    # also reads $CLAUDE_CONFIG_DIR/.claude.json — patch both.
+    _mark_onboarding_complete(cid, f"{CONTAINER_HOME}/.claude.json")
+    _mark_onboarding_complete(cid, f"{CONTAINER_HOME}/.claude/.claude.json")
+
+
+def _mark_onboarding_complete(cid: str, config_path: str) -> None:
+    """Ensure hasCompletedOnboarding and related flags are set in a Claude config file."""
+    # Read existing config
+    result = subprocess.run(
+        ["docker", "exec", "-u", CONTAINER_USER, cid, "cat", config_path],
+        capture_output=True, text=True,
+    )
+    try:
+        data = json.loads(result.stdout) if result.returncode == 0 else {}
+    except json.JSONDecodeError:
+        data = {}
+
+    # Set onboarding flags
+    changed = False
+    for key, val in [
+        ("hasCompletedOnboarding", True),
+        ("theme", "dark"),
+        ("hasAcknowledgedCostThreshold", True),
+        ("bypassTrustPromptWorkspaces", True),
+    ]:
+        if data.get(key) != val:
+            data[key] = val
+            changed = True
+
+    if not changed:
+        return
+
+    patched = json.dumps(data, indent=2)
+    subprocess.run(
+        ["docker", "exec", "-u", CONTAINER_USER, cid, "bash", "-c",
+         f"cat > {config_path} << 'ORCHEOF'\n{patched}\nORCHEOF"],
         capture_output=True,
         timeout=10,
     )
@@ -368,7 +424,7 @@ def ensure_running(project: "Project") -> str:
         cid = _docker_run(project)
 
     # Set up permissions inside the container
-    _setup_permissions(cid)
+    _setup_permissions(cid, project)
 
     # Track the container ID
     project.claude_dir.mkdir(parents=True, exist_ok=True)
@@ -402,14 +458,59 @@ def _build_claude_args(project: "Project") -> str:
     return args
 
 
+def _container_workdir(cid: str, project: "Project | None" = None) -> str:
+    """Detect the workspace directory inside a running container."""
+    # 1. Check WorkingDir from image/container config
+    result = subprocess.run(
+        ["docker", "inspect", "--format", "{{.Config.WorkingDir}}", cid],
+        capture_output=True, text=True,
+    )
+    workdir = result.stdout.strip()
+    if workdir:
+        return workdir
+
+    # 2. Map host project path to container mount path
+    #    Docker Desktop on macOS prefixes sources with /host_mnt, so we
+    #    normalise both sides before comparing.
+    if project:
+        result = subprocess.run(
+            ["docker", "inspect", "--format",
+             "{{range .Mounts}}{{.Source}}\t{{.Destination}}\n{{end}}", cid],
+            capture_output=True, text=True,
+        )
+        host_path = str(project.path)
+        for line in result.stdout.strip().splitlines():
+            parts = line.strip().split("\t")
+            if len(parts) != 2:
+                continue
+            src, dest = parts
+            # Strip /host_mnt prefix that Docker Desktop adds on macOS
+            norm_src = src.removeprefix("/host_mnt")
+            if host_path.startswith(norm_src) and norm_src != "/":
+                relative = host_path[len(norm_src):].lstrip("/")
+                return f"{dest}/{relative}" if relative else dest
+
+    # 3. Fallback: ask the container what exists
+    for path in [WORKSPACE_DIR, "/workspaces"]:
+        check = subprocess.run(
+            ["docker", "exec", cid, "test", "-d", path],
+            capture_output=True,
+        )
+        if check.returncode == 0:
+            return path
+
+    return WORKSPACE_DIR
+
+
 def exec_cmd(project: "Project") -> str:
     """
     Return the docker exec command string to run claude inside the container.
     Ensures the container is running first.
     """
     cid = ensure_running(project)
+    workdir = _container_workdir(cid, project)
     args = _build_claude_args(project)
-    return f"docker exec -it {cid} claude {args}"
+    return f"docker exec -it -u {CONTAINER_USER} -w {workdir} {cid} claude {args}"
 
 
 # ── iTerm2 integration ───────────────────────────────────────────────────────
@@ -431,8 +532,9 @@ def exec_claude_in_iterm(project: "Project") -> None:
 
     # Ensure container is running
     cid = ensure_running(project)
+    workdir = _container_workdir(cid, project)
     args = _build_claude_args(project)
-    claude_cmd = f"docker exec -it {cid} claude {args}"
+    claude_cmd = f"docker exec -it -u {CONTAINER_USER} -w {workdir} {cid} claude {args}"
 
     cfg = _load_config()
     profile = cfg["iterm"].get("profile", "orch")
@@ -445,6 +547,7 @@ def exec_claude_in_iterm(project: "Project") -> None:
         tell application "iTerm2"
             activate
             set orchWindow to missing value
+            set isNewWindow to false
             repeat with w in windows
                 if name of w contains "{window_title}" then
                     set orchWindow to w
@@ -457,18 +560,16 @@ def exec_claude_in_iterm(project: "Project") -> None:
                 on error
                     set orchWindow to (create window with default profile)
                 end try
-                tell orchWindow
-                    tell current session
-                        set name to "{window_title}"
-                    end tell
-                end tell
+                set isNewWindow to true
             end if
             tell orchWindow
-                try
-                    create tab with profile "{profile}"
-                on error
-                    create tab with default profile
-                end try
+                if not isNewWindow then
+                    try
+                        create tab with profile "{profile}"
+                    on error
+                        create tab with default profile
+                    end try
+                end if
                 tell current session
                     set name to "{tab_name}"
                     write text "{claude_cmd}"
@@ -482,19 +583,23 @@ def exec_claude_in_iterm(project: "Project") -> None:
         script = f"""
         tell application "iTerm2"
             activate
+            set isNewWindow to false
             if (count of windows) is 0 then
                 try
                     create window with profile "{profile}"
                 on error
                     create window with default profile
                 end try
+                set isNewWindow to true
             end if
             tell current window
-                try
-                    create tab with profile "{profile}"
-                on error
-                    create tab with default profile
-                end try
+                if not isNewWindow then
+                    try
+                        create tab with profile "{profile}"
+                    on error
+                        create tab with default profile
+                    end try
+                end if
                 tell current session
                     set name to "{tab_name}"
                     write text "{claude_cmd}"
@@ -519,11 +624,12 @@ def _send_task_to_container(project: "Project", task: str) -> None:
     from .iterm import _load_config, _run_iterm_script
 
     cid = ensure_running(project)
+    workdir = _container_workdir(cid, project)
 
     # Escape single quotes in the task for shell safety
     safe_task = task.replace("'", "'\\''")
     args = _build_claude_args(project)
-    claude_cmd = f"docker exec -it {cid} claude {args} -p '{safe_task}'"
+    claude_cmd = f"docker exec -it -u {CONTAINER_USER} -w {workdir} {cid} claude {args} -p '{safe_task}'"
 
     cfg = _load_config()
     profile = cfg["iterm"].get("profile", "orch")
@@ -536,6 +642,7 @@ def _send_task_to_container(project: "Project", task: str) -> None:
         tell application "iTerm2"
             activate
             set orchWindow to missing value
+            set isNewWindow to false
             repeat with w in windows
                 if name of w contains "{window_title}" then
                     set orchWindow to w
@@ -548,18 +655,16 @@ def _send_task_to_container(project: "Project", task: str) -> None:
                 on error
                     set orchWindow to (create window with default profile)
                 end try
-                tell orchWindow
-                    tell current session
-                        set name to "{window_title}"
-                    end tell
-                end tell
+                set isNewWindow to true
             end if
             tell orchWindow
-                try
-                    create tab with profile "{profile}"
-                on error
-                    create tab with default profile
-                end try
+                if not isNewWindow then
+                    try
+                        create tab with profile "{profile}"
+                    on error
+                        create tab with default profile
+                    end try
+                end if
                 tell current session
                     set name to "{tab_name}"
                     write text "{claude_cmd}"
@@ -571,19 +676,23 @@ def _send_task_to_container(project: "Project", task: str) -> None:
         script = f"""
         tell application "iTerm2"
             activate
+            set isNewWindow to false
             if (count of windows) is 0 then
                 try
                     create window with profile "{profile}"
                 on error
                     create window with default profile
                 end try
+                set isNewWindow to true
             end if
             tell current window
-                try
-                    create tab with profile "{profile}"
-                on error
-                    create tab with default profile
-                end try
+                if not isNewWindow then
+                    try
+                        create tab with profile "{profile}"
+                    on error
+                        create tab with default profile
+                    end try
+                end if
                 tell current session
                     set name to "{tab_name}"
                     write text "{claude_cmd}"
@@ -593,3 +702,28 @@ def _send_task_to_container(project: "Project", task: str) -> None:
         """
 
     _run_iterm_script(script)
+
+
+def _run_task_headless(project: "Project", task: str) -> None:
+    """
+    Run Claude headlessly in the container with a task — no terminal window.
+    Uses `docker exec -d` (detached) so it runs in the background.
+    Claude writes status to .claude/status as it works.
+    """
+    cid = ensure_running(project)
+    workdir = _container_workdir(cid, project)
+
+    safe_task = task.replace("'", "'\\''")
+    args = _build_claude_args(project)
+
+    # -d = detached (runs in background inside the container)
+    subprocess.run(
+        ["docker", "exec", "-d",
+         "-u", CONTAINER_USER,
+         "-w", workdir,
+         cid, "bash", "-c",
+         f"claude {args} -p '{safe_task}'"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )

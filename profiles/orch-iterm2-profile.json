@@ -2,7 +2,7 @@
   "Profiles": [
     {
       "Name": "orch",
-      "Guid": "ADBE4C7E-C039-4483-B747-45D96EED04F2",
+      "Guid": "608A8F23-791A-4322-9C2F-758E783E2C14",
 
       "Comment": "Orch session profile — edit this file and save to apply changes instantly. No iTerm2 restart needed.",
 
