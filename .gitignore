@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+
+# macOS
+.DS_Store
+
+# Curated Context plugin (session data)
+.curated-context/
+
+# Claude session data (local only)
+.claude/
+
+# Orch local lifecycle (per-project, committed individually)
+# .orch/ is committed — it holds project.toml
