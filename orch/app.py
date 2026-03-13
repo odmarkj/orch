@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 from pathlib import Path
 from typing import Callable
 
@@ -7,6 +8,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
 from textual.reactive import reactive
+from textual.timer import Timer
 from textual.widgets import (
     Footer,
     Header,
@@ -38,6 +40,41 @@ INDICATOR = {
     "waiting": "[bold yellow]●[/]",
     "idle":    "[dim]○[/]",
 }
+
+# ── Spinner words (Claude-style) ─────────────────────────────────────────────
+
+SPINNER_WORDS = [
+    "Initializing",
+    "Conjuring",
+    "Percolating",
+    "Synthesizing",
+    "Calibrating",
+    "Manifesting",
+    "Bootstrapping",
+    "Assembling",
+    "Wrangling",
+    "Contemplating",
+    "Orchestrating",
+    "Compiling",
+    "Channeling",
+    "Transmuting",
+    "Fermenting",
+    "Galvanizing",
+    "Combusting",
+    "Flummoxing",
+    "Rummaging",
+    "Machinating",
+    "Coalescing",
+    "Ruminating",
+    "Perambulating",
+    "Confabulating",
+    "Amalgamating",
+    "Deliberating",
+    "Cogitating",
+    "Extrapolating",
+    "Triangulating",
+    "Incubating",
+]
 
 CONTAINER_ICON = "[bold blue]■[/]"
 CONTAINER_ICON_OFF = "[dim]□[/]"
@@ -93,7 +130,51 @@ class StatusPane(Static):
     }
     """
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._spinner_timer: Timer | None = None
+        self._spinner_label: str = ""
+        self._spinner_project: Project | None = None
+        self._spinner_words = list(SPINNER_WORDS)
+
+    def start_spinner(self, label: str, project: Project | None = None) -> None:
+        """Start showing a rotating activity spinner."""
+        self._spinner_label = label
+        self._spinner_project = project
+        random.shuffle(self._spinner_words)
+        self._spinner_idx = 0
+        self._update_spinner()
+        if self._spinner_timer is None:
+            self._spinner_timer = self.set_interval(1.5, self._update_spinner)
+
+    def stop_spinner(self) -> None:
+        """Stop the activity spinner."""
+        if self._spinner_timer is not None:
+            self._spinner_timer.stop()
+            self._spinner_timer = None
+        self._spinner_label = ""
+        self._spinner_project = None
+
+    @property
+    def is_spinning(self) -> bool:
+        return self._spinner_timer is not None
+
+    def _update_spinner(self) -> None:
+        word = self._spinner_words[self._spinner_idx % len(self._spinner_words)]
+        self._spinner_idx += 1
+        frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+        frame = frames[self._spinner_idx % len(frames)]
+        name = f" [bold]{self._spinner_project.name}[/]" if self._spinner_project else ""
+        self.update(
+            f"[bold yellow]{frame}[/] [italic]{word}...[/]{name}\n\n"
+            f"[dim]{self._spinner_label}[/]"
+        )
+
     def update_project(self, project: Project | None) -> None:
+        # Don't overwrite an active spinner
+        if self.is_spinning:
+            return
+
         if project is None:
             self.update("[dim]No project selected[/]")
             return
@@ -137,10 +218,9 @@ class StatusPane(Static):
 def _open_log_tab(project: Project) -> None:
     """
     Open an iTerm2 tab running `orch logs <project>`.
-    Uses the orch profile so it's visually distinct.
     Reuses an existing log tab for this project if one is open.
     """
-    from .iterm import _load_config, _bring_tab_to_front
+    from .iterm import _load_config, _bring_tab_to_front, _run_iterm_script
 
     handle_file = project.claude_dir / "iterm_log_handle"
 
@@ -157,53 +237,12 @@ def _open_log_tab(project: Project) -> None:
     tab_name     = f"{project.name} logs"
     cmd          = f"orch logs {project.name}"
 
-    if dedicated:
-        script = f"""
-        tell application "iTerm2"
-            activate
-            set orchWindow to missing value
-            repeat with w in windows
-                if name of w contains "{window_title}" then
-                    set orchWindow to w
-                    exit repeat
-                end if
-            end repeat
-            if orchWindow is missing value then
-                set orchWindow to (create window with profile "{profile}")
-            end if
-            tell orchWindow
-                create tab with profile "{profile}"
-                tell current session
-                    set name to "{tab_name}"
-                    write text "{cmd}"
-                    set thetty to tty
-                end tell
-            end tell
-            return thetty
-        end tell
-        """
-    else:
-        script = f"""
-        tell application "iTerm2"
-            activate
-            if (count of windows) is 0 then
-                create window with profile "{profile}"
-            end if
-            tell current window
-                create tab with profile "{profile}"
-                tell current session
-                    set name to "{tab_name}"
-                    write text "{cmd}"
-                    set thetty to tty
-                end tell
-            end tell
-            return thetty
-        end tell
-        """
+    script = _build_iterm_tab_script(
+        profile=profile, dedicated=dedicated, window_title=window_title,
+        tab_name=tab_name, cmd=cmd,
+    )
 
-    import subprocess
-    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
-    tty = result.stdout.strip()
+    tty = _run_iterm_script(script)
     if tty:
         handle_file.write_text(tty)
 
@@ -212,15 +251,26 @@ def _open_log_tab(project: Project) -> None:
 
 def _open_plan_tab() -> None:
     """Open an iTerm2 tab running `orch plan`."""
-    from .iterm import _load_config
+    from .iterm import _load_config, _run_iterm_script
 
     cfg          = _load_config()
     profile      = cfg["iterm"].get("profile", "orch")
     dedicated    = cfg["iterm"].get("dedicated_window", True)
     window_title = cfg["iterm"].get("window_title", "orch sessions")
 
+    script = _build_iterm_tab_script(
+        profile=profile, dedicated=dedicated, window_title=window_title,
+        tab_name="day plan", cmd="orch plan",
+    )
+
+    _run_iterm_script(script)
+
+
+def _build_iterm_tab_script(*, profile: str, dedicated: bool, window_title: str,
+                             tab_name: str, cmd: str) -> str:
+    """Build AppleScript to open an iTerm2 tab with profile fallback."""
     if dedicated:
-        script = f"""
+        return f"""
         tell application "iTerm2"
             activate
             set orchWindow to missing value
@@ -231,13 +281,21 @@ def _open_plan_tab() -> None:
                 end if
             end repeat
             if orchWindow is missing value then
-                set orchWindow to (create window with profile "{profile}")
+                try
+                    set orchWindow to (create window with profile "{profile}")
+                on error
+                    set orchWindow to (create window with default profile)
+                end try
             end if
             tell orchWindow
-                create tab with profile "{profile}"
+                try
+                    create tab with profile "{profile}"
+                on error
+                    create tab with default profile
+                end try
                 tell current session
-                    set name to "day plan"
-                    write text "orch plan"
+                    set name to "{tab_name}"
+                    write text "{cmd}"
                     set thetty to tty
                 end tell
             end tell
@@ -245,26 +303,31 @@ def _open_plan_tab() -> None:
         end tell
         """
     else:
-        script = f"""
+        return f"""
         tell application "iTerm2"
             activate
             if (count of windows) is 0 then
-                create window with profile "{profile}"
+                try
+                    create window with profile "{profile}"
+                on error
+                    create window with default profile
+                end try
             end if
             tell current window
-                create tab with profile "{profile}"
+                try
+                    create tab with profile "{profile}"
+                on error
+                    create tab with default profile
+                end try
                 tell current session
-                    set name to "day plan"
-                    write text "orch plan"
+                    set name to "{tab_name}"
+                    write text "{cmd}"
                     set thetty to tty
                 end tell
             end tell
             return thetty
         end tell
         """
-
-    import subprocess
-    subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
 
 
 # ── Main App ──────────────────────────────────────────────────────────────────
@@ -426,6 +489,7 @@ class OrchApp(App):
             "  [bold cyan]Esc[/]            Cancel input",
             id="help-bar",
             markup=True,
+            classes="hidden",
         )
         yield Footer()
 
@@ -558,25 +622,31 @@ class OrchApp(App):
         if container_is_running(project):
             return
 
+        # Start the spinner
+        pane = self.query_one("#status-pane", StatusPane)
+        pane.start_spinner("Starting container — pulling image, installing tools", project)
+
         def _start():
             try:
                 cid = ensure_running(project)
-                self.call_from_thread(
-                    self.notify,
-                    f"Container ready for {project.name} ({cid[:12]})",
-                )
-                # Refresh the project item to show container icon
-                self.call_from_thread(self._refresh_project_item, project)
-                if self.selected_project and self.selected_project.path == project.path:
-                    self.call_from_thread(self._refresh_panes)
+                self.call_from_thread(self._stop_spinner_and_refresh, project,
+                                      f"Container ready for {project.name} ({cid[:12]})")
             except Exception as e:
-                self.call_from_thread(
-                    self.notify,
-                    f"Container failed for {project.name}: {e}",
-                    severity="error",
-                )
+                self.call_from_thread(self._stop_spinner_and_refresh, project,
+                                      f"Container failed for {project.name}: {e}",
+                                      "error")
 
         self.run_worker(_start, thread=True)
+
+    def _stop_spinner_and_refresh(self, project: Project, message: str,
+                                   severity: str = "information") -> None:
+        """Stop the spinner, show a notification, and refresh the UI."""
+        pane = self.query_one("#status-pane", StatusPane)
+        pane.stop_spinner()
+        self.notify(message, severity=severity)
+        self._refresh_project_item(project)
+        if self.selected_project and self.selected_project.path == project.path:
+            self._refresh_panes()
 
     def _refresh_panes(self) -> None:
         p = self.selected_project
@@ -641,8 +711,20 @@ class OrchApp(App):
         if not p:
             self.notify("No project selected", severity="warning")
             return
-        self.notify(f"Starting container for {p.name}...")
-        self.run_worker(lambda: exec_claude_in_iterm(p), thread=True)
+
+        pane = self.query_one("#status-pane", StatusPane)
+        pane.start_spinner("Launching Claude in container", p)
+
+        def _launch():
+            try:
+                exec_claude_in_iterm(p)
+                self.call_from_thread(self._stop_spinner_and_refresh, p,
+                                      f"Claude launched for {p.name}")
+            except Exception as e:
+                self.call_from_thread(self._stop_spinner_and_refresh, p,
+                                      f"Launch failed: {e}", "error")
+
+        self.run_worker(_launch, thread=True)
 
     def action_exec_shell(self) -> None:
         """Open an iTerm2 tab with Claude on the host (no container)."""
@@ -650,21 +732,64 @@ class OrchApp(App):
         if not p:
             self.notify("No project selected", severity="warning")
             return
-        self.run_worker(lambda: open_input_tab(p), thread=True)
-        self.notify(f"Opening iTerm2 tab for {p.name}")
+
+        pane = self.query_one("#status-pane", StatusPane)
+        pane.start_spinner("Opening iTerm2 tab", p)
+
+        def _open():
+            try:
+                open_input_tab(p)
+                self.call_from_thread(self._stop_spinner_and_refresh, p,
+                                      f"iTerm2 tab opened for {p.name}")
+            except Exception as e:
+                self.call_from_thread(self._stop_spinner_and_refresh, p,
+                                      f"Failed: {e}", "error")
+
+        self.run_worker(_open, thread=True)
 
     def action_open_logs(self) -> None:
         p = self.selected_project
         if not p:
             self.notify("No project selected", severity="warning")
             return
-        self.run_worker(lambda: _open_log_tab(p), thread=True)
-        self.notify(f"Tailing logs for {p.name}")
+
+        pane = self.query_one("#status-pane", StatusPane)
+        pane.start_spinner("Opening log stream", p)
+
+        def _open():
+            try:
+                _open_log_tab(p)
+                self.call_from_thread(self._stop_spinner_and_refresh, p,
+                                      f"Tailing logs for {p.name}")
+            except Exception as e:
+                self.call_from_thread(self._stop_spinner_and_refresh, p,
+                                      f"Logs failed: {e}", "error")
+
+        self.run_worker(_open, thread=True)
 
     def action_open_plan(self) -> None:
         """Open day plan in an iTerm2 tab."""
-        self.run_worker(_open_plan_tab, thread=True)
-        self.notify("Generating day plan...")
+        pane = self.query_one("#status-pane", StatusPane)
+        pane.start_spinner("Generating day plan — calling Claude API")
+
+        def _plan():
+            try:
+                _open_plan_tab()
+                self.call_from_thread(self._finish_plan)
+            except Exception as e:
+                self.call_from_thread(self._finish_plan, str(e))
+
+        self.run_worker(_plan, thread=True)
+
+    def _finish_plan(self, error: str | None = None) -> None:
+        pane = self.query_one("#status-pane", StatusPane)
+        pane.stop_spinner()
+        if error:
+            self.notify(f"Plan failed: {error}", severity="error")
+        else:
+            self.notify("Day plan opened in iTerm2")
+        if self.selected_project:
+            self._refresh_panes()
 
     def action_toggle_bridge(self) -> None:
         """Toggle the mobile web bridge on/off."""
@@ -742,11 +867,19 @@ class OrchApp(App):
         cid = container_is_running(project)
         if cid:
             from .container import _send_task_to_container
-            self.run_worker(
-                lambda: _send_task_to_container(project, task),
-                thread=True,
-            )
-            self.notify(f"Task sent to {project.name} (container)")
+            pane = self.query_one("#status-pane", StatusPane)
+            pane.start_spinner("Sending task to Claude", project)
+
+            def _send():
+                try:
+                    _send_task_to_container(project, task)
+                    self.call_from_thread(self._stop_spinner_and_refresh, project,
+                                          f"Task sent to {project.name}")
+                except Exception as e:
+                    self.call_from_thread(self._stop_spinner_and_refresh, project,
+                                          f"Task failed: {e}", "error")
+
+            self.run_worker(_send, thread=True)
         else:
             self.notify(f"Task queued for {project.name} (no container running)")
 

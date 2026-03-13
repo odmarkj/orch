@@ -452,7 +452,11 @@ def exec_claude_in_iterm(project: "Project") -> None:
                 end if
             end repeat
             if orchWindow is missing value then
-                set orchWindow to (create window with profile "{profile}")
+                try
+                    set orchWindow to (create window with profile "{profile}")
+                on error
+                    set orchWindow to (create window with default profile)
+                end try
                 tell orchWindow
                     tell current session
                         set name to "{window_title}"
@@ -460,7 +464,11 @@ def exec_claude_in_iterm(project: "Project") -> None:
                 end tell
             end if
             tell orchWindow
-                create tab with profile "{profile}"
+                try
+                    create tab with profile "{profile}"
+                on error
+                    create tab with default profile
+                end try
                 tell current session
                     set name to "{tab_name}"
                     write text "{claude_cmd}"
@@ -475,10 +483,18 @@ def exec_claude_in_iterm(project: "Project") -> None:
         tell application "iTerm2"
             activate
             if (count of windows) is 0 then
-                create window with profile "{profile}"
+                try
+                    create window with profile "{profile}"
+                on error
+                    create window with default profile
+                end try
             end if
             tell current window
-                create tab with profile "{profile}"
+                try
+                    create tab with profile "{profile}"
+                on error
+                    create tab with default profile
+                end try
                 tell current session
                     set name to "{tab_name}"
                     write text "{claude_cmd}"
@@ -489,8 +505,8 @@ def exec_claude_in_iterm(project: "Project") -> None:
         end tell
         """
 
-    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
-    tty = result.stdout.strip()
+    from .iterm import _run_iterm_script
+    tty = _run_iterm_script(script)
     if tty:
         handle_file.write_text(tty)
 
@@ -500,7 +516,7 @@ def _send_task_to_container(project: "Project", task: str) -> None:
     Launch Claude in the container with a task as the initial prompt.
     Opens an iTerm2 tab running: docker exec -it <cid> claude --dangerously-skip-permissions -p "task"
     """
-    from .iterm import _load_config, _bring_tab_to_front
+    from .iterm import _load_config, _run_iterm_script
 
     cid = ensure_running(project)
 
@@ -527,7 +543,11 @@ def _send_task_to_container(project: "Project", task: str) -> None:
                 end if
             end repeat
             if orchWindow is missing value then
-                set orchWindow to (create window with profile "{profile}")
+                try
+                    set orchWindow to (create window with profile "{profile}")
+                on error
+                    set orchWindow to (create window with default profile)
+                end try
                 tell orchWindow
                     tell current session
                         set name to "{window_title}"
@@ -535,7 +555,11 @@ def _send_task_to_container(project: "Project", task: str) -> None:
                 end tell
             end if
             tell orchWindow
-                create tab with profile "{profile}"
+                try
+                    create tab with profile "{profile}"
+                on error
+                    create tab with default profile
+                end try
                 tell current session
                     set name to "{tab_name}"
                     write text "{claude_cmd}"
@@ -548,10 +572,18 @@ def _send_task_to_container(project: "Project", task: str) -> None:
         tell application "iTerm2"
             activate
             if (count of windows) is 0 then
-                create window with profile "{profile}"
+                try
+                    create window with profile "{profile}"
+                on error
+                    create window with default profile
+                end try
             end if
             tell current window
-                create tab with profile "{profile}"
+                try
+                    create tab with profile "{profile}"
+                on error
+                    create tab with default profile
+                end try
                 tell current session
                     set name to "{tab_name}"
                     write text "{claude_cmd}"
@@ -560,4 +592,4 @@ def _send_task_to_container(project: "Project", task: str) -> None:
         end tell
         """
 
-    subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    _run_iterm_script(script)

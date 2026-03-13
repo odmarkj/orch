@@ -160,7 +160,11 @@ def open_input_tab(project: Project) -> None:
                 end if
             end repeat
             if orchWindow is missing value then
-                set orchWindow to (create window with profile "{profile}")
+                try
+                    set orchWindow to (create window with profile "{profile}")
+                on error
+                    set orchWindow to (create window with default profile)
+                end try
                 tell orchWindow
                     tell current session
                         set name to "{window_title}"
@@ -168,7 +172,11 @@ def open_input_tab(project: Project) -> None:
                 end tell
             end if
             tell orchWindow
-                create tab with profile "{profile}"
+                try
+                    create tab with profile "{profile}"
+                on error
+                    create tab with default profile
+                end try
                 tell current session
                     set name to "{project_name}"
                     write text "cd {project_path} && {claude_cmd}"
@@ -183,10 +191,18 @@ def open_input_tab(project: Project) -> None:
         tell application "iTerm2"
             activate
             if (count of windows) is 0 then
-                create window with profile "{profile}"
+                try
+                    create window with profile "{profile}"
+                on error
+                    create window with default profile
+                end try
             end if
             tell current window
-                create tab with profile "{profile}"
+                try
+                    create tab with profile "{profile}"
+                on error
+                    create tab with default profile
+                end try
                 tell current session
                     set name to "{project_name}"
                     write text "cd {project_path} && {claude_cmd}"
@@ -197,12 +213,7 @@ def open_input_tab(project: Project) -> None:
         end tell
         """
 
-    result = subprocess.run(
-        ["osascript", "-e", script],
-        capture_output=True,
-        text=True,
-    )
-    tty = result.stdout.strip()
+    tty = _run_iterm_script(script)
     if tty:
         handle_file.write_text(tty)
 
@@ -252,6 +263,23 @@ def clear_stale_handle(project: Project) -> None:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _run_iterm_script(script: str) -> str:
+    """
+    Run an AppleScript that interacts with iTerm2. Returns stdout.
+    Raises RuntimeError with stderr if it fails.
+    """
+    result = subprocess.run(
+        ["osascript", "-e", script],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"iTerm2 AppleScript failed: {result.stderr.strip()}"
+        )
+    return result.stdout.strip()
+
 
 def _build_claude_cmd(project: Project) -> str:
     """

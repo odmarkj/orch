@@ -2,8 +2,7 @@
   "Profiles": [
     {
       "Name": "orch",
-      "Guid": "com.orch.session.profile",
-      "Dynamic Profile Parent Name": "Default",
+      "Guid": "ADBE4C7E-C039-4483-B747-45D96EED04F2",
 
       "Comment": "Orch session profile — edit this file and save to apply changes instantly. No iTerm2 restart needed.",
 

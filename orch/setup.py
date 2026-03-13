@@ -3,7 +3,7 @@
 orch setup — run once after installing the package.
 
 What this does:
-  1. Symlinks profiles/orch-iterm2-profile.json into iTerm2's DynamicProfiles/
+  1. Copies profiles/orch-iterm2-profile.json into iTerm2's DynamicProfiles/
      (iTerm2 picks it up instantly, no restart needed)
   2. Checks for terminal-notifier and offers to install it
   3. Creates ~/.orch/config.toml with defaults if it doesn't exist
@@ -43,20 +43,21 @@ def install_iterm_profile():
     ITERM_DYNAMIC_PROFILES.mkdir(parents=True, exist_ok=True)
     dest = ITERM_DYNAMIC_PROFILES / "orch-iterm2-profile.json"
 
+    # Remove old symlink or back up existing file
     if dest.is_symlink():
         dest.unlink()
     elif dest.exists():
         dest.rename(dest.with_suffix(".json.bak"))
         print(f"  → Backed up existing profile to {dest.with_suffix('.json.bak')}")
 
-    dest.symlink_to(PROFILE_SRC.resolve())
-    print(f"  ✓ Symlinked: {PROFILE_SRC.name}")
+    # Copy instead of symlink — iTerm2 does not follow symlinks in DynamicProfiles
+    shutil.copy2(PROFILE_SRC, dest)
+    print(f"  ✓ Installed: {PROFILE_SRC.name}")
     print(f"    → {dest}")
     print()
     print("  The profile is now live in iTerm2. Open Preferences → Profiles")
-    print("  to verify 'orch' appears. Edit profiles/orch-iterm2-profile.json")
-    print("  to customize colors, fonts, and environment variables — changes")
-    print("  apply instantly without restarting iTerm2.")
+    print("  to verify 'orch' appears. To customize, edit the source file at")
+    print(f"  {PROFILE_SRC} and re-run: orch setup")
     return True
 
 
