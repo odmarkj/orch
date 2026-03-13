@@ -1,9 +1,8 @@
 <p align="center">
-  <h1 align="center">orch</h1>
+  <img src="assets/orch-logo.svg" alt="orch — claude session orchestrator" width="400">
 </p>
 
 <p align="center">
-  <strong>Claude session orchestrator</strong><br>
   <em>One terminal, all your projects. Built for shipping — not just building.</em>
 </p>
 

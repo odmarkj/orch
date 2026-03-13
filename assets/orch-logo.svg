@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 120" width="400" height="120">
+  <style>
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.35} }
+    .w { animation: blink 2s ease-in-out infinite; }
+    @media (prefers-reduced-motion: reduce) { .w { animation: none; } }
+  </style>
+
+  <!-- Banner background -->
+  <rect width="400" height="120" rx="14" fill="#0d1117"/>
+
+  <!-- TUI icon panel -->
+  <rect x="16" y="14" width="92" height="92" rx="10" fill="#161b22" stroke="#30363d" stroke-width="1"/>
+
+  <!-- Sidebar accent line -->
+  <rect x="27" y="30" width="2" height="52" rx="1" fill="#30363d"/>
+
+  <!-- Row 1: active session (green) -->
+  <circle cx="39" cy="40" r="5.5" fill="#3fb950"/>
+  <rect x="51" y="36.5" width="46" height="7" rx="3.5" fill="#21262d"/>
+  <rect x="51" y="36.5" width="37" height="7" rx="3.5" fill="#3fb950" opacity="0.5"/>
+
+  <!-- Row 2: waiting for input (amber, pulsing) -->
+  <circle cx="39" cy="60" r="5.5" fill="#d29922" class="w"/>
+  <rect x="51" y="56.5" width="46" height="7" rx="3.5" fill="#21262d"/>
+  <rect x="51" y="56.5" width="19" height="7" rx="3.5" fill="#d29922" opacity="0.5"/>
+
+  <!-- Row 3: idle (hollow dot only) -->
+  <circle cx="39" cy="80" r="5" fill="none" stroke="#484f58" stroke-width="1.5"/>
+  <rect x="51" y="76.5" width="46" height="7" rx="3.5" fill="#1c2128"/>
+
+  <!-- "orch" wordmark -->
+  <text x="127" y="57"
+    font-family="'JetBrains Mono','Fira Code','Cascadia Mono','Courier New',monospace"
+    font-size="42" font-weight="700"
+    fill="#e6edf3"
+    dominant-baseline="middle"
+    letter-spacing="-1">orch</text>
+
+  <!-- Subtitle tagline -->
+  <text x="129" y="82"
+    font-family="'JetBrains Mono','Fira Code','Cascadia Mono','Courier New',monospace"
+    font-size="11.5"
+    fill="#7d8590"
+    letter-spacing="0.3">claude session orchestrator</text>
+</svg>
