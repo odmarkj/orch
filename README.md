@@ -1,45 +1,200 @@
-# orch
+<p align="center">
+  <h1 align="center">orch</h1>
+</p>
 
-Claude session orchestrator. One terminal, all your projects. Built for
-shipping — not just building.
+<p align="center">
+  <strong>Claude session orchestrator</strong><br>
+  <em>One terminal, all your projects. Built for shipping — not just building.</em>
+</p>
+
+<p align="center">
+  <a href="https://github.com/odmarkj/orch/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+  <img src="https://img.shields.io/badge/version-0.1.0-green.svg" alt="Version: 0.1.0">
+  <img src="https://img.shields.io/badge/python-%3E%3D3.11-brightgreen.svg" alt="Python: >=3.11">
+  <img src="https://img.shields.io/badge/platform-macOS-lightgrey.svg" alt="Platform: macOS">
+  <a href="TODO-buymeacoffee-url"><img src="https://img.shields.io/badge/Buy%20Me%20A%20Coffee-donate-yellow.svg?logo=buy-me-a-coffee&logoColor=white" alt="Buy Me A Coffee"></a>
+</p>
+
+<p align="center">
+  <a href="#the-problem">The Problem</a> &bull;
+  <a href="#quick-start">Quick Start</a> &bull;
+  <a href="#how-it-works">How It Works</a> &bull;
+  <a href="#architecture">Architecture</a> &bull;
+  <a href="#cli-commands">CLI Commands</a> &bull;
+  <a href="#interface-shortcuts">Interface Shortcuts</a> &bull;
+  <a href="#getting-started">Getting Started</a> &bull;
+  <a href="#contributing">Contributing</a>
+</p>
 
 ---
 
-## Install
+## The Problem
+
+If you're building multiple projects with Claude Code, you know the pain:
+
+- **Context switching is manual** — you `cd` between projects, open tabs, lose track of what's running where
+- **No visibility** — which Claude session is active? Which is stuck waiting for input? Which project stalled three weeks ago?
+- **Permission friction** — Claude asks for approval on every file write and shell command, breaking autonomous workflows
+- **No prioritization** — with ten projects in flight, it's hard to know which one to push forward today
+
+You end up juggling terminal tabs, forgetting which projects need attention, and losing momentum to overhead instead of shipping.
+
+### Where orch fits
+
+orch gives you a single control plane for all your Claude Code projects. It discovers projects automatically, tracks their lifecycle, runs Claude in isolated containers with full permissions, and tells you what to work on next.
+
+| Without orch | With orch |
+|-------------|-----------|
+| Manually `cd` between projects | Select from a live project list |
+| Claude asks permission for everything | Containers run with `--dangerously-skip-permissions` |
+| No idea which session is active or stuck | Real-time status dots and notifications |
+| Context lost between sessions | Session resume built in |
+| No sense of project momentum | Lifecycle tracking with stall detection |
+| "What should I work on?" | AI day planner with prioritized focus |
+
+---
+
+## Quick Start
 
 ```bash
-cd ~/tools/orch
+# Clone and install
+git clone https://github.com/odmarkj/orch.git
+cd orch
 pip install -e . --break-system-packages
 
-# First-time setup (iTerm2 profile, terminal-notifier, config file)
-orch-setup
-```
+# First-time setup (iTerm2 profile, terminal-notifier, Docker checks)
+orch setup
 
-Then run:
-
-```bash
+# Launch
 orch
 ```
 
-## How projects are discovered
-
-Orch auto-scans `~/Sites/*/` and registers any folder containing a `.claude/`
-directory. No manual config. Run Claude Code in a project once (which creates
-`.claude/`) and it appears automatically. Press `r` to rescan at any time.
+That's it. Orch auto-discovers any project in `~/Sites/` that has a `.claude/` directory. Run Claude Code in a project once and it appears automatically.
 
 ---
 
-## TUI keybindings
+## How It Works
+
+Orch operates through three core systems that work together:
+
+### Live status monitoring
+
+Each project's Claude session writes a one-line status to `.claude/status` after every response. Orch watches these files via filesystem events — zero polling, instant updates. Status dots in the TUI show green (active), yellow (waiting for input), or dim (idle).
+
+When Claude needs input, it writes to `.claude/waiting_for_input`. Orch fires a macOS notification and opens an iTerm2 tab with the session already resumed. You answer, Claude continues, the file is deleted, the dot goes green.
+
+### Container isolation
+
+When you select a project, orch automatically starts a Docker container using either `devcontainer up` (preferred) or a raw `docker run` fallback. Inside the container, Claude runs with `--dangerously-skip-permissions` and a `settings.local.json` that allows all tools. This means fully autonomous operation — no permission prompts interrupting multi-step tasks.
+
+Containers persist across project switches. Orch only removes them when you explicitly ask.
+
+### Project lifecycle
+
+Every project tracks its stage in `.orch/project.toml`:
+
+```
+idea → building → mvp → staging → live → maintaining
+```
+
+The ledger is append-only — every transition is dated and noted. Orch uses this history to detect stalled projects (current gap > 1.5x the project's own average pace) and calculates **launch debt** — days spent in `mvp` or `staging` without shipping. Both feed into the day planner.
+
+---
+
+## Architecture
+
+```
+~/Sites/
+  project-a/.claude/status          ──┐
+  project-b/.claude/status          ──┤
+  project-c/.claude/waiting_for_input ┤
+                                      │
+                              [Watchdog Observer]
+                                      │
+                                      v
+                              ┌───────────────┐
+                              │   Orch TUI     │
+                              │   (Textual)    │
+                              │                │
+                              │  Project List  │
+                              │  Status Dots   │
+                              │  TODO Preview  │
+                              └───────┬───────┘
+                                      │
+                    ┌─────────────────┼─────────────────┐
+                    │                 │                 │
+                    v                 v                 v
+            ┌──────────┐    ┌──────────────┐   ┌────────────┐
+            │ Container │    │   iTerm2      │   │   Bridge   │
+            │ Manager   │    │   Integration │   │   :7777    │
+            │           │    │              │   │            │
+            │ devcontainer│   │ Tab mgmt     │   │ Mobile UI  │
+            │ or docker  │    │ Notifications│   │ REST API   │
+            └──────────┘    └──────────────┘   └────────────┘
+                    │
+                    v
+            ┌──────────────┐
+            │   Claude      │
+            │   (in container) │
+            │   --dangerously- │
+            │   skip-permissions│
+            └──────────────┘
+```
+
+### Key design decisions
+
+- **Filesystem events over polling** — Watchdog monitors `.claude/` directories for instant status updates with zero CPU overhead.
+- **Container-first execution** — Claude runs in isolated Docker containers so `--dangerously-skip-permissions` is safe. No permission prompts, no friction.
+- **No dependencies beyond the stdlib** — The TOML parser and Anthropic API client are hand-rolled. Only `textual` (TUI) and `watchdog` (file events) are external.
+- **iTerm2 via AppleScript** — Tab management uses native macOS automation. Dedicated orch window, session resume by TTY handle, no stale tabs.
+- **Append-only ledger** — Project lifecycle transitions are never edited, only appended. Full audit trail for stall detection and planning.
+
+---
+
+## CLI Commands
+
+```bash
+orch                                # Launch TUI
+orch plan                           # Generate AI day plan
+orch plan --json                    # Day plan as JSON
+orch stage <project> <stage>        # Advance project lifecycle stage
+orch stage <project> <stage> note   # With a note in the ledger
+orch logs <project>                 # Tail docker logs for project
+orch logs <project> -g error        # Grep filter
+orch logs <project> --list          # Show discovered containers
+orch logs <project> --past          # Read saved log files
+orch bridge                         # Start mobile web bridge (Ctrl-C to stop)
+orch container <project> up         # Start devcontainer for project
+orch container <project> down       # Stop container
+orch container <project> status     # Check container status
+orch container <project> exec       # Exec into container running Claude
+orch ignore <project>               # Hide project from orch
+orch ignore <project> --undo        # Un-hide project
+orch setup                          # First-time setup
+```
+
+### Day planner
+
+`orch plan` makes a single Claude API call with context from every project: stage, stall score, launch debt, pending todos, git activity, and current Claude status. Returns a prioritized plan with focus projects (max 4), rationale, and suggested tasks pulled from your `TODOS.md`.
+
+Requires `ANTHROPIC_API_KEY` in your environment or iTerm2 profile.
+
+---
+
+## Interface Shortcuts
+
+### TUI keybindings
 
 | Key | Action |
 |-----|--------|
 | `j` / `k` or arrows | Navigate project list |
-| `t` | Send a task to Claude (writes to `.claude/pending_task`) |
-| `e` | Open iTerm2 tab for selected project (resumes Claude session) |
-| `l` | Open iTerm2 tab tailing docker logs for project |
-| `p` | Generate and display day plan in iTerm2 tab |
+| `Enter` | Select project (auto-starts container) |
+| `t` | Send a task to Claude in container |
+| `e` | Open iTerm2 tab with Claude (host) |
+| `c` | Open iTerm2 tab with Claude (container) |
+| `l` | Tail docker logs in iTerm2 tab |
+| `p` | Generate day plan in iTerm2 tab |
 | `b` | Toggle mobile web bridge on/off |
-| `c` | Open iTerm2 tab with Claude running in container |
 | `s` | Set project stage (`stage` or `stage: note`) |
 | `i` | Ignore/hide selected project from orch |
 | `r` | Rescan `~/Sites` for new/removed projects |
@@ -47,121 +202,7 @@ directory. No manual config. Run Claude Code in a project once (which creates
 | `?` | Toggle keybinding help pane |
 | `Escape` | Cancel input |
 
----
-
-## CLI subcommands
-
-```bash
-orch                              # Launch TUI
-orch plan                         # Generate day plan (prints to terminal)
-orch plan --json                  # Day plan as JSON
-orch stage <project> <stage>      # Advance project lifecycle stage
-orch stage <project> <stage> note # With a note in the ledger
-orch logs <project>               # Tail docker logs for project
-orch logs <project> -g error      # Grep filter
-orch logs <project> --list        # Show discovered containers
-orch logs <project> --past        # Read saved log files
-orch bridge                       # Start mobile web bridge (Ctrl-C to stop)
-orch container <project> up       # Start devcontainer for project
-orch container <project> down     # Stop container
-orch container <project> status   # Check container status
-orch container <project> exec     # Exec into container running claude
-orch ignore <project>             # Hide project from orch
-orch ignore <project> --undo     # Un-hide project
-orch setup                        # Re-run first-time setup
-```
-
----
-
-## Live status
-
-Add `CLAUDE_SNIPPET.md` contents to the `CLAUDE.md` of each project.
-This instructs Claude to:
-
-- Overwrite `.claude/status` with a one-line present-tense status after every response
-- Write `.claude/waiting_for_input` with a question when it needs you
-- Mark TODOS.md items as in-progress (`- [~]`) and done (`- [x]`)
-
-Orch watches these files via filesystem events — zero latency, no polling.
-
----
-
-## Input needed → iTerm2 → notification flow
-
-When Claude writes `.claude/waiting_for_input`:
-1. Orch fires a macOS toast notification (requires `terminal-notifier`)
-2. An iTerm2 tab opens automatically using the `orch` profile, already
-   `cd`'d into the project with the Claude session resumed
-3. You give input, Claude resumes and deletes the file
-4. The status dot goes green — you close the tab whenever you're ready
-
-Orch never closes iTerm2 tabs. You own that.
-
----
-
-## iTerm2 profile
-
-`orch-setup` symlinks `profiles/orch-iterm2-profile.json` into iTerm2's
-DynamicProfiles directory. iTerm2 picks it up instantly — no restart.
-
-Edit `profiles/orch-iterm2-profile.json` directly to change colors, fonts,
-environment variables, or any other profile setting. Changes apply the next
-time a tab opens. Key environment variables pre-set in the profile:
-
-```json
-"Environment": {
-  "ORCH_SESSION":    "1",
-  "CLAUDE_ORCH":     "1",
-  "ANTHROPIC_API_KEY": "",
-  "NODE_ENV":        "development",
-  "DOCKER_BUILDKIT": "1"
-}
-```
-
-Fill in `ANTHROPIC_API_KEY` here or export it in your shell profile.
-
----
-
-## Project lifecycle
-
-Each project tracks its stage in `.orch/project.toml`, committed to the repo.
-
-Stages in order:
-```
-idea → building → mvp → staging → live → maintaining
-```
-
-Advance a stage:
-```bash
-orch stage cacao-dna mvp "Core recommendation loop working end to end"
-```
-
-Or press `s` in the TUI. The ledger is append-only — every transition is
-dated and noted. Orch uses this history to detect stalled projects (current
-gap > 1.5× the project's own average pace) and surface them in the day plan.
-
-**Launch debt** — days spent in `mvp` or `staging` without shipping. Shown
-in the project list and weighted heavily in the day planner. The goal is to
-finish what you started before starting something new.
-
----
-
-## Day planner
-
-```bash
-orch plan
-```
-
-Or press `p` in the TUI. Makes a single Claude API call with context from
-every project: stage, stall score, launch debt, pending todos, git activity,
-and current Claude status. Returns a prioritized plan with focus projects
-(max 4), rationale, and suggested tasks pulled from your TODOS.md.
-
-Requires `ANTHROPIC_API_KEY` in your environment or iTerm2 profile.
-
----
-
-## TODOS.md format
+### TODOS.md format
 
 ```markdown
 ## Pending
@@ -175,49 +216,60 @@ Requires `ANTHROPIC_API_KEY` in your environment or iTerm2 profile.
 - [x] Set up pgvector schema
 ```
 
-Pending count shows next to the project name in the TUI. Claude marks items
-in-progress and done automatically as it works.
+Pending count shows next to the project name in the TUI. Claude marks items in-progress and done automatically as it works.
 
 ---
 
-## Mobile access
+## Getting Started
 
-See `MOBILE.md` for the full setup guide. Short version:
+### Installation
 
 ```bash
-# Mac: generate SSH key for mobile
-ssh-keygen -t ed25519 -C "orch-mobile" -f ~/.ssh/orch_mobile
-cat ~/.ssh/orch_mobile.pub >> ~/.ssh/authorized_keys
-
-# Enable Remote Login in System Settings → General → Sharing
+git clone https://github.com/odmarkj/orch.git
+cd orch
+pip install -e . --break-system-packages
 ```
 
-Import `~/.ssh/orch_mobile` into Termius on your phone. Connect, run `orch`.
-Full TUI works on iPad. `orch plan` and `orch stage` work well on phone.
+### First-time setup
 
-For access outside your home network:
 ```bash
-brew install cloudflared
-cloudflared tunnel --url http://localhost:7777  # after starting orch bridge
+orch setup
 ```
 
----
+This will:
+1. Symlink the iTerm2 dynamic profile
+2. Install `terminal-notifier` for macOS notifications
+3. Check for Docker and `devcontainer` CLI
+4. Create `~/.orch/config.toml` with default settings
 
-## Config
+### Enable live status in your projects
 
-`orch-setup` creates `~/.orch/config.toml` with all options documented.
-Key settings:
+Add the contents of `CLAUDE_SNIPPET.md` to the `CLAUDE.md` of each project you want orch to track. This instructs Claude to:
+
+- Write a one-line status to `.claude/status` after every response
+- Write questions to `.claude/waiting_for_input` when it needs you
+- Mark `TODOS.md` items as in-progress (`[~]`) and done (`[x]`)
+
+### Configuration
+
+`orch setup` creates `~/.orch/config.toml`:
 
 ```toml
 [iterm]
 profile = "orch"
-dedicated_window = true      # all orch tabs in one window
+dedicated_window = true
 window_title = "orch sessions"
 
 [notifications]
 sound_input_needed = "Glass"
 sound_resumed = "Pop"
 notify_on_resume = true
+
+[container]
+enabled = true
+image = "mcr.microsoft.com/devcontainers/base:ubuntu"
+memory = "12g"
+prefer_devcontainer_cli = true
 
 [bridge]
 port = 7777
@@ -226,9 +278,11 @@ port = 7777
 model = "claude-sonnet-4-20250514"
 ```
 
----
+### Mobile access
 
-## File reference
+Full TUI works on iPad via SSH. `orch plan` and `orch stage` work well on phone. See [MOBILE.md](MOBILE.md) for the complete setup guide with Termius and Cloudflare Tunnel instructions.
+
+### File reference
 
 | File | Purpose |
 |------|---------|
@@ -240,3 +294,93 @@ model = "claude-sonnet-4-20250514"
 | `~/Sites/<project>/.orch/project.toml` | Lifecycle stage + ledger (commit this) |
 | `~/.orch/config.toml` | Orch configuration |
 | `~/.orch/logs/<project>/` | Docker log files (1000 line rotation) |
+
+---
+
+## System Requirements
+
+- **Python** >= 3.11
+- **macOS** (iTerm2 integration uses AppleScript)
+- **Docker** (for container isolation)
+- **iTerm2** (for tab management and notifications)
+- **terminal-notifier** (installed by `orch setup`)
+
+Optional:
+- **devcontainer CLI** (`npm install -g @devcontainers/cli`) — preferred container strategy
+- **Cloudflare Tunnel** — for mobile access outside your home network
+
+---
+
+## Contributing
+
+Contributions are welcome! Please:
+
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Submit a Pull Request
+
+### Development
+
+```bash
+git clone https://github.com/odmarkj/orch.git
+cd orch
+pip install -e . --break-system-packages
+orch setup
+```
+
+### Project structure
+
+```
+orch/
+├── orch/                  # Python package
+│   ├── __init__.py
+│   ├── __main__.py        # CLI entry point and subcommand routing
+│   ├── app.py             # Textual TUI application
+│   ├── bridge.py          # Mobile web bridge (HTTP server + REST API)
+│   ├── container.py       # Docker container lifecycle management
+│   ├── discovery.py       # Auto-discovery of projects in ~/Sites
+│   ├── iterm.py           # iTerm2 tab management and notifications
+│   ├── lifecycle.py       # Project stages, ledger, stall detection
+│   ├── logs.py            # Docker log streaming and rotation
+│   ├── models.py          # Project and Session data models
+│   ├── planner.py         # AI day planner (Claude API)
+│   └── setup.py           # First-time setup wizard
+├── profiles/
+│   └── orch-iterm2-profile.json  # iTerm2 dynamic profile
+├── CLAUDE_SNIPPET.md      # Status integration snippet for projects
+├── MOBILE.md              # Mobile access setup guide
+├── pyproject.toml         # Package configuration
+└── README.md
+```
+
+---
+
+## License
+
+MIT
+
+---
+
+## Support
+
+- **Bug reports** — [GitHub Issues](https://github.com/odmarkj/orch/issues)
+- **Feature requests** — [GitHub Issues](https://github.com/odmarkj/orch/issues)
+
+---
+
+## Sponsors
+
+A special thanks to our project sponsors:
+
+<p align="center">
+  <a href="https://localdataexchange.com">
+    <img src="https://www.localdataexchange.com/wp-content/uploads/2023/04/1145x433-LDE-black.png" alt="Local Data Exchange" width="300">
+  </a>
+</p>
+
+---
+
+<p align="center">
+  <sub>Built for the Claude Code ecosystem</sub>
+</p>
