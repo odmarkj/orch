@@ -7,6 +7,7 @@ from typing import Callable
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
+from textual.events import Click, Resize
 from textual.reactive import reactive
 from textual.timer import Timer
 from textual.widgets import (
@@ -210,6 +211,59 @@ class StatusPane(Static):
         path_line = f"\n\n[dim]{project.path}[/]"
 
         self.update(f"{status_line}{container_line}{abstract_line}{path_line}")
+
+
+# ── Mobile tab bar ────────────────────────────────────────────────────────────
+
+MOBILE_THRESHOLD = 100  # columns — below this we switch to tabbed layout
+
+TAB_LABELS = ["projects", "status", "todos"]
+
+
+class TabBar(Static):
+    """Horizontal row of tappable tabs for narrow/mobile displays."""
+
+    DEFAULT_CSS = """
+    TabBar {
+        layout: horizontal;
+        height: 3;
+        dock: top;
+        background: $panel;
+        border-bottom: solid $primary;
+    }
+    TabBar .tab {
+        width: 1fr;
+        content-align: center middle;
+        height: 3;
+        padding: 0 1;
+    }
+    TabBar .tab.active {
+        background: $primary;
+        color: $text;
+        text-style: bold;
+    }
+    TabBar .tab:hover {
+        background: $primary 30%;
+    }
+    """
+
+    def __init__(self, tabs: list[str], active: int = 0):
+        super().__init__()
+        self._tabs = tabs
+        self._active = active
+
+    def compose(self) -> ComposeResult:
+        for i, label in enumerate(self._tabs):
+            cls = "tab active" if i == self._active else "tab"
+            yield Static(label, classes=cls, id=f"tab-{i}")
+
+    def set_active(self, index: int) -> None:
+        self._active = index
+        for i, child in enumerate(self.query(".tab")):
+            if i == index:
+                child.add_class("active")
+            else:
+                child.remove_class("active")
 
 
 # ── Log tab helper ────────────────────────────────────────────────────────────
@@ -439,6 +493,31 @@ class OrchApp(App):
     #help-bar.hidden {
         display: none;
     }
+
+    /* ── Tab bar (hidden by default, shown in mobile mode) ── */
+    TabBar {
+        display: none;
+    }
+
+    /* ── Mobile mode: panels shown/hidden via classes ── */
+    .mobile #project-panel {
+        width: 1fr;
+        min-width: 0;
+        border-right: none;
+    }
+    .mobile #center-panel {
+        width: 1fr;
+        border-right: none;
+    }
+    .mobile #right-panel {
+        width: 1fr;
+    }
+    .mobile .panel-hidden {
+        display: none;
+    }
+    .mobile TabBar {
+        display: block;
+    }
     """
 
     BINDINGS = [
@@ -468,9 +547,12 @@ class OrchApp(App):
         self._input_mode: str = "task"  # "task" or "stage"
         self._d_pressed: bool = False
         self._d_timer: Timer | None = None
+        self._mobile: bool = False
+        self._active_tab: int = 0  # 0=projects, 1=status, 2=todos
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
+        yield TabBar(TAB_LABELS, active=0)
         with Horizontal(id="main-row"):
             with Vertical(id="project-panel"):
                 yield Static("projects", id="project-panel-title")
@@ -492,18 +574,21 @@ class OrchApp(App):
             "  [bold cyan]Enter[/]          Select project (auto-starts container)\n"
             "  [bold cyan]t[/]              Send task to Claude (fire-and-forget)\n"
             "  [bold cyan]a[/]              Add todo to TODOS.md\n"
-            "  [bold cyan]e[/]              Open iTerm2 tab with Claude (host)\n"
-            "  [bold cyan]c[/]              Open iTerm2 tab with Claude (container)\n"
+            "  [bold cyan]e[/]              Open iTerm2 tab with Claude (host) [dim]desktop only[/]\n"
+            "  [bold cyan]c[/]              Open iTerm2 tab with Claude (container) [dim]desktop only[/]\n"
             "  [bold cyan]dd[/]             Stop and remove container (double-press)\n"
-            "  [bold cyan]l[/]              Tail docker logs in iTerm2 tab\n"
-            "  [bold cyan]p[/]              Generate day plan in iTerm2 tab\n"
+            "  [bold cyan]l[/]              Tail docker logs in iTerm2 tab [dim]desktop only[/]\n"
+            "  [bold cyan]p[/]              Generate day plan in iTerm2 tab [dim]desktop only[/]\n"
             "  [bold cyan]b[/]              Toggle mobile web bridge on/off\n"
             "  [bold cyan]s[/]              Set project stage (type: stage or stage: note)\n"
             "  [bold cyan]i[/]              Ignore/hide selected project from orch\n"
             "  [bold cyan]r[/]              Rescan ~/Sites for projects\n"
             "  [bold cyan]q[/]              Quit\n"
             "  [bold cyan]?[/]              Toggle this help\n"
-            "  [bold cyan]Esc[/]            Cancel input",
+            "  [bold cyan]Esc[/]            Cancel input\n"
+            "\n"
+            "  [bold magenta]Mobile:[/] Tap tabs at top to switch panels. "
+            "Width < 100 cols enables tabbed mode.",
             id="help-bar",
             markup=True,
         )
@@ -522,6 +607,60 @@ class OrchApp(App):
         )
         if self.projects:
             self.query_one("#project-list", ListView).focus()
+        # Check if we should start in mobile mode
+        self._check_mobile(self.size.width)
+
+    # ── Mobile / tabbed layout ───────────────────────────────────────────────
+
+    def on_resize(self, event: Resize) -> None:
+        """Switch layout when terminal width crosses the mobile threshold."""
+        self._check_mobile(event.size.width)
+
+    def _check_mobile(self, width: int) -> None:
+        mobile = width < MOBILE_THRESHOLD
+        if mobile == self._mobile:
+            return
+        self._mobile = mobile
+        if mobile:
+            self._enter_mobile()
+        else:
+            self._exit_mobile()
+
+    def _enter_mobile(self) -> None:
+        """Switch to tabbed single-panel layout."""
+        self.screen.add_class("mobile")
+        self._active_tab = 0
+        self._apply_tab(0)
+        # Hide help bar in mobile — too much screen estate
+        self.query_one("#help-bar").add_class("hidden")
+
+    def _exit_mobile(self) -> None:
+        """Restore the three-pane side-by-side layout."""
+        self.screen.remove_class("mobile")
+        for panel_id in ("project-panel", "center-panel", "right-panel"):
+            self.query_one(f"#{panel_id}").remove_class("panel-hidden")
+
+    def _apply_tab(self, index: int) -> None:
+        """Show only the panel for the given tab index."""
+        self._active_tab = index
+        panels = ["project-panel", "center-panel", "right-panel"]
+        for i, pid in enumerate(panels):
+            panel = self.query_one(f"#{pid}")
+            if i == index:
+                panel.remove_class("panel-hidden")
+            else:
+                panel.add_class("panel-hidden")
+        self.query_one(TabBar).set_active(index)
+
+    @on(Click, "TabBar .tab")
+    def _on_tab_click(self, event: Click) -> None:
+        """Handle tap/click on a tab in mobile mode."""
+        if not self._mobile:
+            return
+        widget = event.widget
+        if widget.id and widget.id.startswith("tab-"):
+            index = int(widget.id.split("-")[1])
+            self._apply_tab(index)
 
     def _populate_list(self) -> None:
         lv = self.query_one("#project-list", ListView)
@@ -631,6 +770,9 @@ class OrchApp(App):
             self._refresh_panes()
             # Auto-start container in background if not already running
             self._ensure_container(event.item.project)
+            # On mobile, auto-switch to the status tab after selecting a project
+            if self._mobile:
+                self._apply_tab(1)
 
     def _ensure_container(self, project: Project) -> None:
         """Start container in background if not already running."""
@@ -743,6 +885,9 @@ class OrchApp(App):
     def action_container_up(self) -> None:
         """Open an iTerm2 tab with Claude running inside the container."""
         if self._input_focused: return
+        if self._mobile:
+            self.notify("Not available on mobile — use the bridge instead", severity="warning")
+            return
         p = self.selected_project
         if not p:
             self.notify("No project selected", severity="warning")
@@ -800,6 +945,9 @@ class OrchApp(App):
     def action_exec_shell(self) -> None:
         """Open an iTerm2 tab with Claude on the host (no container)."""
         if self._input_focused: return
+        if self._mobile:
+            self.notify("Not available on mobile — use the bridge instead", severity="warning")
+            return
         p = self.selected_project
         if not p:
             self.notify("No project selected", severity="warning")
@@ -821,6 +969,9 @@ class OrchApp(App):
 
     def action_open_logs(self) -> None:
         if self._input_focused: return
+        if self._mobile:
+            self.notify("Not available on mobile — use the bridge instead", severity="warning")
+            return
         p = self.selected_project
         if not p:
             self.notify("No project selected", severity="warning")
@@ -843,6 +994,9 @@ class OrchApp(App):
     def action_open_plan(self) -> None:
         """Open day plan in an iTerm2 tab."""
         if self._input_focused: return
+        if self._mobile:
+            self.notify("Not available on mobile — use the bridge instead", severity="warning")
+            return
         pane = self.query_one("#status-pane", StatusPane)
         pane.start_spinner("Generating day plan — calling Claude API")
 
