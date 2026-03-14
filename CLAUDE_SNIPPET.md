@@ -26,6 +26,10 @@ When working through TODOS.md:
 - Mark items you start with `- [~]` (in progress)
 - Mark completed items with `- [x]` (done)
 - Work through items in the order they appear unless a specific task overrides
+
+When you finish a task and have no more work to do, clear `.claude/status` by
+writing an empty string. This tells the orchestrator you are idle and ready for
+the next task.
 ```
 
 Claude will update these files automatically. Orch reads them in real time to

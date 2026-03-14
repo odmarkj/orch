@@ -105,3 +105,44 @@ class Project:
     @property
     def has_devcontainer(self) -> bool:
         return (self.path / ".devcontainer" / "devcontainer.json").is_file()
+
+    # ── Auto-dispatch properties ─────────────────────────────────────────────
+
+    @property
+    def active_todo_file(self) -> Path:
+        return self.claude_dir / "active_todo"
+
+    @property
+    def active_todo(self) -> str | None:
+        try:
+            text = self.active_todo_file.read_text().strip()
+            return text or None
+        except FileNotFoundError:
+            return None
+
+    @property
+    def auto_dispatch_file(self) -> Path:
+        return self.claude_dir / "auto_dispatch"
+
+    @property
+    def auto_dispatch_enabled(self) -> bool:
+        return self.auto_dispatch_file.exists()
+
+    @property
+    def in_progress_count(self) -> int:
+        try:
+            text = self.todos_file.read_text()
+            return text.count("- [~]")
+        except FileNotFoundError:
+            return 0
+
+    @property
+    def first_pending_todo(self) -> str | None:
+        try:
+            for line in self.todos_file.read_text().splitlines():
+                stripped = line.strip()
+                if stripped.startswith("- [ ] "):
+                    return stripped[6:]
+            return None
+        except FileNotFoundError:
+            return None
