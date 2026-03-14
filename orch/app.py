@@ -112,9 +112,10 @@ class ProjectItem(ListItem):
     def _build_label(self) -> str:
         indicator = INDICATOR.get(self.project.status_indicator, INDICATOR["idle"])
         cbox = CONTAINER_ICON if container_is_running(self.project) else CONTAINER_ICON_OFF
+        auto = "[bold magenta]⚡[/]" if self.project.auto_dispatch_enabled else ""
         count = self.project.pending_count
         badge = f" [dim]{count}t[/]" if count else ""
-        return f"{indicator}{cbox} {self.project.name}{badge}"
+        return f"{indicator}{cbox}{auto} {self.project.name}{badge}"
 
     def refresh_label(self) -> None:
         self.query_one(Label).update(self._build_label())
@@ -533,6 +534,7 @@ class OrchApp(App):
         Binding("b", "toggle_bridge", "Bridge", show=True),
         Binding("s", "set_stage", "Stage", show=True),
         Binding("i", "ignore_project", "Ignore", show=True),
+        Binding("g", "toggle_auto_dispatch", "Auto(g)", show=True),
         Binding("question_mark", "toggle_help", "?", show=True),
         Binding("escape", "blur_input", "Cancel", show=False),
     ]
@@ -549,6 +551,7 @@ class OrchApp(App):
         self._d_timer: Timer | None = None
         self._mobile: bool = False
         self._active_tab: int = 0  # 0=projects, 1=status, 2=todos
+        self._dispatch_timers: dict[str, Timer] = {}  # project path -> pending dispatch timer
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -568,7 +571,7 @@ class OrchApp(App):
         yield Static(
             "[dim]t[/]ask  [dim]a[/]dd todo  [dim]e[/]xec  [dim]c[/]ontainer  [dim]dd[/] down  "
             "[dim]l[/]ogs  [dim]p[/]lan  [dim]b[/]ridge  [dim]s[/]tage  "
-            "[dim]i[/]gnore  [dim]r[/]efresh  [dim]q[/]uit  [dim]?[/] toggle help\n"
+            "[dim]i[/]gnore  [dim]g[/] auto  [dim]r[/]efresh  [dim]q[/]uit  [dim]?[/] toggle help\n"
             "\n"
             "  [bold cyan]j/k[/] [dim]or[/] [bold cyan]arrows[/]  Navigate projects\n"
             "  [bold cyan]Enter[/]          Select project (auto-starts container)\n"
@@ -582,6 +585,7 @@ class OrchApp(App):
             "  [bold cyan]b[/]              Toggle mobile web bridge on/off\n"
             "  [bold cyan]s[/]              Set project stage (type: stage or stage: note)\n"
             "  [bold cyan]i[/]              Ignore/hide selected project from orch\n"
+            "  [bold cyan]g[/]              Toggle auto-dispatch of pending todos (⚡)\n"
             "  [bold cyan]r[/]              Rescan ~/Sites for projects\n"
             "  [bold cyan]q[/]              Quit\n"
             "  [bold cyan]?[/]              Toggle this help\n"
@@ -727,16 +731,30 @@ class OrchApp(App):
             self._refresh_project_item_for_path(changed)
             if self.selected_project and changed.is_relative_to(self.selected_project.path):
                 self._refresh_panes()
+            # Container just started — check if there are pending todos to dispatch
+            project = self._project_for_path(changed)
+            if project and changed.exists():
+                self._schedule_dispatch_check(project)
             return
 
         # ── iterm handles: no action needed ───────────────────────────────────
         if changed.name in ("iterm_handle", "iterm_container_handle", "iterm_log_handle"):
             return
 
+        # ── Auto-dispatch files: skip refresh loop ────────────────────────────
+        if changed.name in ("active_todo", "auto_dispatch"):
+            return
+
         # ── General file change: status, todos, etc. ──────────────────────────
         self._refresh_project_item_for_path(changed)
         if self.selected_project and changed.is_relative_to(self.selected_project.path):
             self._refresh_panes()
+
+        # ── Auto-dispatch check on status or TODOS.md changes ─────────────────
+        if changed.name in ("status", "TODOS.md"):
+            project = self._project_for_path(changed)
+            if project:
+                self._schedule_dispatch_check(project)
 
     def _project_for_path(self, path: Path) -> Project | None:
         """Find the project that owns this path."""
@@ -876,6 +894,28 @@ class OrchApp(App):
         ignore_project(p)
         self.notify(f"{p.name} ignored — undo with: orch ignore {p.name} --undo")
         self.action_refresh()
+
+    def action_toggle_auto_dispatch(self) -> None:
+        """Toggle auto-dispatch of pending todos for the selected project."""
+        if self._input_focused: return
+        p = self.selected_project
+        if not p:
+            self.notify("No project selected", severity="warning")
+            return
+        p.claude_dir.mkdir(parents=True, exist_ok=True)
+        if p.auto_dispatch_enabled:
+            p.auto_dispatch_file.unlink(missing_ok=True)
+            # Cancel any pending dispatch timer
+            key = str(p.path)
+            if key in self._dispatch_timers:
+                self._dispatch_timers[key].stop()
+                del self._dispatch_timers[key]
+            self.notify(f"Auto-dispatch OFF for {p.name}")
+        else:
+            p.auto_dispatch_file.write_text("1")
+            self.notify(f"⚡ Auto-dispatch ON for {p.name}")
+            self._schedule_dispatch_check(p)
+        self._refresh_project_item(p)
 
     def action_toggle_help(self) -> None:
         if self._input_focused: return
@@ -1134,7 +1174,106 @@ class OrchApp(App):
         self.notify(f"Todo added to {project.name}")
         self._refresh_panes()
 
+    # ── Auto-dispatch logic ─────────────────────────────────────────────────
+
+    def _schedule_dispatch_check(self, project: Project) -> None:
+        """Debounced: schedule a dispatch check 10 seconds from now."""
+        if not project.auto_dispatch_enabled:
+            return
+        key = str(project.path)
+        if key in self._dispatch_timers:
+            self._dispatch_timers[key].stop()
+        self._dispatch_timers[key] = self.set_timer(
+            10.0,
+            lambda p=project: self._maybe_auto_dispatch(p),
+        )
+
+    def _maybe_auto_dispatch(self, project: Project) -> None:
+        """Check if we should auto-dispatch the next pending todo."""
+        from .container import _run_task_headless
+
+        # Clean up the timer reference
+        key = str(project.path)
+        self._dispatch_timers.pop(key, None)
+
+        if not project.auto_dispatch_enabled:
+            return
+        if not container_is_running(project):
+            return
+        if project.status_indicator != "idle":
+            return
+        if project.in_progress_count > 0:
+            return
+
+        # Clear stale active_todo from previous task
+        if project.active_todo is not None:
+            project.active_todo_file.unlink(missing_ok=True)
+
+        todo_text = project.first_pending_todo
+        if not todo_text:
+            return
+
+        if not self._claim_todo(project, todo_text):
+            return
+
+        task = (
+            f"Work on the next todo from TODOS.md: {todo_text}\n\n"
+            f"Mark it as - [x] when complete, then clear .claude/status."
+        )
+
+        def _run():
+            try:
+                _run_task_headless(project, task)
+                self.call_from_thread(self._on_dispatch_complete, project, todo_text)
+            except Exception as e:
+                self.call_from_thread(self._on_dispatch_failed, project, todo_text, e)
+
+        self.run_worker(_run, thread=True)
+        truncated = todo_text[:50] + ("…" if len(todo_text) > 50 else "")
+        self.notify(f"⚡ Auto-dispatched: {truncated}")
+        self._refresh_project_item(project)
+        if self.selected_project and self.selected_project.path == project.path:
+            self._refresh_panes()
+
+    def _claim_todo(self, project: Project, todo_text: str) -> bool:
+        """Mark first matching '- [ ] {todo_text}' as '- [~]' in TODOS.md."""
+        try:
+            content = project.todos_file.read_text()
+        except FileNotFoundError:
+            return False
+
+        target = f"- [ ] {todo_text}"
+        if target not in content:
+            return False
+
+        new_content = content.replace(target, f"- [~] {todo_text}", 1)
+        project.todos_file.write_text(new_content)
+
+        project.claude_dir.mkdir(parents=True, exist_ok=True)
+        project.active_todo_file.write_text(todo_text)
+        return True
+
+    def _on_dispatch_complete(self, project: Project, todo_text: str) -> None:
+        self._refresh_project_item(project)
+        if self.selected_project and self.selected_project.path == project.path:
+            self._refresh_panes()
+
+    def _on_dispatch_failed(self, project: Project, todo_text: str, error: Exception) -> None:
+        self.notify(f"Auto-dispatch failed for {project.name}: {error}", severity="error")
+        # Unclaim: revert - [~] back to - [ ]
+        try:
+            content = project.todos_file.read_text()
+            content = content.replace(f"- [~] {todo_text}", f"- [ ] {todo_text}", 1)
+            project.todos_file.write_text(content)
+        except FileNotFoundError:
+            pass
+        project.active_todo_file.unlink(missing_ok=True)
+
     def on_unmount(self) -> None:
+        # Stop dispatch timers
+        for timer in self._dispatch_timers.values():
+            timer.stop()
+        self._dispatch_timers.clear()
         if self._observer:
             self._observer.stop()
             self._observer.join()
