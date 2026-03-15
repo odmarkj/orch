@@ -88,6 +88,38 @@ When you select a project, orch automatically starts a Docker container using ei
 
 Containers persist across project switches. Orch only removes them when you explicitly ask.
 
+### Auto-dispatch with parallel worktrees
+
+When auto-dispatch is enabled (`g` in the TUI), orch automatically picks up pending todos from `TODOS.md` and runs them — each in its own git worktree with a dedicated Claude instance. Up to 3 tasks run in parallel by default (configurable via `max_parallel`).
+
+The full pipeline for each dispatched todo:
+
+1. **Worktree created** — a new branch `auto/<slug>-<random>` is checked out in `../.orch-worktrees/`
+2. **Claude works the task** — runs autonomously in the worktree with `--dangerously-skip-permissions`
+3. **Code review** (optional) — a second Claude instance reviews the diff for bugs, security issues, and quality
+4. **Commit & push** — changes are committed and pushed to the branch with retry backoff
+5. **PR created** — a pull request is opened via `gh` CLI with the task description and review findings
+6. **Cleanup** — worktree is removed, todo is marked `[x]`, next pending todo fills the slot
+
+This means you can add 10 todos to a project, press `g`, and walk away. Orch will churn through them 3 at a time, each producing a PR ready for merge.
+
+### Code review
+
+Per-project opt-in. Add `code_review = true` to `.orch/project.toml`:
+
+```toml
+[project]
+name = "my-project"
+code_review = true
+```
+
+When enabled, after Claude finishes a task but before the commit and PR, a separate Claude instance reviews the diff. The review is:
+- Saved to `.claude/last_review.md` in the worktree
+- Included in the PR body under a "Code Review" section
+- Posted as a comment on the PR
+
+Code review is **off by default** and configured per project.
+
 ### Project lifecycle
 
 Every project tracks its stage in `.orch/project.toml`:
@@ -120,24 +152,24 @@ The ledger is append-only — every transition is dated and noted. Orch uses thi
                               │  TODO Preview  │
                               └───────┬───────┘
                                       │
-                    ┌─────────────────┼─────────────────┐
-                    │                 │                 │
-                    v                 v                 v
-            ┌──────────┐    ┌──────────────┐   ┌────────────┐
-            │ Container │    │   iTerm2      │   │   Bridge   │
-            │ Manager   │    │   Integration │   │   :7777    │
-            │           │    │              │   │            │
-            │ devcontainer│   │ Tab mgmt     │   │ Mobile UI  │
-            │ or docker  │    │ Notifications│   │ REST API   │
-            └──────────┘    └──────────────┘   └────────────┘
-                    │
-                    v
-            ┌──────────────┐
-            │   Claude      │
-            │   (in container) │
-            │   --dangerously- │
-            │   skip-permissions│
-            └──────────────┘
+               ┌──────────────┬───────┼──────────┬────────────┐
+               │              │       │          │            │
+               v              v       v          v            v
+       ┌──────────┐  ┌──────────┐ ┌────────┐ ┌────────┐ ┌────────┐
+       │ Container │  │  iTerm2  │ │ Bridge │ │ Auto-  │ │  Code  │
+       │ Manager   │  │  Integ.  │ │ :7777  │ │Dispatch│ │ Review │
+       │           │  │          │ │        │ │        │ │        │
+       │devcontainer│ │ Tab mgmt │ │Mobile  │ │Worktree│ │ Claude │
+       │ or docker │  │ Notifs   │ │REST API│ │Parallel│ │  Diff  │
+       └──────────┘  └──────────┘ └────────┘ └───┬────┘ └────────┘
+               │                                  │
+               v                                  v
+       ┌──────────────┐                 ┌──────────────────┐
+       │   Claude      │                 │  Worktree 1..N    │
+       │ (in container)│                 │  Claude per task   │
+       │ --dangerously-│                 │  commit → push     │
+       │ skip-perms    │                 │  → PR via gh       │
+       └──────────────┘                 └──────────────────┘
 ```
 
 ### Key design decisions
@@ -189,6 +221,8 @@ Requires `ANTHROPIC_API_KEY` in your environment or iTerm2 profile.
 | `j` / `k` or arrows | Navigate project list |
 | `Enter` | Select project (auto-starts container) |
 | `t` | Send a task to Claude in container |
+| `a` | Add a todo to TODOS.md |
+| `g` | Toggle auto-dispatch (parallel worktrees) |
 | `e` | Open iTerm2 tab with Claude (host) |
 | `c` | Open iTerm2 tab with Claude (container) |
 | `l` | Tail docker logs in iTerm2 tab |
@@ -270,11 +304,27 @@ image = "mcr.microsoft.com/devcontainers/base:ubuntu"
 memory = "12g"
 prefer_devcontainer_cli = true
 
+[dispatch]
+# Max Claude instances running in parallel per project (each gets a worktree)
+max_parallel = 3
+
 [bridge]
 port = 7777
 
 [planner]
 model = "claude-sonnet-4-20250514"
+```
+
+### Per-project config
+
+Projects can have their own settings in `.orch/project.toml`:
+
+```toml
+[project]
+name = "my-project"
+
+# Enable automatic code review on dispatched tasks (off by default)
+code_review = true
 ```
 
 ### Mobile access
@@ -289,8 +339,12 @@ Full TUI works on iPad via SSH. `orch plan` and `orch stage` work well on phone.
 | `~/Sites/<project>/.claude/waiting_for_input` | Claude's question; triggers notification + iTerm2 tab |
 | `~/Sites/<project>/.claude/pending_task` | Task queued from orch, read by Claude |
 | `~/Sites/<project>/.claude/sessions.json` | `{"active": "<session-id>"}` for `--resume` |
+| `~/Sites/<project>/.claude/auto_dispatch` | Auto-dispatch enabled flag (existence = on) |
+| `~/Sites/<project>/.claude/active_todo` | Currently dispatched todo text |
+| `~/Sites/<project>/.claude/last_review.md` | Most recent code review output |
 | `~/Sites/<project>/TODOS.md` | Project todo list |
-| `~/Sites/<project>/.orch/project.toml` | Lifecycle stage + ledger (commit this) |
+| `~/Sites/<project>/.orch/project.toml` | Lifecycle stage, ledger, and per-project config |
+| `~/Sites/.orch-worktrees/` | Temporary worktrees for parallel dispatch |
 | `~/.orch/config.toml` | Orch configuration |
 | `~/.orch/logs/<project>/` | Docker log files (1000 line rotation) |
 
@@ -306,6 +360,7 @@ Full TUI works on iPad via SSH. `orch plan` and `orch stage` work well on phone.
 
 Optional:
 - **devcontainer CLI** (`npm install -g @devcontainers/cli`) — preferred container strategy
+- **GitHub CLI** (`brew install gh`) — enables auto-dispatch PR creation and code review comments
 - **Cloudflare Tunnel** — for mobile access outside your home network
 
 ---
