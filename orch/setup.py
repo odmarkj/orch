@@ -171,6 +171,18 @@ prefer_devcontainer_cli = true
 """
             CONFIG_FILE.write_text(existing.rstrip() + "\n" + container_section)
             print(f"  ✓ Added [container] section to {CONFIG_FILE}")
+            existing = CONFIG_FILE.read_text()
+
+        # Check if [dispatch] section is missing and append it
+        if "[dispatch]" not in existing:
+            dispatch_section = """
+[dispatch]
+# Maximum number of Claude instances to run in parallel per project
+# Each dispatched todo gets its own git worktree
+max_parallel = 3
+"""
+            CONFIG_FILE.write_text(existing.rstrip() + "\n" + dispatch_section)
+            print(f"  ✓ Added [dispatch] section to {CONFIG_FILE}")
         else:
             print(f"  ✓ Already exists at {CONFIG_FILE}")
         return
@@ -221,6 +233,11 @@ passthrough_env = "ANTHROPIC_API_KEY,CLOUDFLARE_API_TOKEN,CLOUDFLARE_ACCOUNT_ID"
 
 # Use devcontainer CLI if available (falls back to raw docker if false or missing)
 prefer_devcontainer_cli = true
+
+[dispatch]
+# Maximum number of Claude instances to run in parallel per project
+# Each dispatched todo gets its own git worktree
+max_parallel = 3
 """
     CONFIG_FILE.write_text(config)
     print(f"  ✓ Created {CONFIG_FILE}")
