@@ -1289,11 +1289,11 @@ class OrchApp(App):
         if review and pr_url:
             self._post_review_comment(pr_url, review)
 
-        # Clean up worktree
+        # Clean up worktree and local branch
         wt_path = results.get("worktree")
         if wt_path:
             try:
-                remove_worktree(project, Path(wt_path))
+                remove_worktree(project, Path(wt_path), branch)
             except Exception:
                 pass
 

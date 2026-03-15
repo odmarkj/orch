@@ -777,12 +777,35 @@ def _slugify(text: str, max_len: int = 30) -> str:
     return slug[:max_len]
 
 
+def _ensure_worktrees_gitignored(project: "Project") -> None:
+    """Add .orch-worktrees to the parent directory's .gitignore if not already present."""
+    gitignore = project.path / ".gitignore"
+    entry = ".orch-worktrees"
+    try:
+        if gitignore.exists():
+            content = gitignore.read_text()
+            if entry in content.splitlines():
+                return
+            # Append with newline safety
+            if content and not content.endswith("\n"):
+                content += "\n"
+            content += f"{entry}\n"
+            gitignore.write_text(content)
+        else:
+            gitignore.write_text(f"{entry}\n")
+    except OSError:
+        pass
+
+
 def create_worktree(project: "Project", todo_text: str) -> tuple[Path, str]:
     """
     Create a git worktree for the given todo.
     Returns (worktree_path, branch_name).
     """
     import random as _rand
+
+    _ensure_worktrees_gitignored(project)
+
     slug = _slugify(todo_text)
     suffix = _rand.randint(1000, 9999)
     branch_name = f"auto/{slug}-{suffix}"
@@ -804,8 +827,8 @@ def create_worktree(project: "Project", todo_text: str) -> tuple[Path, str]:
     return worktree_dir, branch_name
 
 
-def remove_worktree(project: "Project", worktree_path: Path) -> None:
-    """Remove a git worktree after work is done."""
+def remove_worktree(project: "Project", worktree_path: Path, branch_name: str = "") -> None:
+    """Remove a git worktree and delete the local branch if it was pushed."""
     subprocess.run(
         ["git", "worktree", "remove", "--force", str(worktree_path)],
         capture_output=True,
@@ -813,6 +836,19 @@ def remove_worktree(project: "Project", worktree_path: Path) -> None:
         cwd=str(project.path),
         timeout=30,
     )
+
+    # Delete local branch if it exists and has been pushed to remote
+    if branch_name:
+        # Check if remote tracking branch exists (i.e., it was pushed)
+        check = subprocess.run(
+            ["git", "branch", "-r", "--list", f"origin/{branch_name}"],
+            capture_output=True, text=True, cwd=str(project.path), timeout=10,
+        )
+        if check.stdout.strip():
+            subprocess.run(
+                ["git", "branch", "-D", branch_name],
+                capture_output=True, text=True, cwd=str(project.path), timeout=10,
+            )
 
 
 def _run_code_review(project: "Project", worktree_path: Path, branch_name: str) -> str:
@@ -989,9 +1025,9 @@ def run_task_in_worktree(project: "Project", todo_text: str) -> dict:
         results["pr_url"] = pr_url
 
     except Exception:
-        # On failure, still try to clean up worktree
+        # On failure, still try to clean up worktree and local branch
         try:
-            remove_worktree(project, worktree_path)
+            remove_worktree(project, worktree_path, branch_name)
         except Exception:
             pass
         raise
