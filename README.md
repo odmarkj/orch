@@ -94,12 +94,14 @@ When auto-dispatch is enabled (`g` in the TUI), orch automatically picks up pend
 
 The full pipeline for each dispatched todo:
 
-1. **Worktree created** — a new branch `auto/<slug>-<random>` is checked out in `../.orch-worktrees/`
+1. **Worktree created** — a new branch `auto/<slug>-<random>` is checked out in `../.orch-worktrees/` (automatically added to `.gitignore`)
 2. **Claude works the task** — runs autonomously in the worktree with `--dangerously-skip-permissions`
 3. **Code review** (optional) — a second Claude instance reviews the diff for bugs, security issues, and quality
 4. **Commit & push** — changes are committed and pushed to the branch with retry backoff
 5. **PR created** — a pull request is opened via `gh` CLI with the task description and review findings
-6. **Cleanup** — worktree is removed, todo is marked `[x]`, next pending todo fills the slot
+6. **Cleanup** — worktree is removed, local branch is deleted (remote branch preserved on the PR), todo is marked `[x]`, next pending todo fills the slot
+
+`.orch-worktrees` is automatically added to the project's `.gitignore` on first dispatch to keep temporary worktrees out of version control. Local branches are cleaned up after a successful push to avoid clutter — the work lives on in the remote branch and PR.
 
 This means you can add 10 todos to a project, press `g`, and walk away. Orch will churn through them 3 at a time, each producing a PR ready for merge.
 
