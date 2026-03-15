@@ -146,3 +146,35 @@ class Project:
             return None
         except FileNotFoundError:
             return None
+
+    @property
+    def pending_todos(self) -> list[str]:
+        """Return all pending todo texts."""
+        try:
+            results = []
+            for line in self.todos_file.read_text().splitlines():
+                stripped = line.strip()
+                if stripped.startswith("- [ ] "):
+                    results.append(stripped[6:])
+            return results
+        except FileNotFoundError:
+            return []
+
+    # ── Per-project config ────────────────────────────────────────────────────
+
+    @property
+    def orch_config_file(self) -> Path:
+        return self.path / ".orch" / "project.toml"
+
+    @property
+    def code_review_enabled(self) -> bool:
+        """Check if code review is enabled for this project (off by default)."""
+        try:
+            for line in self.orch_config_file.read_text().splitlines():
+                stripped = line.strip()
+                if stripped.startswith("code_review") and "=" in stripped:
+                    val = stripped.split("=", 1)[1].strip().strip('"').strip("'").lower()
+                    return val == "true"
+        except FileNotFoundError:
+            pass
+        return False

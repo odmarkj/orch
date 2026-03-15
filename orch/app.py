@@ -1174,7 +1174,7 @@ class OrchApp(App):
         self.notify(f"Todo added to {project.name}")
         self._refresh_panes()
 
-    # ── Auto-dispatch logic ─────────────────────────────────────────────────
+    # ── Auto-dispatch logic (parallel worktree-based) ──────────────────────
 
     def _schedule_dispatch_check(self, project: Project) -> None:
         """Debounced: schedule a dispatch check 10 seconds from now."""
@@ -1189,48 +1189,52 @@ class OrchApp(App):
         )
 
     def _maybe_auto_dispatch(self, project: Project) -> None:
-        """Check if we should auto-dispatch the next pending todo."""
-        from .container import _run_task_headless
+        """
+        Dispatch pending todos in parallel using worktrees.
+        Up to max_parallel tasks run concurrently (default 3).
+        """
+        from .container import _load_dispatch_config, run_task_in_worktree
 
-        # Clean up the timer reference
         key = str(project.path)
         self._dispatch_timers.pop(key, None)
 
         if not project.auto_dispatch_enabled:
             return
-        if not container_is_running(project):
-            return
-        if project.status_indicator != "idle":
-            return
-        if project.in_progress_count > 0:
-            return
 
-        # Clear stale active_todo from previous task
-        if project.active_todo is not None:
-            project.active_todo_file.unlink(missing_ok=True)
+        # How many slots are available?
+        cfg = _load_dispatch_config()
+        max_parallel = cfg.get("max_parallel", 3)
+        active = project.in_progress_count
+        slots = max(0, max_parallel - active)
 
-        todo_text = project.first_pending_todo
-        if not todo_text:
+        if slots == 0:
             return
 
-        if not self._claim_todo(project, todo_text):
+        # Grab up to `slots` pending todos
+        pending = project.pending_todos[:slots]
+        if not pending:
             return
 
-        task = (
-            f"Work on the next todo from TODOS.md: {todo_text}\n\n"
-            f"Mark it as - [x] when complete, then clear .claude/status."
-        )
+        # Claim and dispatch each todo in parallel
+        for todo_text in pending:
+            if not self._claim_todo(project, todo_text):
+                continue
 
-        def _run():
-            try:
-                _run_task_headless(project, task)
-                self.call_from_thread(self._on_dispatch_complete, project, todo_text)
-            except Exception as e:
-                self.call_from_thread(self._on_dispatch_failed, project, todo_text, e)
+            def _run(tt=todo_text):
+                try:
+                    results = run_task_in_worktree(project, tt)
+                    self.call_from_thread(
+                        self._on_dispatch_complete, project, tt, results
+                    )
+                except Exception as e:
+                    self.call_from_thread(
+                        self._on_dispatch_failed, project, tt, e
+                    )
 
-        self.run_worker(_run, thread=True)
-        truncated = todo_text[:50] + ("…" if len(todo_text) > 50 else "")
-        self.notify(f"⚡ Auto-dispatched: {truncated}")
+            self.run_worker(_run, thread=True)
+            truncated = todo_text[:50] + ("…" if len(todo_text) > 50 else "")
+            self.notify(f"⚡ Dispatched (worktree): {truncated}")
+
         self._refresh_project_item(project)
         if self.selected_project and self.selected_project.path == project.path:
             self._refresh_panes()
@@ -1253,21 +1257,92 @@ class OrchApp(App):
         project.active_todo_file.write_text(todo_text)
         return True
 
-    def _on_dispatch_complete(self, project: Project, todo_text: str) -> None:
+    def _mark_todo_done(self, project: Project, todo_text: str) -> None:
+        """Mark a todo as done in TODOS.md."""
+        try:
+            content = project.todos_file.read_text()
+            content = content.replace(f"- [~] {todo_text}", f"- [x] {todo_text}", 1)
+            project.todos_file.write_text(content)
+        except FileNotFoundError:
+            pass
+
+    def _on_dispatch_complete(
+        self, project: Project, todo_text: str, results: dict
+    ) -> None:
+        from .container import remove_worktree
+        from pathlib import Path
+
+        # Mark done
+        self._mark_todo_done(project, todo_text)
+
+        # Build notification
+        pr_url = results.get("pr_url")
+        branch = results.get("branch", "")
+        truncated = todo_text[:40] + ("…" if len(todo_text) > 40 else "")
+        if pr_url:
+            self.notify(f"✓ {truncated} → PR: {pr_url}")
+        else:
+            self.notify(f"✓ {truncated} → branch: {branch}")
+
+        # If there's a code review, write it as a comment on the PR
+        review = results.get("review", "")
+        if review and pr_url:
+            self._post_review_comment(pr_url, review)
+
+        # Clean up worktree
+        wt_path = results.get("worktree")
+        if wt_path:
+            try:
+                remove_worktree(project, Path(wt_path))
+            except Exception:
+                pass
+
+        # Clear active_todo if this was the last in-progress
+        if project.in_progress_count == 0:
+            project.active_todo_file.unlink(missing_ok=True)
+
         self._refresh_project_item(project)
         if self.selected_project and self.selected_project.path == project.path:
             self._refresh_panes()
 
-    def _on_dispatch_failed(self, project: Project, todo_text: str, error: Exception) -> None:
-        self.notify(f"Auto-dispatch failed for {project.name}: {error}", severity="error")
+        # Check if more todos to dispatch
+        self._schedule_dispatch_check(project)
+
+    def _on_dispatch_failed(
+        self, project: Project, todo_text: str, error: Exception
+    ) -> None:
+        self.notify(
+            f"Auto-dispatch failed for {project.name}: {error}",
+            severity="error",
+        )
         # Unclaim: revert - [~] back to - [ ]
         try:
             content = project.todos_file.read_text()
-            content = content.replace(f"- [~] {todo_text}", f"- [ ] {todo_text}", 1)
+            content = content.replace(
+                f"- [~] {todo_text}", f"- [ ] {todo_text}", 1
+            )
             project.todos_file.write_text(content)
         except FileNotFoundError:
             pass
         project.active_todo_file.unlink(missing_ok=True)
+
+        # Still try to dispatch remaining todos
+        self._schedule_dispatch_check(project)
+
+    def _post_review_comment(self, pr_url: str, review: str) -> None:
+        """Post a code review comment on the PR using gh CLI."""
+        import subprocess, shutil
+        if not shutil.which("gh"):
+            return
+        try:
+            subprocess.run(
+                ["gh", "pr", "comment", pr_url, "--body", review],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except Exception:
+            pass
 
     def on_unmount(self) -> None:
         # Stop dispatch timers

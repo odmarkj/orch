@@ -727,3 +727,273 @@ def _run_task_headless(project: "Project", task: str) -> None:
         text=True,
         timeout=30,
     )
+
+
+# ── Dispatch config ──────────────────────────────────────────────────────────
+
+DEFAULT_MAX_PARALLEL = 3
+
+def _load_dispatch_config() -> dict:
+    """Load [dispatch] section from ~/.orch/config.toml."""
+    defaults = {
+        "max_parallel": DEFAULT_MAX_PARALLEL,
+    }
+    config_file = Path.home() / ".orch" / "config.toml"
+    if not config_file.exists():
+        return defaults
+    section = None
+    for raw in config_file.read_text().splitlines():
+        line = raw.strip()
+        if line == "[dispatch]":
+            section = "dispatch"
+            continue
+        if line.startswith("["):
+            section = None
+            continue
+        if section == "dispatch" and "=" in line:
+            key, _, val = line.partition("=")
+            key = key.strip()
+            val = val.strip().strip('"').strip("'")
+            if key == "max_parallel":
+                try:
+                    defaults[key] = int(val)
+                except ValueError:
+                    pass
+            else:
+                if val.lower() == "true":
+                    val = True
+                elif val.lower() == "false":
+                    val = False
+                defaults[key] = val
+    return defaults
+
+
+# ── Worktree helpers ──────────────────────────────────────────────────────────
+
+def _slugify(text: str, max_len: int = 30) -> str:
+    """Turn a todo description into a safe branch/directory name slug."""
+    import re
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", text.lower()).strip("-")
+    return slug[:max_len]
+
+
+def create_worktree(project: "Project", todo_text: str) -> tuple[Path, str]:
+    """
+    Create a git worktree for the given todo.
+    Returns (worktree_path, branch_name).
+    """
+    import random as _rand
+    slug = _slugify(todo_text)
+    suffix = _rand.randint(1000, 9999)
+    branch_name = f"auto/{slug}-{suffix}"
+    worktree_dir = project.path.parent / f".orch-worktrees" / f"{project.name}-{slug}-{suffix}"
+
+    worktree_dir.parent.mkdir(parents=True, exist_ok=True)
+
+    # Create worktree with a new branch from HEAD
+    result = subprocess.run(
+        ["git", "worktree", "add", "-b", branch_name, str(worktree_dir)],
+        capture_output=True,
+        text=True,
+        cwd=str(project.path),
+        timeout=30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"git worktree add failed: {result.stderr}")
+
+    return worktree_dir, branch_name
+
+
+def remove_worktree(project: "Project", worktree_path: Path) -> None:
+    """Remove a git worktree after work is done."""
+    subprocess.run(
+        ["git", "worktree", "remove", "--force", str(worktree_path)],
+        capture_output=True,
+        text=True,
+        cwd=str(project.path),
+        timeout=30,
+    )
+
+
+def _run_code_review(project: "Project", worktree_path: Path, branch_name: str) -> str:
+    """
+    Run Claude code review on the worktree changes.
+    Returns the review text.
+    """
+    # Get the diff of changes in the worktree
+    diff_result = subprocess.run(
+        ["git", "diff", "HEAD~1"],
+        capture_output=True,
+        text=True,
+        cwd=str(worktree_path),
+        timeout=30,
+    )
+    diff_text = diff_result.stdout.strip()
+    if not diff_text:
+        return ""
+
+    # Run Claude to review the diff
+    review_prompt = (
+        "Review the following code changes. Be concise. "
+        "Flag any bugs, security issues, or significant problems. "
+        "If the changes look good, say so briefly.\n\n"
+        f"```diff\n{diff_text[:8000]}\n```"
+    )
+    safe_prompt = review_prompt.replace("'", "'\\''")
+
+    result = subprocess.run(
+        ["claude", "--dangerously-skip-permissions", "-p", safe_prompt],
+        capture_output=True,
+        text=True,
+        cwd=str(worktree_path),
+        timeout=120,
+    )
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def _commit_and_push_worktree(worktree_path: Path, branch_name: str, todo_text: str) -> None:
+    """Stage all changes, commit, and push the worktree branch."""
+    # Stage all changes
+    subprocess.run(
+        ["git", "add", "-A"],
+        capture_output=True, cwd=str(worktree_path), timeout=30,
+    )
+
+    # Check if there are changes to commit
+    status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        capture_output=True, text=True, cwd=str(worktree_path), timeout=10,
+    )
+    if not status.stdout.strip():
+        return  # Nothing to commit
+
+    # Commit
+    safe_msg = todo_text[:72]
+    subprocess.run(
+        ["git", "commit", "-m", f"auto: {safe_msg}"],
+        capture_output=True, text=True, cwd=str(worktree_path), timeout=30,
+    )
+
+    # Push with retries (exponential backoff)
+    import time
+    delays = [2, 4, 8, 16]
+    for attempt in range(5):
+        result = subprocess.run(
+            ["git", "push", "-u", "origin", branch_name],
+            capture_output=True, text=True, cwd=str(worktree_path), timeout=60,
+        )
+        if result.returncode == 0:
+            return
+        if attempt < len(delays):
+            time.sleep(delays[attempt])
+
+    # Final attempt failed — not fatal, just log
+
+
+def _create_pr(worktree_path: Path, branch_name: str, todo_text: str, review_text: str = "") -> str | None:
+    """
+    Create a pull request for the worktree branch using gh CLI.
+    Returns the PR URL or None if gh is unavailable.
+    """
+    import shutil
+    if not shutil.which("gh"):
+        return None
+
+    body = f"## Auto-dispatched task\n\n{todo_text}\n"
+    if review_text:
+        body += f"\n## Code Review\n\n{review_text}\n"
+
+    safe_title = f"auto: {todo_text[:60]}"
+
+    result = subprocess.run(
+        ["gh", "pr", "create",
+         "--title", safe_title,
+         "--body", body,
+         "--head", branch_name],
+        capture_output=True,
+        text=True,
+        cwd=str(worktree_path),
+        timeout=30,
+    )
+    if result.returncode == 0:
+        return result.stdout.strip()
+    return None
+
+
+def run_task_in_worktree(project: "Project", todo_text: str) -> dict:
+    """
+    Full pipeline: worktree -> Claude task -> code review -> commit -> push -> PR.
+    Returns a dict with results: {branch, worktree, pr_url, review}.
+    """
+    worktree_path, branch_name = create_worktree(project, todo_text)
+    results = {"branch": branch_name, "worktree": str(worktree_path), "pr_url": None, "review": ""}
+
+    try:
+        # Run Claude on the task inside the worktree
+        safe_task = todo_text.replace("'", "'\\''")
+        task_prompt = (
+            f"Work on this task: {safe_task}\n\n"
+            f"When done, make sure all changes are saved. Do not commit or push."
+        )
+        safe_prompt = task_prompt.replace("'", "'\\''")
+
+        subprocess.run(
+            ["claude", "--dangerously-skip-permissions", "-p", safe_prompt],
+            capture_output=True,
+            text=True,
+            cwd=str(worktree_path),
+            timeout=600,
+        )
+
+        # Code review (if enabled for project)
+        if project.code_review_enabled:
+            # First do a temporary commit so review can diff
+            subprocess.run(["git", "add", "-A"], capture_output=True, cwd=str(worktree_path), timeout=10)
+            subprocess.run(
+                ["git", "commit", "-m", f"wip: {todo_text[:50]}"],
+                capture_output=True, text=True, cwd=str(worktree_path), timeout=10,
+            )
+            review = _run_code_review(project, worktree_path, branch_name)
+            results["review"] = review
+
+            # Write review as a file in the worktree for reference
+            if review:
+                review_file = worktree_path / ".claude" / "last_review.md"
+                review_file.parent.mkdir(parents=True, exist_ok=True)
+                review_file.write_text(review)
+        else:
+            # Just commit directly
+            _commit_and_push_worktree(worktree_path, branch_name, todo_text)
+
+        # Push (handles both cases — review already committed, or fresh commit)
+        if project.code_review_enabled:
+            # Amend commit with final message and push
+            subprocess.run(
+                ["git", "commit", "--amend", "-m", f"auto: {todo_text[:72]}"],
+                capture_output=True, text=True, cwd=str(worktree_path), timeout=10,
+            )
+            import time
+            delays = [2, 4, 8, 16]
+            for attempt in range(5):
+                result = subprocess.run(
+                    ["git", "push", "-u", "origin", branch_name, "--force-with-lease"],
+                    capture_output=True, text=True, cwd=str(worktree_path), timeout=60,
+                )
+                if result.returncode == 0:
+                    break
+                if attempt < len(delays):
+                    time.sleep(delays[attempt])
+
+        # Create PR
+        pr_url = _create_pr(worktree_path, branch_name, todo_text, results.get("review", ""))
+        results["pr_url"] = pr_url
+
+    except Exception:
+        # On failure, still try to clean up worktree
+        try:
+            remove_worktree(project, worktree_path)
+        except Exception:
+            pass
+        raise
+
+    return results
