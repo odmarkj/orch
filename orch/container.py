@@ -119,6 +119,40 @@ def _load_container_config() -> dict:
     return defaults
 
 
+# ── SSH agent forwarding ─────────────────────────────────────────────────────
+
+# Target path for the SSH agent socket inside the container
+_CONTAINER_SSH_AUTH_SOCK = "/tmp/ssh-agent.sock"
+
+
+def _ssh_agent_mount() -> tuple[str, str] | None:
+    """
+    Return (mount_string, env_value) for forwarding the host SSH agent into
+    the container, or None if no agent is available.
+
+    macOS + Docker Desktop: uses the built-in /run/host-services/ssh-auth.sock
+    proxy so Unix socket mounting just works.
+
+    Linux: bind-mounts $SSH_AUTH_SOCK directly.
+    """
+    if platform.system() == "Darwin":
+        # Docker Desktop for Mac exposes the host agent at a magic path
+        return (
+            f"source=/run/host-services/ssh-auth.sock,"
+            f"target={_CONTAINER_SSH_AUTH_SOCK},type=bind",
+            _CONTAINER_SSH_AUTH_SOCK,
+        )
+
+    sock = os.environ.get("SSH_AUTH_SOCK", "")
+    if sock and Path(sock).exists():
+        return (
+            f"source={sock},target={_CONTAINER_SSH_AUTH_SOCK},type=bind",
+            _CONTAINER_SSH_AUTH_SOCK,
+        )
+
+    return None
+
+
 # ── Detection helpers ────────────────────────────────────────────────────────
 
 def _has_devcontainer_cli() -> bool:
@@ -215,6 +249,16 @@ def _prepare_devcontainer_config(project: "Project") -> Path:
         if not has_claude_mount:
             merged_mounts.insert(0, claude_mount)
 
+        # Forward host SSH agent into the container
+        ssh = _ssh_agent_mount()
+        if ssh:
+            ssh_mount, ssh_env = ssh
+            if not any(_mount_target(m) == _CONTAINER_SSH_AUTH_SOCK for m in merged_mounts):
+                merged_mounts.append(ssh_mount)
+            container_env = config.get("containerEnv", {})
+            container_env["SSH_AUTH_SOCK"] = ssh_env
+            config["containerEnv"] = container_env
+
         config["mounts"] = merged_mounts
 
         # Write merged config to ~/.orch/ so we don't modify the project's file
@@ -251,6 +295,13 @@ def _prepare_devcontainer_config(project: "Project") -> Path:
         config["mounts"].append(
             f"source={claude_json},target={CONTAINER_HOME}/.claude.json,type=bind"
         )
+
+    # Forward host SSH agent into the container
+    ssh = _ssh_agent_mount()
+    if ssh:
+        ssh_mount, ssh_env = ssh
+        config["mounts"].append(ssh_mount)
+        config["containerEnv"]["SSH_AUTH_SOCK"] = ssh_env
 
     dc_json.write_text(json.dumps(config, indent=2) + "\n")
     return dc_json
@@ -350,6 +401,16 @@ def _docker_run(project: "Project") -> str:
     ]
     if claude_json.exists():
         mount_args += ["-v", f"{claude_json}:{CONTAINER_HOME}/.claude.json"]
+
+    # Forward host SSH agent for git operations
+    ssh = _ssh_agent_mount()
+    if ssh:
+        ssh_mount, ssh_env = ssh
+        # Convert devcontainer mount string to docker -v format
+        src = ssh_mount.split("source=")[1].split(",")[0]
+        tgt = ssh_mount.split("target=")[1].split(",")[0]
+        mount_args += ["-v", f"{src}:{tgt}"]
+        env_args += ["-e", f"SSH_AUTH_SOCK={ssh_env}"]
 
     cmd = [
         "docker", "run", "-d",
