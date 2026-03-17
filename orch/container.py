@@ -753,6 +753,106 @@ def exec_claude_in_iterm(project: "Project") -> None:
         handle_file.write_text(tty)
 
 
+def exec_shell_in_iterm(project: "Project") -> None:
+    """
+    Open an iTerm2 tab with a plain bash shell inside the project's container.
+    Ensures the container is running first.
+    """
+    from .iterm import _load_config, _bring_tab_to_front
+
+    # Reuse existing shell tab if open
+    handle_file = project.claude_dir / "iterm_container_shell_handle"
+    if handle_file.exists():
+        tty = handle_file.read_text().strip()
+        if tty and _bring_tab_to_front(tty):
+            return
+        handle_file.unlink(missing_ok=True)
+
+    # Ensure container is running
+    cid = ensure_running(project)
+    workdir = _container_workdir(cid, project)
+    shell_cmd = f"docker exec -it -u {CONTAINER_USER} -w {workdir} {cid} bash"
+
+    cfg = _load_config()
+    profile = cfg["iterm"].get("profile", "orch")
+    dedicated = cfg["iterm"].get("dedicated_window", True)
+    window_title = cfg["iterm"].get("window_title", "orch sessions")
+    tab_name = f"{project.name} (shell)"
+
+    if dedicated:
+        script = f"""
+        tell application "iTerm2"
+            activate
+            set orchWindow to missing value
+            set isNewWindow to false
+            repeat with w in windows
+                if name of w contains "{window_title}" then
+                    set orchWindow to w
+                    exit repeat
+                end if
+            end repeat
+            if orchWindow is missing value then
+                try
+                    set orchWindow to (create window with profile "{profile}")
+                on error
+                    set orchWindow to (create window with default profile)
+                end try
+                set isNewWindow to true
+            end if
+            tell orchWindow
+                if not isNewWindow then
+                    try
+                        create tab with profile "{profile}"
+                    on error
+                        create tab with default profile
+                    end try
+                end if
+                tell current session
+                    set name to "{tab_name}"
+                    write text "{shell_cmd}"
+                    set thetty to tty
+                end tell
+            end tell
+            return thetty
+        end tell
+        """
+    else:
+        script = f"""
+        tell application "iTerm2"
+            activate
+            set isNewWindow to false
+            if (count of windows) is 0 then
+                try
+                    create window with profile "{profile}"
+                on error
+                    create window with default profile
+                end try
+                set isNewWindow to true
+            end if
+            tell current window
+                if not isNewWindow then
+                    try
+                        create tab with profile "{profile}"
+                    on error
+                        create tab with default profile
+                    end try
+                end if
+                tell current session
+                    set name to "{tab_name}"
+                    write text "{shell_cmd}"
+                    set thetty to tty
+                end tell
+            end tell
+            return thetty
+        end tell
+        """
+
+    from .iterm import _run_iterm_script
+    tty = _run_iterm_script(script)
+    if tty:
+        handle_file.write_text(tty)
+
+
 def _send_task_to_container(project: "Project", task: str) -> None:
     """
     Launch Claude in the container with a task as the initial prompt.

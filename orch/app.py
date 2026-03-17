@@ -542,6 +542,7 @@ class OrchApp(App):
         Binding("a", "focus_input_todo", "Add Todo", show=True),
         Binding("e", "exec_shell", "Shell", show=True),
         Binding("c", "container_up", "Container", show=True),
+        Binding("x", "container_shell", "Shell(ctr)", show=True),
         Binding("d", "container_down_press", "Down(dd)", show=True),
         Binding("l", "open_logs", "Logs", show=True),
         Binding("p", "open_plan", "Plan", show=True),
@@ -583,7 +584,7 @@ class OrchApp(App):
                 yield Static("todos", id="right-title")
                 yield Markdown("", id="todos-view")
         yield Static(
-            "[dim]t[/]ask  [dim]a[/]dd todo  [dim]e[/]xec  [dim]c[/]ontainer  [dim]dd[/] down  "
+            "[dim]t[/]ask  [dim]a[/]dd todo  [dim]e[/]xec  [dim]c[/]ontainer  [dim]x[/] shell(ctr)  [dim]dd[/] down  "
             "[dim]l[/]ogs  [dim]p[/]lan  [dim]b[/]ridge  [dim]s[/]tage  "
             "[dim]i[/]gnore  [dim]g[/] auto  [dim]r[/]efresh  [dim]q[/]uit  [dim]?[/] toggle help\n"
             "\n"
@@ -593,6 +594,7 @@ class OrchApp(App):
             "  [bold cyan]a[/]              Add todo to TODOS.md\n"
             "  [bold cyan]e[/]              Open iTerm2 tab with Claude (host) [dim]desktop only[/]\n"
             "  [bold cyan]c[/]              Open iTerm2 tab with Claude (container) [dim]desktop only[/]\n"
+            "  [bold cyan]x[/]              Open iTerm2 tab with bash shell (container) [dim]desktop only[/]\n"
             "  [bold cyan]dd[/]             Stop and remove container (double-press)\n"
             "  [bold cyan]l[/]              Tail docker logs in iTerm2 tab [dim]desktop only[/]\n"
             "  [bold cyan]p[/]              Generate day plan in iTerm2 tab [dim]desktop only[/]\n"
@@ -752,7 +754,7 @@ class OrchApp(App):
             return
 
         # ── iterm handles: no action needed ───────────────────────────────────
-        if changed.name in ("iterm_handle", "iterm_container_handle", "iterm_log_handle"):
+        if changed.name in ("iterm_handle", "iterm_container_handle", "iterm_container_shell_handle", "iterm_log_handle"):
             return
 
         # ── Auto-dispatch files: skip refresh loop ────────────────────────────
@@ -960,6 +962,32 @@ class OrchApp(App):
             except Exception as e:
                 self.call_from_thread(self._stop_spinner_and_refresh, p,
                                       f"Launch failed: {e}", "error")
+
+        self.run_worker(_launch, thread=True)
+
+    def action_container_shell(self) -> None:
+        """Open an iTerm2 tab with a bash shell inside the container."""
+        if self._input_focused: return
+        if self._mobile:
+            self.notify("Not available on mobile — use the bridge instead", severity="warning")
+            return
+        p = self.selected_project
+        if not p:
+            self.notify("No project selected", severity="warning")
+            return
+
+        pane = self.query_one("#status-pane", StatusPane)
+        pane.start_spinner("Opening shell in container", p)
+
+        def _launch():
+            try:
+                from .container import exec_shell_in_iterm
+                exec_shell_in_iterm(p)
+                self.call_from_thread(self._stop_spinner_and_refresh, p,
+                                      f"Shell opened for {p.name}")
+            except Exception as e:
+                self.call_from_thread(self._stop_spinner_and_refresh, p,
+                                      f"Shell failed: {e}", "error")
 
         self.run_worker(_launch, thread=True)
 
