@@ -137,9 +137,19 @@ class StatusPane(Static):
         self._spinner_label: str = ""
         self._spinner_project: Project | None = None
         self._spinner_words = list(SPINNER_WORDS)
+        self._error: str | None = None  # persistent error shown until next action
+
+    def set_error(self, message: str) -> None:
+        """Set a persistent error message shown in the status pane."""
+        self._error = message
+
+    def clear_error(self) -> None:
+        """Clear any persistent error."""
+        self._error = None
 
     def start_spinner(self, label: str, project: Project | None = None) -> None:
         """Start showing a rotating activity spinner."""
+        self.clear_error()
         self._spinner_label = label
         self._spinner_project = project
         random.shuffle(self._spinner_words)
@@ -211,7 +221,11 @@ class StatusPane(Static):
 
         path_line = f"\n\n[dim]{project.path}[/]"
 
-        self.update(f"{status_line}{container_line}{abstract_line}{path_line}")
+        error_line = ""
+        if self._error:
+            error_line = f"\n\n[bold red]Container error:[/]\n[red]{self._error}[/]"
+
+        self.update(f"{status_line}{container_line}{abstract_line}{path_line}{error_line}")
 
 
 # ── Mobile tab bar ────────────────────────────────────────────────────────────
@@ -818,6 +832,8 @@ class OrchApp(App):
         """Stop the spinner, show a notification, and refresh the UI."""
         pane = self.query_one("#status-pane", StatusPane)
         pane.stop_spinner()
+        if severity == "error":
+            pane.set_error(message)
         self.notify(message, severity=severity)
         self._refresh_project_item(project)
         if self.selected_project and self.selected_project.path == project.path:

@@ -158,25 +158,81 @@ def clear_stale_container(project: "Project") -> None:
 
 # ── Devcontainer CLI strategy ────────────────────────────────────────────────
 
-def _ensure_devcontainer_json(project: "Project") -> Path:
+def _mount_target(mount_str: str) -> str | None:
+    """Extract the target path from a devcontainer mount string."""
+    for part in mount_str.split(","):
+        key, _, val = part.partition("=")
+        if key.strip() == "target":
+            return val
+    return None
+
+
+def _prepare_devcontainer_config(project: "Project") -> Path:
     """
-    Ensure a .devcontainer/devcontainer.json exists for the project.
-    If the project already has one, use it. Otherwise, generate one from template.
-    Returns the path to the devcontainer.json.
+    Prepare a devcontainer.json for the project, ready for `devcontainer up`.
+
+    If the project has an existing .devcontainer/devcontainer.json, orch
+    reads it and merges in its requirements (Claude config mount, env vars).
+    The merged config is written to ~/.orch/devcontainers/<project>/ so
+    the project's own file is never modified.  All other settings
+    (features, mounts, postCreateCommand, etc.) are preserved as-is — if
+    a mount source doesn't exist on this host the container will fail and
+    the error will be shown in the status pane.
+
+    If no project config exists, generates one from orch's template and
+    writes it to the project's .devcontainer/ so the user can customize it.
+
+    Returns the path to the config to use with `devcontainer up --config`.
     """
+    project_dc = project.path / ".devcontainer" / "devcontainer.json"
+    cfg = _load_container_config()
+
+    if project_dc.exists():
+        # ── Merge mode: start from the project's config ─────────────
+        config = json.loads(project_dc.read_text())
+
+        # Ensure CLAUDE_CONFIG_DIR is set
+        container_env = config.get("containerEnv", {})
+        container_env["CLAUDE_CONFIG_DIR"] = f"{CONTAINER_HOME}/.claude"
+        config["containerEnv"] = container_env
+
+        # Replace any existing ~/.claude mount with orch's, or add it
+        claude_host = str(Path.home() / ".claude")
+        claude_mount = f"source={claude_host},target={CONTAINER_HOME}/.claude,type=bind"
+
+        existing_mounts = config.get("mounts", [])
+        merged_mounts = []
+        has_claude_mount = False
+
+        for m in existing_mounts:
+            target = _mount_target(m)
+            if target and target.rstrip("/").endswith("/.claude"):
+                has_claude_mount = True
+                merged_mounts.append(claude_mount)
+            else:
+                merged_mounts.append(m)
+
+        if not has_claude_mount:
+            merged_mounts.insert(0, claude_mount)
+
+        config["mounts"] = merged_mounts
+
+        # Write merged config to ~/.orch/ so we don't modify the project's file
+        orch_dc_dir = Path.home() / ".orch" / "devcontainers" / project.name
+        orch_dc_dir.mkdir(parents=True, exist_ok=True)
+        orch_dc_json = orch_dc_dir / "devcontainer.json"
+        orch_dc_json.write_text(json.dumps(config, indent=2) + "\n")
+        return orch_dc_json
+
+    # ── Generate mode: no existing config ────────────────────────
     dc_dir = project.path / ".devcontainer"
     dc_json = dc_dir / "devcontainer.json"
-
-    if dc_json.exists():
-        return dc_json
-
-    # Generate from template
     dc_dir.mkdir(exist_ok=True)
+
     config = dict(DEVCONTAINER_TEMPLATE)
     config["name"] = f"orch — {project.name}"
 
     # Add env var passthrough
-    cfg = _load_container_config()
     env_vars = [v.strip() for v in cfg.get("passthrough_env", "").split(",") if v.strip()]
     container_env = dict(config.get("containerEnv", {}))
     for var in env_vars:
@@ -185,7 +241,7 @@ def _ensure_devcontainer_json(project: "Project") -> Path:
             container_env[var] = host_val
     config["containerEnv"] = container_env
 
-    # Mount Claude config and auth from host so container skips login/setup
+    # Mount Claude config and auth from host
     claude_host = Path.home() / ".claude"
     claude_json = Path.home() / ".claude.json"
     config["mounts"] = [
@@ -202,7 +258,7 @@ def _ensure_devcontainer_json(project: "Project") -> Path:
 
 def _devcontainer_up(project: "Project") -> str:
     """Use devcontainer CLI to start container. Returns container ID."""
-    _ensure_devcontainer_json(project)
+    dc_json = _prepare_devcontainer_config(project)
 
     # Pass through env vars
     cfg = _load_container_config()
@@ -216,13 +272,18 @@ def _devcontainer_up(project: "Project") -> str:
     cmd = [
         "devcontainer", "up",
         "--workspace-folder", str(project.path),
+        "--config", str(dc_json),
     ] + env_args
 
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
 
     if result.returncode != 0:
+        # Show only the last few lines — the full stderr is a verbose build
+        # log and the actual error is usually at the end.
+        lines = result.stderr.strip().splitlines()
+        tail = "\n".join(lines[-15:])
         raise RuntimeError(
-            f"devcontainer up failed for {project.name}:\n{result.stderr}"
+            f"devcontainer up failed for {project.name}:\n{tail}"
         )
 
     # Parse the JSON output to get container ID
