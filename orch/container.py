@@ -153,6 +153,18 @@ def _ssh_agent_mount() -> tuple[str, str] | None:
     return None
 
 
+def _fix_ssh_socket_permissions(cid: str) -> None:
+    """
+    The SSH agent socket is mounted as root:root. Make it accessible to the
+    container user so git/ssh operations work.
+    """
+    subprocess.run(
+        ["docker", "exec", "-u", "root", cid,
+         "chmod", "777", _CONTAINER_SSH_AUTH_SOCK],
+        capture_output=True,
+    )
+
+
 # ── Detection helpers ────────────────────────────────────────────────────────
 
 def _has_devcontainer_cli() -> bool:
@@ -604,6 +616,9 @@ def ensure_running(project: "Project") -> str:
 
     # Set up permissions inside the container
     _setup_permissions(cid, project)
+
+    # Fix SSH agent socket permissions so the container user can access it
+    _fix_ssh_socket_permissions(cid)
 
     # Inject host OAuth credentials so Claude doesn't prompt for login
     _inject_credentials(cid)
