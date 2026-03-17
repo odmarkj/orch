@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import json
 import os
+import platform
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -398,6 +400,61 @@ def _mark_onboarding_complete(cid: str, config_path: str) -> None:
     )
 
 
+# ── Credential injection ────────────────────────────────────────────────────
+
+
+def _extract_host_credentials() -> str | None:
+    """Extract Claude OAuth credentials from the macOS Keychain.
+
+    On macOS, Claude Code stores OAuth tokens in the Keychain under the
+    service name "Claude Code-credentials".  On Linux (inside containers)
+    it reads from $CLAUDE_CONFIG_DIR/.credentials.json instead.
+
+    Returns the raw JSON string, or None if unavailable.
+    """
+    if platform.system() != "Darwin":
+        return None
+
+    result = subprocess.run(
+        ["security", "find-generic-password",
+         "-s", "Claude Code-credentials", "-w"],
+        capture_output=True, text=True, timeout=10,
+    )
+    if result.returncode != 0:
+        return None
+    cred = result.stdout.strip()
+    # Sanity-check: should be valid JSON containing an OAuth token
+    try:
+        data = json.loads(cred)
+        if "claudeAiOauth" not in data:
+            return None
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return cred
+
+
+def _inject_credentials(cid: str) -> None:
+    """Extract OAuth credentials from macOS Keychain and write them into the
+    container as a plaintext credentials file.
+
+    Claude Code on Linux reads $CLAUDE_CONFIG_DIR/.credentials.json as a
+    fallback when the macOS Keychain is unavailable.  We extract the token
+    from the host Keychain and write it directly to that path inside the
+    container.
+    """
+    cred_json = _extract_host_credentials()
+    if not cred_json:
+        return  # No credentials to inject (not macOS, or not logged in)
+
+    safe_cred = shlex.quote(cred_json)
+    cred_path = f"{CONTAINER_HOME}/.claude/.credentials.json"
+    subprocess.run(
+        ["docker", "exec", "-u", CONTAINER_USER, cid, "bash", "-c",
+         f"printf '%s' {safe_cred} > {cred_path} && chmod 600 {cred_path}"],
+        capture_output=True, timeout=10,
+    )
+
+
 # ── Main lifecycle functions ─────────────────────────────────────────────────
 
 def ensure_running(project: "Project") -> str:
@@ -425,6 +482,9 @@ def ensure_running(project: "Project") -> str:
 
     # Set up permissions inside the container
     _setup_permissions(cid, project)
+
+    # Inject host OAuth credentials so Claude doesn't prompt for login
+    _inject_credentials(cid)
 
     # Track the container ID
     project.claude_dir.mkdir(parents=True, exist_ok=True)
@@ -502,12 +562,27 @@ def _container_workdir(cid: str, project: "Project | None" = None) -> str:
     return WORKSPACE_DIR
 
 
+def _ensure_credentials_injected(cid: str) -> None:
+    """Lazily inject credentials if .credentials.json doesn't exist yet.
+
+    Handles containers that were started before credential injection was added.
+    """
+    cred_path = f"{CONTAINER_HOME}/.claude/.credentials.json"
+    check = subprocess.run(
+        ["docker", "exec", cid, "test", "-f", cred_path],
+        capture_output=True,
+    )
+    if check.returncode != 0:
+        _inject_credentials(cid)
+
+
 def exec_cmd(project: "Project") -> str:
     """
     Return the docker exec command string to run claude inside the container.
     Ensures the container is running first.
     """
     cid = ensure_running(project)
+    _ensure_credentials_injected(cid)
     workdir = _container_workdir(cid, project)
     args = _build_claude_args(project)
     return f"docker exec -it -u {CONTAINER_USER} -w {workdir} {cid} claude {args}"
@@ -532,6 +607,7 @@ def exec_claude_in_iterm(project: "Project") -> None:
 
     # Ensure container is running
     cid = ensure_running(project)
+    _ensure_credentials_injected(cid)
     workdir = _container_workdir(cid, project)
     args = _build_claude_args(project)
     claude_cmd = f"docker exec -it -u {CONTAINER_USER} -w {workdir} {cid} claude {args}"

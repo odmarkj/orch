@@ -54,7 +54,7 @@ def _find_project(name_or_cwd: str | None):
 
 
 def cmd_plan(argv: list[str]) -> None:
-    from .discovery import discover_projects
+    from .discovery import discover_projects, SITES_ROOT
     from .planner import generate, format_plan
     from .lifecycle import ensure_initialized
     import json as _json
@@ -69,7 +69,7 @@ def cmd_plan(argv: list[str]) -> None:
         ensure_initialized(p)
 
     if not projects:
-        print("No projects found in ~/Sites")
+        print(f"No projects found in {SITES_ROOT}")
         sys.exit(1)
 
     if not as_json:

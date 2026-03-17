@@ -144,6 +144,22 @@ def check_docker():
         print("    Start Docker Desktop and re-run setup")
 
 
+def _prompt_sites_root() -> str:
+    """Ask the user where their projects live, defaulting to cwd."""
+    default = os.getcwd()
+    print(f"  Where are your projects located?")
+    print(f"  orch scans this directory for subdirectories containing .claude/")
+    try:
+        answer = input(f"  Projects root [{default}]: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        answer = ""
+    chosen = answer if answer else default
+    resolved = Path(chosen).expanduser().resolve()
+    if not resolved.is_dir():
+        print(f"  ⚠ {resolved} does not exist yet — it will be used once created")
+    return str(resolved)
+
+
 def create_config():
     step(5, 5, "Creating ~/.orch/config.toml")
     ORCH_CONFIG_DIR.mkdir(exist_ok=True)
@@ -187,7 +203,9 @@ max_parallel = 3
             print(f"  ✓ Already exists at {CONFIG_FILE}")
         return
 
-    config = """\
+    sites_root = _prompt_sites_root()
+
+    config = f"""\
 # orch configuration
 # Edit freely — changes take effect on next orch launch
 
@@ -216,7 +234,7 @@ notify_on_resume = true
 
 [projects]
 # Root directory to scan for projects (must contain .claude/ to be registered)
-sites_root = "~/Sites"
+sites_root = "{sites_root}"
 
 [container]
 # Enable containerized Claude sessions (requires Docker)
@@ -241,6 +259,7 @@ max_parallel = 3
 """
     CONFIG_FILE.write_text(config)
     print(f"  ✓ Created {CONFIG_FILE}")
+    print(f"    Projects root: {sites_root}")
 
 
 def print_claude_snippet():

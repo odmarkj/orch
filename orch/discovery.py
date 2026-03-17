@@ -2,7 +2,27 @@ from pathlib import Path
 from .models import Project
 
 
-SITES_ROOT = Path.home() / "Sites"
+def _load_sites_root() -> Path:
+    """Read [projects] sites_root from ~/.orch/config.toml, fallback to cwd."""
+    config_file = Path.home() / ".orch" / "config.toml"
+    if config_file.exists():
+        section = None
+        for raw in config_file.read_text().splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("[") and line.endswith("]"):
+                section = line[1:-1].strip()
+                continue
+            if section == "projects" and "=" in line:
+                key, _, val = line.partition("=")
+                if key.strip() == "sites_root":
+                    val = val.strip().strip('"').strip("'")
+                    return Path(val).expanduser().resolve()
+    return Path.cwd()
+
+
+SITES_ROOT = _load_sites_root()
 
 
 def _is_ignored(project_path: Path) -> bool:
@@ -24,8 +44,8 @@ def _is_ignored(project_path: Path) -> bool:
 
 def discover_projects(root: Path = SITES_ROOT) -> list[Project]:
     """
-    Auto-discover projects from ~/Sites/* where a .claude/ directory exists.
-    Skips projects with ignored = true in .orch/project.toml.
+    Auto-discover projects under the configured sites_root where a .git/
+    directory exists. Skips projects with ignored = true in .orch/project.toml.
     Sorted alphabetically. No manual registration needed.
     """
     if not root.exists():
@@ -33,7 +53,7 @@ def discover_projects(root: Path = SITES_ROOT) -> list[Project]:
 
     projects = []
     for candidate in sorted(root.iterdir()):
-        if candidate.is_dir() and (candidate / ".claude").is_dir():
+        if candidate.is_dir() and (candidate / ".git").is_dir():
             if not _is_ignored(candidate):
                 projects.append(Project(path=candidate))
 
