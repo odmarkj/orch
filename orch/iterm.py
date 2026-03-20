@@ -188,6 +188,7 @@ def open_input_tab(project: Project) -> None:
                 end if
                 tell current session
                     set name to "{project_name}"
+                    set badge to "{project_name}"
                     write text "cd {project_path} && {claude_cmd}"
                     set thetty to tty
                 end tell
@@ -218,6 +219,7 @@ def open_input_tab(project: Project) -> None:
                 end if
                 tell current session
                     set name to "{project_name}"
+                    set badge to "{project_name}"
                     write text "cd {project_path} && {claude_cmd}"
                     set thetty to tty
                 end tell
