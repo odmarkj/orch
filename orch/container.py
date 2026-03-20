@@ -742,6 +742,8 @@ def _setup_git_identity(cid: str, project: "Project | None" = None) -> None:
 
     Sets the identity at the repo level so commits made by Claude inside the
     container always have a consistent author regardless of host config.
+    Also seeds ~/.ssh/known_hosts with GitHub's host key so git push/pull
+    doesn't fail on host key verification.
     """
     workdir = _container_workdir(cid, project)
     subprocess.run(
@@ -753,6 +755,14 @@ def _setup_git_identity(cid: str, project: "Project | None" = None) -> None:
         ["docker", "exec", "-u", CONTAINER_USER, "-w", workdir, cid,
          "git", "config", "user.email", GIT_USER_EMAIL],
         capture_output=True, timeout=10,
+    )
+
+    # Seed SSH known_hosts with GitHub's host key so git operations don't
+    # fail on first use with "Host key verification failed"
+    subprocess.run(
+        ["docker", "exec", "-u", CONTAINER_USER, cid, "bash", "-c",
+         "mkdir -p ~/.ssh && ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null"],
+        capture_output=True, timeout=15,
     )
 
 
