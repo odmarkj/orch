@@ -292,9 +292,11 @@ def _open_log_tab(project: Project) -> None:
 
     handle_file = project.claude_dir / "iterm_log_handle"
 
+    tab_name     = f"{project.name} logs"
+
     if handle_file.exists():
         tty = handle_file.read_text().strip()
-        if tty and _bring_tab_to_front(tty):
+        if tty and _bring_tab_to_front(tty, expected_name=tab_name):
             return
         handle_file.unlink(missing_ok=True)
 
@@ -302,7 +304,6 @@ def _open_log_tab(project: Project) -> None:
     profile      = cfg["iterm"].get("profile", "orch")
     dedicated    = cfg["iterm"].get("dedicated_window", True)
     window_title = cfg["iterm"].get("window_title", "orch sessions")
-    tab_name     = f"{project.name} logs"
     cmd          = f"orch logs {project.name}"
 
     script = _build_iterm_tab_script(
@@ -343,10 +344,20 @@ def _build_iterm_tab_script(*, profile: str, dedicated: bool, window_title: str,
             activate
             set orchWindow to missing value
             set isNewWindow to false
+            set foundOrch to false
             repeat with w in windows
-                if name of w contains "{window_title}" then
-                    set orchWindow to w
-                    exit repeat
+                if not foundOrch then
+                    repeat with aTab in tabs of w
+                        if not foundOrch then
+                            repeat with aSession in sessions of aTab
+                                if profile name of aSession is "{profile}" then
+                                    set orchWindow to w
+                                    set foundOrch to true
+                                    exit repeat
+                                end if
+                            end repeat
+                        end if
+                    end repeat
                 end if
             end repeat
             if orchWindow is missing value then
@@ -498,16 +509,13 @@ class OrchApp(App):
 
     #help-bar {
         height: auto;
-        max-height: 14;
-        padding: 1 2;
+        max-height: 4;
+        padding: 0 2;
         background: $panel;
         border-top: solid $primary;
         color: $text;
     }
 
-    #help-bar.hidden {
-        display: none;
-    }
 
     /* ── Tab bar (hidden by default, shown in mobile mode) ── */
     TabBar {
@@ -550,7 +558,7 @@ class OrchApp(App):
         Binding("s", "set_stage", "Stage", show=True),
         Binding("i", "ignore_project", "Ignore", show=True),
         Binding("g", "toggle_auto_dispatch", "Auto(g)", show=True),
-        Binding("question_mark", "toggle_help", "?", show=True),
+        Binding("o", "edit_config", "Config", show=True),
         Binding("escape", "blur_input", "Cancel", show=False),
     ]
 
@@ -584,31 +592,8 @@ class OrchApp(App):
                 yield Static("todos", id="right-title")
                 yield Markdown("", id="todos-view")
         yield Static(
-            "[dim]t[/]ask  [dim]a[/]dd todo  [dim]e[/]xec  [dim]c[/]ontainer  [dim]x[/] shell(ctr)  [dim]dd[/] down  "
-            "[dim]l[/]ogs  [dim]p[/]lan  [dim]b[/]ridge  [dim]s[/]tage  "
-            "[dim]i[/]gnore  [dim]g[/] auto  [dim]r[/]efresh  [dim]q[/]uit  [dim]?[/] toggle help\n"
-            "\n"
-            "  [bold cyan]j/k[/] [dim]or[/] [bold cyan]arrows[/]  Navigate projects\n"
-            "  [bold cyan]Enter[/]          Select project (auto-starts container)\n"
-            "  [bold cyan]t[/]              Send task to Claude (fire-and-forget)\n"
-            "  [bold cyan]a[/]              Add todo to TODOS.md\n"
-            "  [bold cyan]e[/]              Open iTerm2 tab with Claude (host) [dim]desktop only[/]\n"
-            "  [bold cyan]c[/]              Open iTerm2 tab with Claude (container) [dim]desktop only[/]\n"
-            "  [bold cyan]x[/]              Open iTerm2 tab with bash shell (container) [dim]desktop only[/]\n"
-            "  [bold cyan]dd[/]             Stop and remove container (double-press)\n"
-            "  [bold cyan]l[/]              Tail docker logs in iTerm2 tab [dim]desktop only[/]\n"
-            "  [bold cyan]p[/]              Generate day plan in iTerm2 tab [dim]desktop only[/]\n"
-            "  [bold cyan]b[/]              Toggle mobile web bridge on/off\n"
-            "  [bold cyan]s[/]              Set project stage (type: stage or stage: note)\n"
-            "  [bold cyan]i[/]              Ignore/hide selected project from orch\n"
-            "  [bold cyan]g[/]              Toggle auto-dispatch of pending todos (⚡)\n"
-            "  [bold cyan]r[/]              Rescan ~/Sites for projects\n"
-            "  [bold cyan]q[/]              Quit\n"
-            "  [bold cyan]?[/]              Toggle this help\n"
-            "  [bold cyan]Esc[/]            Cancel input\n"
-            "\n"
-            "  [bold magenta]Mobile:[/] Tap tabs at top to switch panels. "
-            "Width < 100 cols enables tabbed mode.",
+            "[dim]j/k[/] navigate  [dim]Enter[/] select  [dim]t[/]ask  [dim]a[/]dd todo  [dim]e[/]xec  [dim]c[/]ontainer  [dim]x[/] shell(ctr)  [dim]dd[/] down\n"
+            "[dim]l[/]ogs  [dim]p[/]lan  [dim]b[/]ridge  [dim]s[/]tage  [dim]i[/]gnore  [dim]g[/] auto  [dim]o[/] config  [dim]r[/]efresh  [dim]q[/]uit  [dim]Esc[/] cancel",
             id="help-bar",
             markup=True,
         )
@@ -651,8 +636,6 @@ class OrchApp(App):
         self.screen.add_class("mobile")
         self._active_tab = 0
         self._apply_tab(0)
-        # Hide help bar in mobile — too much screen estate
-        self.query_one("#help-bar").add_class("hidden")
 
     def _exit_mobile(self) -> None:
         """Restore the three-pane side-by-side layout."""
@@ -935,10 +918,6 @@ class OrchApp(App):
             self._schedule_dispatch_check(p)
         self._refresh_project_item(p)
 
-    def action_toggle_help(self) -> None:
-        if self._input_focused: return
-        bar = self.query_one("#help-bar")
-        bar.toggle_class("hidden")
 
     def action_container_up(self) -> None:
         """Open an iTerm2 tab with Claude running inside the container."""
@@ -956,7 +935,7 @@ class OrchApp(App):
 
         def _launch():
             try:
-                exec_claude_in_iterm(p)
+                exec_claude_in_iterm(p, with_shell=True)
                 self.call_from_thread(self._stop_spinner_and_refresh, p,
                                       f"Claude launched for {p.name}")
             except Exception as e:
@@ -1130,6 +1109,43 @@ class OrchApp(App):
         inp = self.query_one("#task-input", Input)
         inp.placeholder = "Stage (e.g. mvp or mvp: core loop working) — Enter to set, Esc to cancel"
         inp.focus()
+
+    def action_edit_config(self) -> None:
+        """Open ~/.orch/config.toml in vi in an iTerm2 tab."""
+        if self._input_focused: return
+        if self._mobile:
+            self.notify("Not available on mobile — use the bridge instead", severity="warning")
+            return
+
+        config_file = Path.home() / ".orch" / "config.toml"
+        config_file.parent.mkdir(parents=True, exist_ok=True)
+        if not config_file.exists():
+            config_file.write_text(
+                "# Orch configuration\n"
+                "#\n"
+                "# Settings are grouped by section (e.g. [container], [iterm]).\n"
+                "# Each setting must appear under the correct [section] header —\n"
+                "# a setting placed under the wrong header will be ignored.\n\n"
+                "[container]\n"
+                "# reference_dirs = \"~/Sites,~/Projects\"\n\n"
+                "[iterm]\n"
+                "# profile = \"orch\"\n"
+                "# dedicated_window = true\n"
+            )
+
+        from .iterm import _load_config, _run_iterm_script
+
+        cfg = _load_config()
+        profile = cfg["iterm"].get("profile", "orch")
+        dedicated = cfg["iterm"].get("dedicated_window", True)
+        window_title = cfg["iterm"].get("window_title", "orch sessions")
+
+        script = _build_iterm_tab_script(
+            profile=profile, dedicated=dedicated, window_title=window_title,
+            tab_name="orch config", cmd=f"vi {config_file}",
+        )
+        _run_iterm_script(script)
+        self.notify("Config opened in iTerm2")
 
     @on(Input.Submitted, "#task-input")
     def on_input_submitted(self, event: Input.Submitted) -> None:

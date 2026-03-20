@@ -35,12 +35,34 @@ WORKSPACE_DIR = "/workspace"
 CONTAINER_USER = "vscode"
 CONTAINER_HOME = f"/home/{CONTAINER_USER}"
 
+# Shell setup commands injected into every container
+ORCH_POST_CREATE = (
+    "printf 'set nocompatible\\nset backspace=indent,eol,start\\n' > ~/.vimrc"
+    " && echo 'alias vim=vi' >> ~/.bashrc"
+    " && echo 'export TERM=xterm-256color' >> ~/.bashrc"
+)
+
 # Env vars to always pass through from host
 DEFAULT_PASSTHROUGH_ENV = [
     "ANTHROPIC_API_KEY",
     "CLOUDFLARE_API_TOKEN",
     "CLOUDFLARE_ACCOUNT_ID",
 ]
+
+# Terminal identity env vars to forward into docker exec so that CLI tools
+# (e.g. Claude Code) can detect the host terminal and activate keyboard
+# protocols like Kitty/CSI-u.  These travel transparently through the PTY.
+TERMINAL_ENV_VARS = ["TERM_PROGRAM", "TERM_PROGRAM_VERSION", "COLORTERM"]
+
+
+def _terminal_env_flags() -> str:
+    """Build ``-e VAR=val`` flags for terminal identity vars present on the host."""
+    parts: list[str] = []
+    for var in TERMINAL_ENV_VARS:
+        val = os.environ.get(var)
+        if val:
+            parts.append(f"-e {var}={shlex.quote(val)}")
+    return " ".join(parts)
 
 # Permissions that allow Claude to run without prompting
 SETTINGS_LOCAL = {
@@ -81,6 +103,7 @@ DEVCONTAINER_TEMPLATE = {
         "CLAUDE_CONFIG_DIR": f"{CONTAINER_HOME}/.claude",
     },
     "remoteUser": CONTAINER_USER,
+    "postCreateCommand": ORCH_POST_CREATE,
     "runArgs": ["--memory=12g", "--memory-swap=12g"],
 }
 
@@ -101,11 +124,10 @@ def _load_container_config() -> dict:
     section = None
     for raw in config_file.read_text().splitlines():
         line = raw.strip()
-        if line == "[container]":
-            section = "container"
+        if not line or line.startswith("#"):
             continue
-        if line.startswith("["):
-            section = None
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip()
             continue
         if section == "container" and "=" in line:
             key, _, val = line.partition("=")
@@ -117,6 +139,73 @@ def _load_container_config() -> dict:
                 val = False
             defaults[key] = val
     return defaults
+
+
+# ── Host path passthrough mounts ──────────────────────────────────────────────
+#
+# When a user drags a file (e.g. a screenshot) into iTerm2, the terminal
+# pastes the *host-side* absolute path as text.  Claude Code detects the
+# image extension and tries to read the file at that path.  Inside a
+# container the path doesn't exist unless we mount it.
+#
+# We mount common macOS directories at their *original host path* so that
+# paths pasted by iTerm2 resolve identically inside the container.
+
+
+def _host_passthrough_mounts() -> list[tuple[str, str]]:
+    """
+    Return (host_path, container_target) pairs for directories that should
+    be mounted at their original host path inside the container.
+
+    This makes drag-and-drop of files (screenshots, etc.) into iTerm2 work
+    seamlessly — the host path pasted by the terminal resolves to the same
+    file inside the container.
+
+    Reads ``host_passthrough_dirs`` from [container] config.  Defaults to
+    the user's Desktop and Downloads on macOS (common screenshot locations).
+    """
+    cfg = _load_container_config()
+    raw = cfg.get("host_passthrough_dirs", "")
+
+    if raw:
+        dirs = [d.strip() for d in raw.split(",") if d.strip()]
+    elif platform.system() == "Darwin":
+        home = Path.home()
+        dirs = [str(home / "Desktop"), str(home / "Downloads")]
+    else:
+        dirs = []
+
+    result = []
+    for d in dirs:
+        host = Path(d).expanduser().resolve()
+        if host.is_dir():
+            # Mount at the same absolute path so host paths resolve as-is
+            result.append((str(host), str(host)))
+    return result
+
+
+# ── Reference directory mounts ────────────────────────────────────────────────
+
+
+def _reference_mounts() -> list[tuple[str, str]]:
+    """
+    Parse reference_dirs from config and return (host_path, container_target)
+    tuples for each directory.  Mounted at their original host path
+    so that paths are consistent between host and container.
+    """
+    cfg = _load_container_config()
+    raw = cfg.get("reference_dirs", "")
+    if not raw:
+        return []
+
+    result = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        host = Path(entry).expanduser().resolve()
+        result.append((str(host), str(host)))
+    return result
 
 
 # ── SSH agent forwarding ─────────────────────────────────────────────────────
@@ -218,24 +307,33 @@ def _prepare_devcontainer_config(project: "Project") -> Path:
     Prepare a devcontainer.json for the project, ready for `devcontainer up`.
 
     If the project has an existing .devcontainer/devcontainer.json, orch
-    reads it and merges in its requirements (Claude config mount, env vars).
-    The merged config is written to ~/.orch/devcontainers/<project>/ so
-    the project's own file is never modified.  All other settings
-    (features, mounts, postCreateCommand, etc.) are preserved as-is — if
-    a mount source doesn't exist on this host the container will fail and
-    the error will be shown in the status pane.
+    reads it and merges in its requirements (Claude config mount, env vars,
+    reference dirs).  The user's original config is backed up to
+    devcontainer.base.json so orch can re-merge from scratch each time
+    (picking up config changes like new reference_dirs).
 
-    If no project config exists, generates one from orch's template and
-    writes it to the project's .devcontainer/ so the user can customize it.
+    If no project config exists, generates one from orch's template.
 
-    Returns the path to the config to use with `devcontainer up --config`.
+    In both cases the final config is written to the project's
+    .devcontainer/devcontainer.json — devcontainer CLI reliably reads
+    from there regardless of --config flags.
+
+    Returns the path to the config file.
     """
-    project_dc = project.path / ".devcontainer" / "devcontainer.json"
+    dc_dir = project.path / ".devcontainer"
+    dc_json = dc_dir / "devcontainer.json"
+    dc_base = dc_dir / "devcontainer.base.json"
     cfg = _load_container_config()
 
-    if project_dc.exists():
-        # ── Merge mode: start from the project's config ─────────────
-        config = json.loads(project_dc.read_text())
+    if dc_base.exists() or dc_json.exists():
+        # ── Merge mode ──────────────────────────────────────────────
+        # Read from the base (user's original) if available,
+        # otherwise from the current devcontainer.json and save a backup.
+        if dc_base.exists():
+            config = json.loads(dc_base.read_text())
+        else:
+            config = json.loads(dc_json.read_text())
+            dc_base.write_text(json.dumps(config, indent=2) + "\n")
 
         # Ensure CLAUDE_CONFIG_DIR is set
         container_env = config.get("containerEnv", {})
@@ -271,18 +369,36 @@ def _prepare_devcontainer_config(project: "Project") -> Path:
             container_env["SSH_AUTH_SOCK"] = ssh_env
             config["containerEnv"] = container_env
 
+        # Mount reference directories (read-only)
+        for host, target in _reference_mounts():
+            if not any(_mount_target(m) == target for m in merged_mounts):
+                merged_mounts.append(
+                    f"source={host},target={target},type=bind,readonly"
+                )
+
+        # Mount host passthrough dirs at their original paths (read-only)
+        # so that file paths pasted by iTerm2 drag-and-drop resolve inside
+        # the container (e.g. screenshots dragged from Finder).
+        for host, target in _host_passthrough_mounts():
+            if not any(_mount_target(m) == target for m in merged_mounts):
+                merged_mounts.append(
+                    f"source={host},target={target},type=bind,readonly"
+                )
+
         config["mounts"] = merged_mounts
 
-        # Write merged config to ~/.orch/ so we don't modify the project's file
-        orch_dc_dir = Path.home() / ".orch" / "devcontainers" / project.name
-        orch_dc_dir.mkdir(parents=True, exist_ok=True)
-        orch_dc_json = orch_dc_dir / "devcontainer.json"
-        orch_dc_json.write_text(json.dumps(config, indent=2) + "\n")
-        return orch_dc_json
+        # Merge orch shell setup into postCreateCommand
+        existing_post = config.get("postCreateCommand", "")
+        if isinstance(existing_post, str):
+            if ORCH_POST_CREATE not in existing_post:
+                parts = [p for p in (existing_post, ORCH_POST_CREATE) if p]
+                config["postCreateCommand"] = " && ".join(parts)
+        # If it's a list/object form, leave it alone — those are complex
+
+        dc_json.write_text(json.dumps(config, indent=2) + "\n")
+        return dc_json
 
     # ── Generate mode: no existing config ────────────────────────
-    dc_dir = project.path / ".devcontainer"
-    dc_json = dc_dir / "devcontainer.json"
     dc_dir.mkdir(exist_ok=True)
 
     config = dict(DEVCONTAINER_TEMPLATE)
@@ -299,13 +415,13 @@ def _prepare_devcontainer_config(project: "Project") -> Path:
 
     # Mount Claude config and auth from host
     claude_host = Path.home() / ".claude"
-    claude_json = Path.home() / ".claude.json"
+    claude_json_file = Path.home() / ".claude.json"
     config["mounts"] = [
         f"source={claude_host},target={CONTAINER_HOME}/.claude,type=bind",
     ]
-    if claude_json.exists():
+    if claude_json_file.exists():
         config["mounts"].append(
-            f"source={claude_json},target={CONTAINER_HOME}/.claude.json,type=bind"
+            f"source={claude_json_file},target={CONTAINER_HOME}/.claude.json,type=bind"
         )
 
     # Forward host SSH agent into the container
@@ -315,13 +431,25 @@ def _prepare_devcontainer_config(project: "Project") -> Path:
         config["mounts"].append(ssh_mount)
         config["containerEnv"]["SSH_AUTH_SOCK"] = ssh_env
 
+    # Mount reference directories (read-only)
+    for host, target in _reference_mounts():
+        config["mounts"].append(
+            f"source={host},target={target},type=bind,readonly"
+        )
+
+    # Mount host passthrough dirs at their original paths (read-only)
+    for host, target in _host_passthrough_mounts():
+        config["mounts"].append(
+            f"source={host},target={target},type=bind,readonly"
+        )
+
     dc_json.write_text(json.dumps(config, indent=2) + "\n")
     return dc_json
 
 
 def _devcontainer_up(project: "Project") -> str:
     """Use devcontainer CLI to start container. Returns container ID."""
-    dc_json = _prepare_devcontainer_config(project)
+    _prepare_devcontainer_config(project)
 
     # Pass through env vars
     cfg = _load_container_config()
@@ -332,10 +460,16 @@ def _devcontainer_up(project: "Project") -> str:
         if val:
             env_args += ["--remote-env", f"{var}={val}"]
 
+    # If no container is tracked by orch, remove any stale devcontainer-
+    # managed container so a fresh one is created with the current config
+    # (mounts, env, etc. are only applied at container creation time).
+    existing = _find_container_by_label(project)
+    if existing:
+        subprocess.run(["docker", "rm", "-f", existing], capture_output=True)
+
     cmd = [
         "devcontainer", "up",
         "--workspace-folder", str(project.path),
-        "--config", str(dc_json),
     ] + env_args
 
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
@@ -423,6 +557,14 @@ def _docker_run(project: "Project") -> str:
         tgt = ssh_mount.split("target=")[1].split(",")[0]
         mount_args += ["-v", f"{src}:{tgt}"]
         env_args += ["-e", f"SSH_AUTH_SOCK={ssh_env}"]
+
+    # Mount reference directories (read-only)
+    for host, target in _reference_mounts():
+        mount_args += ["-v", f"{host}:{target}:ro"]
+
+    # Mount host passthrough dirs at their original paths (read-only)
+    for host, target in _host_passthrough_mounts():
+        mount_args += ["-v", f"{host}:{target}:ro"]
 
     cmd = [
         "docker", "run", "-d",
@@ -589,6 +731,96 @@ def _inject_credentials(cid: str) -> None:
     )
 
 
+# ── Git identity ──────────────────────────────────────────────────────────────
+
+GIT_USER_NAME = "Orch & Claude"
+GIT_USER_EMAIL = "orch-claude@noreply.com"
+
+
+def _setup_git_identity(cid: str, project: "Project | None" = None) -> None:
+    """Configure git user.name and user.email inside the container workspace.
+
+    Sets the identity at the repo level so commits made by Claude inside the
+    container always have a consistent author regardless of host config.
+    """
+    workdir = _container_workdir(cid, project)
+    subprocess.run(
+        ["docker", "exec", "-u", CONTAINER_USER, "-w", workdir, cid,
+         "git", "config", "user.name", GIT_USER_NAME],
+        capture_output=True, timeout=10,
+    )
+    subprocess.run(
+        ["docker", "exec", "-u", CONTAINER_USER, "-w", workdir, cid,
+         "git", "config", "user.email", GIT_USER_EMAIL],
+        capture_output=True, timeout=10,
+    )
+
+
+# ── Reference site context ────────────────────────────────────────────────────
+
+
+def _inject_reference_context(cid: str) -> None:
+    """Write a user-level CLAUDE.md inside the container listing available
+    reference projects.
+
+    Reference directories are mounted read-only into the container at their
+    original host paths.  This function scans each reference directory for
+    subdirectories (projects) and writes a ``~/.claude/CLAUDE.md`` that tells
+    Claude where to look when the user asks it to reuse code from another
+    project.
+    """
+    refs = _reference_mounts()
+    if not refs:
+        return
+
+    # Scan each reference directory for project subdirectories
+    projects_by_dir: dict[str, list[str]] = {}
+    for host_path, container_target in refs:
+        host = Path(host_path)
+        if not host.is_dir():
+            continue
+        subdirs = sorted(
+            d.name for d in host.iterdir()
+            if d.is_dir() and not d.name.startswith(".")
+        )
+        if subdirs:
+            projects_by_dir[container_target] = subdirs
+
+    if not projects_by_dir:
+        return
+
+    # Build the CLAUDE.md content
+    lines = [
+        "# Reference projects",
+        "",
+        "The following reference projects are mounted read-only inside this",
+        "container. When the user asks you to look at, reuse, or draw inspiration",
+        "from another project, check these locations.",
+        "",
+    ]
+    for container_path, names in projects_by_dir.items():
+        lines.append(f"**{container_path}/**")
+        for name in names:
+            lines.append(f"- `{container_path}/{name}`")
+        lines.append("")
+
+    lines.extend([
+        "These are read-only. Do not attempt to modify files in reference projects.",
+        "Copy code into the current workspace if you need to adapt it.",
+    ])
+
+    content = "\n".join(lines) + "\n"
+
+    # Write to the user-level CLAUDE.md inside the container
+    claude_md_path = f"{CONTAINER_HOME}/.claude/CLAUDE.md"
+    escaped = content.replace("'", "'\\''")
+    subprocess.run(
+        ["docker", "exec", "-u", CONTAINER_USER, cid, "bash", "-c",
+         f"printf '%s' '{escaped}' > {claude_md_path}"],
+        capture_output=True, timeout=10,
+    )
+
+
 # ── Main lifecycle functions ─────────────────────────────────────────────────
 
 def ensure_running(project: "Project") -> str:
@@ -617,11 +849,17 @@ def ensure_running(project: "Project") -> str:
     # Set up permissions inside the container
     _setup_permissions(cid, project)
 
+    # Configure git identity so commits have a consistent author
+    _setup_git_identity(cid, project)
+
     # Fix SSH agent socket permissions so the container user can access it
     _fix_ssh_socket_permissions(cid)
 
     # Inject host OAuth credentials so Claude doesn't prompt for login
     _inject_credentials(cid)
+
+    # Tell Claude about available reference projects
+    _inject_reference_context(cid)
 
     # Track the container ID
     project.claude_dir.mkdir(parents=True, exist_ok=True)
@@ -633,11 +871,22 @@ def ensure_running(project: "Project") -> str:
 def stop(project: "Project") -> None:
     """Stop and remove the container for a project."""
     cid = project.container_id
-    if not cid:
-        return
+    if cid:
+        subprocess.run(["docker", "rm", "-f", cid], capture_output=True)
+        project.container_id_file.unlink(missing_ok=True)
 
-    subprocess.run(["docker", "rm", "-f", cid], capture_output=True)
-    project.container_id_file.unlink(missing_ok=True)
+    # Also remove any container devcontainer CLI may have created for this
+    # workspace — it tracks containers by label, not by orch's stored ID,
+    # so a stale one can survive and get reused with outdated mounts.
+    result = subprocess.run(
+        ["docker", "ps", "-aq",
+         "--filter", f"label=devcontainer.local_folder={project.path}"],
+        capture_output=True, text=True,
+    )
+    for stale in result.stdout.strip().splitlines():
+        stale = stale.strip()
+        if stale and stale != cid:
+            subprocess.run(["docker", "rm", "-f", stale], capture_output=True)
 
 
 def _build_claude_args(project: "Project") -> str:
@@ -700,17 +949,13 @@ def _container_workdir(cid: str, project: "Project | None" = None) -> str:
 
 
 def _ensure_credentials_injected(cid: str) -> None:
-    """Lazily inject credentials if .credentials.json doesn't exist yet.
+    """Re-inject credentials from the host Keychain into the container.
 
-    Handles containers that were started before credential injection was added.
+    Always refreshes credentials so that updated OAuth tokens (e.g. after
+    a token refresh on the host) are picked up without restarting the
+    container.  This is called before each Claude session.
     """
-    cred_path = f"{CONTAINER_HOME}/.claude/.credentials.json"
-    check = subprocess.run(
-        ["docker", "exec", cid, "test", "-f", cred_path],
-        capture_output=True,
-    )
-    if check.returncode != 0:
-        _inject_credentials(cid)
+    _inject_credentials(cid)
 
 
 def exec_cmd(project: "Project") -> str:
@@ -722,49 +967,114 @@ def exec_cmd(project: "Project") -> str:
     _ensure_credentials_injected(cid)
     workdir = _container_workdir(cid, project)
     args = _build_claude_args(project)
-    return f"docker exec -it -u {CONTAINER_USER} -w {workdir} {cid} claude {args}"
+    tenv = _terminal_env_flags()
+    return f"docker exec -it {tenv} -u {CONTAINER_USER} -w {workdir} {cid} claude {args}"
 
 
 # ── iTerm2 integration ───────────────────────────────────────────────────────
 
-def exec_claude_in_iterm(project: "Project") -> None:
+def exec_claude_in_iterm(project: "Project", with_shell: bool = False) -> None:
     """
     Spin up a container (if needed) and open an iTerm2 tab running claude
     inside it with full permissions.
+
+    If with_shell is True, also opens a second tab with a plain bash shell
+    in the same window (single AppleScript call to guarantee same window).
     """
     from .iterm import _load_config, _bring_tab_to_front
 
-    # Reuse existing tab if open
+    # Check existing Claude tab
+    tab_name = f"{project.name} (container)"
     handle_file = project.claude_dir / "iterm_container_handle"
+    claude_exists = False
     if handle_file.exists():
         tty = handle_file.read_text().strip()
-        if tty and _bring_tab_to_front(tty):
-            return
-        handle_file.unlink(missing_ok=True)
+        if tty and _bring_tab_to_front(tty, expected_name=tab_name):
+            claude_exists = True
+        else:
+            handle_file.unlink(missing_ok=True)
+
+    # Check existing shell tab
+    shell_exists = False
+    shell_tab_name = f"{project.name} (shell)"
+    shell_handle_file = project.claude_dir / "iterm_container_shell_handle"
+    if with_shell and shell_handle_file.exists():
+        tty = shell_handle_file.read_text().strip()
+        if tty and _bring_tab_to_front(tty, expected_name=shell_tab_name):
+            shell_exists = True
+        else:
+            shell_handle_file.unlink(missing_ok=True)
+
+    # Nothing to open
+    if claude_exists and (not with_shell or shell_exists):
+        return
 
     # Ensure container is running
     cid = ensure_running(project)
     _ensure_credentials_injected(cid)
     workdir = _container_workdir(cid, project)
-    args = _build_claude_args(project)
-    claude_cmd = f"docker exec -it -u {CONTAINER_USER} -w {workdir} {cid} claude {args}"
+
+    need_claude = not claude_exists
+    need_shell = with_shell and not shell_exists
 
     cfg = _load_config()
     profile = cfg["iterm"].get("profile", "orch")
     dedicated = cfg["iterm"].get("dedicated_window", True)
-    window_title = cfg["iterm"].get("window_title", "orch sessions")
-    tab_name = f"{project.name} (container)"
 
+    # Build commands
+    if need_claude:
+        args = _build_claude_args(project)
+        tenv = _terminal_env_flags()
+        claude_cmd = f"docker exec -it {tenv} -u {CONTAINER_USER} -w {workdir} {cid} claude {args}"
+    if need_shell:
+        shell_cmd = f"docker exec -it -u {CONTAINER_USER} -w {workdir} {cid} bash"
+
+    # ── Single-tab case (no shell, or shell already open) ────────────────
+    if need_claude and not need_shell:
+        script = _build_single_tab_script(
+            profile=profile, dedicated=dedicated,
+            tab_name=tab_name, cmd=claude_cmd,
+            badge=project.name,
+        )
+        from .iterm import _run_iterm_script
+        tty = _run_iterm_script(script)
+        if tty:
+            handle_file.write_text(tty)
+        return
+
+    if not need_claude and need_shell:
+        script = _build_single_tab_script(
+            profile=profile, dedicated=dedicated,
+            tab_name=shell_tab_name, cmd=shell_cmd,
+            badge=project.name,
+        )
+        from .iterm import _run_iterm_script
+        tty = _run_iterm_script(script)
+        if tty:
+            shell_handle_file.write_text(tty)
+        return
+
+    # ── Both tabs needed — single AppleScript, one window ────────────────
     if dedicated:
         script = f"""
         tell application "iTerm2"
             activate
             set orchWindow to missing value
             set isNewWindow to false
+            set foundOrch to false
             repeat with w in windows
-                if name of w contains "{window_title}" then
-                    set orchWindow to w
-                    exit repeat
+                if not foundOrch then
+                    repeat with aTab in tabs of w
+                        if not foundOrch then
+                            repeat with aSession in sessions of aTab
+                                if profile name of aSession is "{profile}" then
+                                    set orchWindow to w
+                                    set foundOrch to true
+                                    exit repeat
+                                end if
+                            end repeat
+                        end if
+                    end repeat
                 end if
             end repeat
             if orchWindow is missing value then
@@ -776,6 +1086,7 @@ def exec_claude_in_iterm(project: "Project") -> None:
                 set isNewWindow to true
             end if
             tell orchWindow
+                -- Claude tab (reuses the initial session if new window)
                 if not isNewWindow then
                     try
                         create tab with profile "{profile}"
@@ -785,11 +1096,32 @@ def exec_claude_in_iterm(project: "Project") -> None:
                 end if
                 tell current session
                     set name to "{tab_name}"
+                    set badge to "{project.name}"
                     write text "{claude_cmd}"
-                    set thetty to tty
+                    set claudeTty to tty
                 end tell
+                -- Shell tab (always a new tab)
+                try
+                    create tab with profile "{profile}"
+                on error
+                    create tab with default profile
+                end try
+                tell current session
+                    set name to "{shell_tab_name}"
+                    set badge to "{project.name}"
+                    write text "{shell_cmd}"
+                    set shellTty to tty
+                end tell
+                -- Switch focus back to Claude tab
+                repeat with aTab in tabs
+                    repeat with aSession in sessions of aTab
+                        if tty of aSession is claudeTty then
+                            select aTab
+                        end if
+                    end repeat
+                end repeat
             end tell
-            return thetty
+            return claudeTty & linefeed & shellTty
         end tell
         """
     else:
@@ -815,56 +1147,68 @@ def exec_claude_in_iterm(project: "Project") -> None:
                 end if
                 tell current session
                     set name to "{tab_name}"
+                    set badge to "{project.name}"
                     write text "{claude_cmd}"
-                    set thetty to tty
+                    set claudeTty to tty
                 end tell
+                try
+                    create tab with profile "{profile}"
+                on error
+                    create tab with default profile
+                end try
+                tell current session
+                    set name to "{shell_tab_name}"
+                    set badge to "{project.name}"
+                    write text "{shell_cmd}"
+                    set shellTty to tty
+                end tell
+                repeat with aTab in tabs
+                    repeat with aSession in sessions of aTab
+                        if tty of aSession is claudeTty then
+                            select aTab
+                        end if
+                    end repeat
+                end repeat
             end tell
-            return thetty
+            return claudeTty & linefeed & shellTty
         end tell
         """
 
     from .iterm import _run_iterm_script
-    tty = _run_iterm_script(script)
-    if tty:
-        handle_file.write_text(tty)
+    result = _run_iterm_script(script)
+    if result:
+        parts = result.split("\n")
+        if len(parts) >= 1 and parts[0]:
+            handle_file.write_text(parts[0])
+        if len(parts) >= 2 and parts[1]:
+            shell_handle_file.write_text(parts[1])
 
 
-def exec_shell_in_iterm(project: "Project") -> None:
-    """
-    Open an iTerm2 tab with a plain bash shell inside the project's container.
-    Ensures the container is running first.
-    """
-    from .iterm import _load_config, _bring_tab_to_front
-
-    # Reuse existing shell tab if open
-    handle_file = project.claude_dir / "iterm_container_shell_handle"
-    if handle_file.exists():
-        tty = handle_file.read_text().strip()
-        if tty and _bring_tab_to_front(tty):
-            return
-        handle_file.unlink(missing_ok=True)
-
-    # Ensure container is running
-    cid = ensure_running(project)
-    workdir = _container_workdir(cid, project)
-    shell_cmd = f"docker exec -it -u {CONTAINER_USER} -w {workdir} {cid} bash"
-
-    cfg = _load_config()
-    profile = cfg["iterm"].get("profile", "orch")
-    dedicated = cfg["iterm"].get("dedicated_window", True)
-    window_title = cfg["iterm"].get("window_title", "orch sessions")
-    tab_name = f"{project.name} (shell)"
-
+def _build_single_tab_script(*, profile: str, dedicated: bool,
+                              tab_name: str, cmd: str,
+                              badge: str = "") -> str:
+    """Build AppleScript to open a single iTerm2 tab."""
+    badge_line = f'set badge to "{badge}"' if badge else ""
     if dedicated:
-        script = f"""
+        return f"""
         tell application "iTerm2"
             activate
             set orchWindow to missing value
             set isNewWindow to false
+            set foundOrch to false
             repeat with w in windows
-                if name of w contains "{window_title}" then
-                    set orchWindow to w
-                    exit repeat
+                if not foundOrch then
+                    repeat with aTab in tabs of w
+                        if not foundOrch then
+                            repeat with aSession in sessions of aTab
+                                if profile name of aSession is "{profile}" then
+                                    set orchWindow to w
+                                    set foundOrch to true
+                                    exit repeat
+                                end if
+                            end repeat
+                        end if
+                    end repeat
                 end if
             end repeat
             if orchWindow is missing value then
@@ -885,6 +1229,114 @@ def exec_shell_in_iterm(project: "Project") -> None:
                 end if
                 tell current session
                     set name to "{tab_name}"
+                    {badge_line}
+                    write text "{cmd}"
+                    set thetty to tty
+                end tell
+            end tell
+            return thetty
+        end tell
+        """
+    else:
+        return f"""
+        tell application "iTerm2"
+            activate
+            set isNewWindow to false
+            if (count of windows) is 0 then
+                try
+                    create window with profile "{profile}"
+                on error
+                    create window with default profile
+                end try
+                set isNewWindow to true
+            end if
+            tell current window
+                if not isNewWindow then
+                    try
+                        create tab with profile "{profile}"
+                    on error
+                        create tab with default profile
+                    end try
+                end if
+                tell current session
+                    set name to "{tab_name}"
+                    {badge_line}
+                    write text "{cmd}"
+                    set thetty to tty
+                end tell
+            end tell
+            return thetty
+        end tell
+        """
+
+
+def exec_shell_in_iterm(project: "Project") -> None:
+    """
+    Open an iTerm2 tab with a plain bash shell inside the project's container.
+    Ensures the container is running first.
+    """
+    from .iterm import _load_config, _bring_tab_to_front
+
+    # Reuse existing shell tab if open
+    tab_name = f"{project.name} (shell)"
+    handle_file = project.claude_dir / "iterm_container_shell_handle"
+    if handle_file.exists():
+        tty = handle_file.read_text().strip()
+        if tty and _bring_tab_to_front(tty, expected_name=tab_name):
+            return
+        handle_file.unlink(missing_ok=True)
+
+    # Ensure container is running
+    cid = ensure_running(project)
+    workdir = _container_workdir(cid, project)
+    shell_cmd = f"docker exec -it -u {CONTAINER_USER} -w {workdir} {cid} bash"
+
+    cfg = _load_config()
+    profile = cfg["iterm"].get("profile", "orch")
+    dedicated = cfg["iterm"].get("dedicated_window", True)
+    window_title = cfg["iterm"].get("window_title", "orch sessions")
+
+    if dedicated:
+        script = f"""
+        tell application "iTerm2"
+            activate
+            set orchWindow to missing value
+            set isNewWindow to false
+            set foundOrch to false
+            repeat with w in windows
+                if not foundOrch then
+                    repeat with aTab in tabs of w
+                        if not foundOrch then
+                            repeat with aSession in sessions of aTab
+                                if profile name of aSession is "{profile}" then
+                                    set orchWindow to w
+                                    set foundOrch to true
+                                    exit repeat
+                                end if
+                            end repeat
+                        end if
+                    end repeat
+                end if
+            end repeat
+            if orchWindow is missing value then
+                try
+                    set orchWindow to (create window with profile "{profile}")
+                on error
+                    set orchWindow to (create window with default profile)
+                end try
+                set isNewWindow to true
+            end if
+            tell orchWindow
+                if not isNewWindow then
+                    try
+                        create tab with profile "{profile}"
+                    on error
+                        create tab with default profile
+                    end try
+                end if
+                tell current session
+                    set name to "{tab_name}"
+                    set badge to "{project.name}"
                     write text "{shell_cmd}"
                     set thetty to tty
                 end tell
@@ -915,6 +1367,7 @@ def exec_shell_in_iterm(project: "Project") -> None:
                 end if
                 tell current session
                     set name to "{tab_name}"
+                    set badge to "{project.name}"
                     write text "{shell_cmd}"
                     set thetty to tty
                 end tell
@@ -942,7 +1395,8 @@ def _send_task_to_container(project: "Project", task: str) -> None:
     # Escape single quotes in the task for shell safety
     safe_task = task.replace("'", "'\\''")
     args = _build_claude_args(project)
-    claude_cmd = f"docker exec -it -u {CONTAINER_USER} -w {workdir} {cid} claude {args} -p '{safe_task}'"
+    tenv = _terminal_env_flags()
+    claude_cmd = f"docker exec -it {tenv} -u {CONTAINER_USER} -w {workdir} {cid} claude {args} -p '{safe_task}'"
 
     cfg = _load_config()
     profile = cfg["iterm"].get("profile", "orch")
@@ -956,10 +1410,20 @@ def _send_task_to_container(project: "Project", task: str) -> None:
             activate
             set orchWindow to missing value
             set isNewWindow to false
+            set foundOrch to false
             repeat with w in windows
-                if name of w contains "{window_title}" then
-                    set orchWindow to w
-                    exit repeat
+                if not foundOrch then
+                    repeat with aTab in tabs of w
+                        if not foundOrch then
+                            repeat with aSession in sessions of aTab
+                                if profile name of aSession is "{profile}" then
+                                    set orchWindow to w
+                                    set foundOrch to true
+                                    exit repeat
+                                end if
+                            end repeat
+                        end if
+                    end repeat
                 end if
             end repeat
             if orchWindow is missing value then

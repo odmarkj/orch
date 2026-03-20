@@ -34,3 +34,13 @@ the next task.
 
 Claude will update these files automatically. Orch reads them in real time to
 show live status, fire notifications, and track progress — zero LLM calls.
+
+## Reference projects
+
+When containers start, orch automatically writes a user-level `~/.claude/CLAUDE.md`
+inside the container that lists all reference projects available under the
+configured `reference_dirs`. This lets Claude know where to look when you say
+things like "look at how project X does it" or "reuse the parser from Y".
+
+Reference projects are mounted **read-only** — Claude will copy code into the
+current workspace rather than modifying the originals.

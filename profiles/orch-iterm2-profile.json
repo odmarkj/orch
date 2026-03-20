@@ -3,6 +3,7 @@
     {
       "Name": "orch",
       "Guid": "608A8F23-791A-4322-9C2F-758E783E2C14",
+      "Dynamic Profile Parent Name": "Default",
 
       "Comment": "Orch session profile — edit this file and save to apply changes instantly. No iTerm2 restart needed.",
 

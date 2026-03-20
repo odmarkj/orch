@@ -131,11 +131,12 @@ def open_input_tab(project: Project) -> None:
     - Never closes tabs — user owns that.
     """
     handle_file = project.claude_dir / "iterm_handle"
+    project_name  = project.name
 
     # Re-focus existing tab if the handle is still alive
     if handle_file.exists():
         existing_tty = handle_file.read_text().strip()
-        if existing_tty and _bring_tab_to_front(existing_tty):
+        if existing_tty and _bring_tab_to_front(existing_tty, expected_name=project_name):
             return
         # Handle is stale (tab was closed manually) — clean it up
         handle_file.unlink(missing_ok=True)
@@ -146,7 +147,6 @@ def open_input_tab(project: Project) -> None:
     window_title  = cfg["iterm"].get("window_title", "orch sessions")
     claude_cmd    = _build_claude_cmd(project)
     project_path  = str(project.path)
-    project_name  = project.name
 
     if dedicated:
         script = f"""
@@ -154,10 +154,20 @@ def open_input_tab(project: Project) -> None:
             activate
             set orchWindow to missing value
             set isNewWindow to false
+            set foundOrch to false
             repeat with w in windows
-                if name of w contains "{window_title}" then
-                    set orchWindow to w
-                    exit repeat
+                if not foundOrch then
+                    repeat with aTab in tabs of w
+                        if not foundOrch then
+                            repeat with aSession in sessions of aTab
+                                if profile name of aSession is "{profile}" then
+                                    set orchWindow to w
+                                    set foundOrch to true
+                                    exit repeat
+                                end if
+                            end repeat
+                        end if
+                    end repeat
                 end if
             end repeat
             if orchWindow is missing value then
@@ -221,18 +231,26 @@ def open_input_tab(project: Project) -> None:
         handle_file.write_text(tty)
 
 
-def _bring_tab_to_front(tty: str) -> bool:
+def _bring_tab_to_front(tty: str, expected_name: str | None = None) -> bool:
     """
     Focus the iTerm2 tab whose session matches tty.
     Returns True if found, False if the tab no longer exists.
+
+    If expected_name is given, the session's name must also contain it.
+    This prevents TTY-reuse collisions where the OS recycles a /dev/ttysXXX
+    and a stale handle accidentally matches a different project's tab.
     """
+    if expected_name:
+        name_check = f'and name of aSession contains "{expected_name}"'
+    else:
+        name_check = ""
     script = f"""
     set found to false
     tell application "iTerm2"
         repeat with aWindow in windows
             repeat with aTab in tabs of aWindow
                 repeat with aSession in sessions of aTab
-                    if tty of aSession is "{tty}" then
+                    if tty of aSession is "{tty}" {name_check} then
                         activate
                         select aWindow
                         tell aWindow to select aTab
@@ -254,15 +272,22 @@ def _bring_tab_to_front(tty: str) -> bool:
 
 def clear_stale_handle(project: Project) -> None:
     """
-    Called on orch startup. If the handle file exists but the tab is gone
+    Called on orch startup. If any handle file exists but the tab is gone
     (iTerm2 was quit, tab was closed), silently remove the stale handle.
     """
-    handle_file = project.claude_dir / "iterm_handle"
-    if not handle_file.exists():
-        return
-    tty = handle_file.read_text().strip()
-    if tty and not _bring_tab_to_front(tty):
-        handle_file.unlink(missing_ok=True)
+    handle_names = [
+        "iterm_handle",
+        "iterm_container_handle",
+        "iterm_container_shell_handle",
+        "iterm_log_handle",
+    ]
+    for name in handle_names:
+        handle_file = project.claude_dir / name
+        if not handle_file.exists():
+            continue
+        tty = handle_file.read_text().strip()
+        if not tty or not _bring_tab_to_front(tty):
+            handle_file.unlink(missing_ok=True)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

@@ -88,6 +88,23 @@ When you select a project, orch automatically starts a Docker container using ei
 
 Containers persist across project switches. Orch only removes them when you explicitly ask.
 
+### Reference projects
+
+If you have code in other projects that Claude should be able to look at — a parser you've already built, an auth pattern you like, a design system — you can mount those directories into every container as read-only reference sites.
+
+Set `reference_dirs` in `~/.orch/config.toml`:
+
+```toml
+[container]
+reference_dirs = "/Users/you/Apps"
+```
+
+When a container starts, orch:
+1. Mounts each reference directory read-only at its original host path (enforced by Docker — not just an instruction)
+2. Scans the directories for projects and writes a user-level `~/.claude/CLAUDE.md` inside the container listing every available reference project and its path
+
+This means you can tell Claude "look at how project-x handles rate limiting" or "reuse the email template from project-y" and it already knows where to find them. No paths to remember — just project names.
+
 ### Auto-dispatch with parallel worktrees
 
 When auto-dispatch is enabled (`g` in the TUI), orch automatically picks up pending todos from `TODOS.md` and runs them — each in its own git worktree with a dedicated Claude instance. Up to 3 tasks run in parallel by default (configurable via `max_parallel`).
@@ -305,6 +322,8 @@ enabled = true
 image = "mcr.microsoft.com/devcontainers/base:ubuntu"
 memory = "12g"
 prefer_devcontainer_cli = true
+# Comma-separated host directories to mount read-only as reference projects
+reference_dirs = "/Users/you/Apps,/Users/you/OtherProjects"
 
 [dispatch]
 # Max Claude instances running in parallel per project (each gets a worktree)
