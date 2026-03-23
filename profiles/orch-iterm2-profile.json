@@ -134,7 +134,46 @@
       "Use Tab Color": true,
 
       "Show Mark Indicators": true,
-      "Prompt Before Closing 2": false
+      "Prompt Before Closing 2": false,
+
+      "Triggers": [
+        {
+          "regex": "Would you like to proceed",
+          "action": "PostNotificationAction",
+          "parameter": "orch: Claude is waiting for plan approval",
+          "partial": false
+        },
+        {
+          "regex": "Do you want to proceed",
+          "action": "PostNotificationAction",
+          "parameter": "orch: Claude is waiting for approval",
+          "partial": false
+        },
+        {
+          "regex": "❯.*Yes.*No",
+          "action": "PostNotificationAction",
+          "parameter": "orch: Claude is waiting for a choice",
+          "partial": false
+        },
+        {
+          "regex": "clear context.*bypass permissions",
+          "action": "PostNotificationAction",
+          "parameter": "orch: Claude has a plan ready for approval",
+          "partial": false
+        },
+        {
+          "regex": "Please login|please log in|authenticate to continue",
+          "action": "PostNotificationAction",
+          "parameter": "orch: Claude needs authentication",
+          "partial": false
+        },
+        {
+          "regex": "Type here to tell Claude what to change",
+          "action": "PostNotificationAction",
+          "parameter": "orch: Claude is waiting for plan feedback",
+          "partial": false
+        }
+      ]
     }
   ]
 }

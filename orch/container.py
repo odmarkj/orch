@@ -64,7 +64,7 @@ def _terminal_env_flags() -> str:
             parts.append(f"-e {var}={shlex.quote(val)}")
     return " ".join(parts)
 
-# Permissions that allow Claude to run without prompting
+# Permissions and hooks injected into every container workspace
 SETTINGS_LOCAL = {
     "permissions": {
         "allow": [
@@ -82,7 +82,28 @@ SETTINGS_LOCAL = {
             "TodoWrite(*)",
             "mcp__*",
         ]
-    }
+    },
+    "hooks": {
+        "Notification": [
+            {
+                "matcher": "",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": (
+                            "cat /dev/stdin"
+                            " | python3 -c \""
+                            "import sys,json; d=json.load(sys.stdin);"
+                            "open('.claude/waiting_for_input','w')"
+                            ".write(d.get('title','') + ': ' + d.get('message','Input needed'))"
+                            "\""
+                        ),
+                        "timeout": 5,
+                    }
+                ],
+            }
+        ],
+    },
 }
 
 # Default devcontainer.json template
