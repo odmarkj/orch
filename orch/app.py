@@ -30,6 +30,7 @@ from .iterm import notify_input_needed, notify_resumed, clear_stale_handle, open
 from .container import (
     clear_stale_container, is_running as container_is_running,
     ensure_running, exec_claude_in_iterm, stop as container_stop,
+    _inject_credentials,
 )
 
 
@@ -617,6 +618,18 @@ class OrchApp(App):
             self.query_one("#project-list", ListView).focus()
         # Check if we should start in mobile mode
         self._check_mobile(self.size.width)
+        # Refresh OAuth credentials in running containers every 30 minutes
+        # so tokens don't expire mid-session
+        self.set_interval(30 * 60, self._refresh_credentials)
+
+    def _refresh_credentials(self) -> None:
+        """Re-inject OAuth credentials from host Keychain into all running containers."""
+        def _do_refresh():
+            for p in self.projects:
+                cid = container_is_running(p)
+                if cid:
+                    _inject_credentials(cid)
+        self.run_worker(_do_refresh, thread=True)
 
     # ── Mobile / tabbed layout ───────────────────────────────────────────────
 
