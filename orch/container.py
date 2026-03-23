@@ -943,16 +943,7 @@ def _build_claude_args(project: "Project") -> str:
 
 def _container_workdir(cid: str, project: "Project | None" = None) -> str:
     """Detect the workspace directory inside a running container."""
-    # 1. Check WorkingDir from image/container config
-    result = subprocess.run(
-        ["docker", "inspect", "--format", "{{.Config.WorkingDir}}", cid],
-        capture_output=True, text=True,
-    )
-    workdir = result.stdout.strip()
-    if workdir:
-        return workdir
-
-    # 2. Map host project path to container mount path
+    # 1. Map host project path to container mount path (preferred)
     #    Docker Desktop on macOS prefixes sources with /host_mnt, so we
     #    normalise both sides before comparing.
     #    Use the longest (most specific) match to avoid resolving to a
@@ -990,8 +981,14 @@ def _container_workdir(cid: str, project: "Project | None" = None) -> str:
         if best_match:
             return best_match[0]
 
-    # 3. Fallback: ask the container what exists
-    for path in [WORKSPACE_DIR, "/workspaces"]:
+    # 2. Fallback: check common workspace paths inside the container
+    #    devcontainer CLI uses /workspaces/<name>, raw docker uses /workspace
+    candidates = [WORKSPACE_DIR]
+    if project:
+        candidates.insert(0, f"/workspaces/{project.name}")
+    candidates.append("/workspaces")
+
+    for path in candidates:
         check = subprocess.run(
             ["docker", "exec", cid, "test", "-d", path],
             capture_output=True,
