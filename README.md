@@ -61,7 +61,7 @@ git clone https://github.com/odmarkj/orch.git
 cd orch
 pip install -e . --break-system-packages
 
-# First-time setup (iTerm2 profile, terminal-notifier, Docker checks)
+# First-time setup (iTerm2 profile, Docker checks)
 orch setup
 
 # Launch
@@ -290,7 +290,7 @@ orch setup
 
 This will:
 1. Symlink the iTerm2 dynamic profile
-2. Install `terminal-notifier` for macOS notifications
+2. Verify macOS notification support (built-in, no extra install needed)
 3. Check for Docker and `devcontainer` CLI
 4. Create `~/.orch/config.toml` with default settings
 
@@ -377,7 +377,7 @@ Full TUI works on iPad via SSH. `orch plan` and `orch stage` work well on phone.
 - **macOS** (iTerm2 integration uses AppleScript)
 - **Docker** (for container isolation)
 - **iTerm2** (for tab management and notifications)
-- **terminal-notifier** (installed by `orch setup`)
+- **macOS notifications** — uses built-in `osascript`; ensure Focus/Do Not Disturb is off
 
 Optional:
 - **devcontainer CLI** (`npm install -g @devcontainers/cli`) — preferred container strategy

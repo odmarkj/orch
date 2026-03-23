@@ -5,7 +5,7 @@ orch setup — run once after installing the package.
 What this does:
   1. Copies profiles/orch-iterm2-profile.json into iTerm2's DynamicProfiles/
      (iTerm2 picks it up instantly, no restart needed)
-  2. Checks for terminal-notifier and offers to install it
+  2. Verifies macOS notification support (built-in osascript)
   3. Creates ~/.orch/config.toml with defaults if it doesn't exist
   4. Prints the CLAUDE.md snippet to add to each project
 """
@@ -89,12 +89,10 @@ def _brew_install(package: str, description: str) -> bool:
         return False
 
 
-def check_terminal_notifier():
-    step(2, 5, "Checking terminal-notifier")
-    _brew_install(
-        "terminal-notifier",
-        "This enables macOS toast notifications when Claude needs input.",
-    )
+def check_notifications():
+    step(2, 5, "Checking notifications")
+    print("  ✓ Using built-in macOS notifications (osascript)")
+    print("    Ensure Focus / Do Not Disturb is off to receive notifications.")
 
 
 def check_devcontainer_cli():
@@ -282,7 +280,7 @@ def main():
     hr("═")
 
     install_iterm_profile()       # 1/5
-    check_terminal_notifier()     # 2/5
+    check_notifications()          # 2/5
     check_devcontainer_cli()      # 3/5
     check_docker()                # 4/5
     create_config()               # 5/5

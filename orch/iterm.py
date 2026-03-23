@@ -69,35 +69,36 @@ def _load_config() -> dict:
 
 # ── Notifications ─────────────────────────────────────────────────────────────
 
-def _has_terminal_notifier() -> bool:
-    return subprocess.run(
-        ["which", "terminal-notifier"],
-        capture_output=True,
-    ).returncode == 0
+
+def _osascript_notify(*, title: str, subtitle: str, message: str,
+                      sound: str = "") -> None:
+    """Send a macOS notification via osascript (no dependencies required)."""
+    parts = [
+        f'display notification {_applescript_quote(message)}',
+        f'with title {_applescript_quote(title)}',
+        f'subtitle {_applescript_quote(subtitle)}',
+    ]
+    if sound:
+        parts.append(f'sound name {_applescript_quote(sound)}')
+    script = " ".join(parts)
+    subprocess.Popen(["osascript", "-e", script])
+
+
+def _applescript_quote(s: str) -> str:
+    """Escape a string for use in AppleScript."""
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def notify_input_needed(project: Project, question: str) -> None:
-    """
-    Fire a macOS toast notification when Claude needs input.
-    Clicking it activates iTerm2 (which already has the tab open).
-    Requires: brew install terminal-notifier
-    """
-    if not _has_terminal_notifier():
-        return
+    """Fire a macOS notification when Claude needs input."""
     cfg = _load_config()
     sound = cfg["notifications"].get("sound_input_needed", "Glass")
-
-    args = [
-        "terminal-notifier",
-        "-title",    "orch — input needed",
-        "-subtitle", project.name,
-        "-message",  question,
-        "-activate", "com.googlecode.iterm2",
-    ]
-    if sound:
-        args += ["-sound", sound]
-
-    subprocess.Popen(args)
+    _osascript_notify(
+        title="orch — input needed",
+        subtitle=project.name,
+        message=question,
+        sound=sound,
+    )
 
 
 def notify_resumed(project: Project) -> None:
@@ -105,20 +106,13 @@ def notify_resumed(project: Project) -> None:
     cfg = _load_config()
     if not cfg["notifications"].get("notify_on_resume", True):
         return
-    if not _has_terminal_notifier():
-        return
-
     sound = cfg["notifications"].get("sound_resumed", "Pop")
-    args = [
-        "terminal-notifier",
-        "-title",    "orch",
-        "-subtitle", project.name,
-        "-message",  "Claude resumed \u21a9",
-    ]
-    if sound:
-        args += ["-sound", sound]
-
-    subprocess.Popen(args)
+    _osascript_notify(
+        title="orch",
+        subtitle=project.name,
+        message="Claude resumed ↩",
+        sound=sound,
+    )
 
 
 # ── iTerm2 tab management ──────────────────────────────────────────────────────
