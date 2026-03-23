@@ -289,11 +289,12 @@ def _open_log_tab(project: Project) -> None:
     Open an iTerm2 tab running `orch logs <project>`.
     Reuses an existing log tab for this project if one is open.
     """
-    from .iterm import _load_config, _bring_tab_to_front, _run_iterm_script
+    from .iterm import _load_config, _bring_tab_to_front, _run_iterm_script, _iterm_badge_cmd
 
     handle_file = project.claude_dir / "iterm_log_handle"
 
     tab_name     = f"{project.name} logs"
+    badge        = _iterm_badge_cmd(project.name)
 
     if handle_file.exists():
         tty = handle_file.read_text().strip()
@@ -340,6 +341,9 @@ def _build_iterm_tab_script(*, profile: str, dedicated: bool, window_title: str,
                              tab_name: str, cmd: str, badge: str = "") -> str:
     """Build AppleScript to open an iTerm2 tab with profile fallback."""
     badge_line = f'set badge to "{badge}"' if badge else ""
+    if badge:
+        from .iterm import _iterm_badge_cmd
+        cmd = f"{_iterm_badge_cmd(badge)} && {cmd}"
     if dedicated:
         return f"""
         tell application "iTerm2"

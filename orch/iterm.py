@@ -13,6 +13,7 @@ Design contract:
 
 from __future__ import annotations
 
+import base64
 import json
 import subprocess
 from pathlib import Path
@@ -65,6 +66,20 @@ def _load_config() -> dict:
             cfg[section][key] = val
 
     return cfg
+
+
+# ── iTerm2 badge ──────────────────────────────────────────────────────────────
+
+
+def _iterm_badge_cmd(text: str) -> str:
+    """Return a shell command that sets the iTerm2 badge via escape sequence.
+
+    The badge is a faint watermark in the terminal that persists regardless
+    of what the running program does to the window title.  Uses iTerm2's
+    proprietary escape sequence: ``\\033]1337;SetBadgeFormat=<b64>\\007``.
+    """
+    encoded = base64.b64encode(text.encode()).decode()
+    return f"printf '\\033]1337;SetBadgeFormat={encoded}\\007'"
 
 
 # ── Notifications ─────────────────────────────────────────────────────────────
@@ -139,6 +154,7 @@ def open_input_tab(project: Project) -> None:
     profile       = cfg["iterm"].get("profile", "orch")
     dedicated     = cfg["iterm"].get("dedicated_window", True)
     window_title  = cfg["iterm"].get("window_title", "orch sessions")
+    badge         = _iterm_badge_cmd(project_name)
     claude_cmd    = _build_claude_cmd(project)
     project_path  = str(project.path)
 
@@ -183,7 +199,7 @@ def open_input_tab(project: Project) -> None:
                 tell current session
                     set name to "{project_name}"
                     set badge to "{project_name}"
-                    write text "cd {project_path} && {claude_cmd}"
+                    write text "{badge} && cd {project_path} && {claude_cmd}"
                     set thetty to tty
                 end tell
             end tell
@@ -214,7 +230,7 @@ def open_input_tab(project: Project) -> None:
                 tell current session
                     set name to "{project_name}"
                     set badge to "{project_name}"
-                    write text "cd {project_path} && {claude_cmd}"
+                    write text "{badge} && cd {project_path} && {claude_cmd}"
                     set thetty to tty
                 end tell
             end tell

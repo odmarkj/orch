@@ -64,6 +64,12 @@ def _terminal_env_flags() -> str:
             parts.append(f"-e {var}={shlex.quote(val)}")
     return " ".join(parts)
 
+
+def _iterm_badge_cmd(text: str) -> str:
+    """Return a shell command that sets the iTerm2 badge via escape sequence."""
+    from .iterm import _iterm_badge_cmd as _badge
+    return _badge(text)
+
 # Permissions and hooks injected into every container workspace
 SETTINGS_LOCAL = {
     "permissions": {
@@ -999,7 +1005,8 @@ def exec_cmd(project: "Project") -> str:
     workdir = _container_workdir(cid, project)
     args = _build_claude_args(project)
     tenv = _terminal_env_flags()
-    return f"docker exec -it {tenv} -u {CONTAINER_USER} -w {workdir} {cid} claude {args}"
+    badge = _iterm_badge_cmd(project.name)
+    return f"{badge} && docker exec -it {tenv} -u {CONTAINER_USER} -w {workdir} {cid} claude {args}"
 
 
 # ── iTerm2 integration ───────────────────────────────────────────────────────
@@ -1052,13 +1059,15 @@ def exec_claude_in_iterm(project: "Project", with_shell: bool = False) -> None:
     profile = cfg["iterm"].get("profile", "orch")
     dedicated = cfg["iterm"].get("dedicated_window", True)
 
-    # Build commands
+    # Build commands — prepend iTerm2 badge escape sequence so the project
+    # name is always visible as a watermark, even if Claude changes the title
+    badge = _iterm_badge_cmd(project.name)
     if need_claude:
         args = _build_claude_args(project)
         tenv = _terminal_env_flags()
-        claude_cmd = f"docker exec -it {tenv} -u {CONTAINER_USER} -w {workdir} {cid} claude {args}"
+        claude_cmd = f"{badge} && docker exec -it {tenv} -u {CONTAINER_USER} -w {workdir} {cid} claude {args}"
     if need_shell:
-        shell_cmd = f"docker exec -it -u {CONTAINER_USER} -w {workdir} {cid} bash"
+        shell_cmd = f"{badge} && docker exec -it -u {CONTAINER_USER} -w {workdir} {cid} bash"
 
     # ── Single-tab case (no shell, or shell already open) ────────────────
     if need_claude and not need_shell:
@@ -1320,7 +1329,8 @@ def exec_shell_in_iterm(project: "Project") -> None:
     # Ensure container is running
     cid = ensure_running(project)
     workdir = _container_workdir(cid, project)
-    shell_cmd = f"docker exec -it -u {CONTAINER_USER} -w {workdir} {cid} bash"
+    badge = _iterm_badge_cmd(project.name)
+    shell_cmd = f"{badge} && docker exec -it -u {CONTAINER_USER} -w {workdir} {cid} bash"
 
     cfg = _load_config()
     profile = cfg["iterm"].get("profile", "orch")
@@ -1427,7 +1437,8 @@ def _send_task_to_container(project: "Project", task: str) -> None:
     safe_task = task.replace("'", "'\\''")
     args = _build_claude_args(project)
     tenv = _terminal_env_flags()
-    claude_cmd = f"docker exec -it {tenv} -u {CONTAINER_USER} -w {workdir} {cid} claude {args} -p '{safe_task}'"
+    badge = _iterm_badge_cmd(project.name)
+    claude_cmd = f"{badge} && docker exec -it {tenv} -u {CONTAINER_USER} -w {workdir} {cid} claude {args} -p '{safe_task}'"
 
     cfg = _load_config()
     profile = cfg["iterm"].get("profile", "orch")
