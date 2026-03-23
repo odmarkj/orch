@@ -955,23 +955,40 @@ def _container_workdir(cid: str, project: "Project | None" = None) -> str:
     # 2. Map host project path to container mount path
     #    Docker Desktop on macOS prefixes sources with /host_mnt, so we
     #    normalise both sides before comparing.
+    #    Use the longest (most specific) match to avoid resolving to a
+    #    parent read-only reference mount when the project has its own
+    #    read-write workspace mount.
     if project:
         result = subprocess.run(
             ["docker", "inspect", "--format",
-             "{{range .Mounts}}{{.Source}}\t{{.Destination}}\n{{end}}", cid],
+             "{{range .Mounts}}{{.Source}}\t{{.Destination}}\t{{.RW}}\n{{end}}", cid],
             capture_output=True, text=True,
         )
         host_path = str(project.path)
+        best_match: tuple[str, int] | None = None  # (container_path, match_len)
         for line in result.stdout.strip().splitlines():
             parts = line.strip().split("\t")
-            if len(parts) != 2:
+            if len(parts) < 2:
                 continue
-            src, dest = parts
+            src, dest = parts[0], parts[1]
+            rw = parts[2] if len(parts) > 2 else "true"
             # Strip /host_mnt prefix that Docker Desktop adds on macOS
             norm_src = src.removeprefix("/host_mnt")
             if host_path.startswith(norm_src) and norm_src != "/":
                 relative = host_path[len(norm_src):].lstrip("/")
-                return f"{dest}/{relative}" if relative else dest
+                container_path = f"{dest}/{relative}" if relative else dest
+                # Prefer read-write mounts; among same-rw mounts, prefer longest match
+                match_len = len(norm_src)
+                is_rw = rw.lower() == "true"
+                if best_match is None:
+                    best_match = (container_path, match_len, is_rw)
+                else:
+                    _, prev_len, prev_rw = best_match
+                    # Always prefer rw over ro; within same rw class, prefer longer match
+                    if (is_rw and not prev_rw) or (is_rw == prev_rw and match_len > prev_len):
+                        best_match = (container_path, match_len, is_rw)
+        if best_match:
+            return best_match[0]
 
     # 3. Fallback: ask the container what exists
     for path in [WORKSPACE_DIR, "/workspaces"]:
