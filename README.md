@@ -88,6 +88,8 @@ When you select a project, orch automatically starts a Docker container using ei
 
 Containers persist across project switches. Orch only removes them when you explicitly ask.
 
+**Environment variables** — orch automatically passes all host environment variables into containers, minus a sensible blocklist (HOME, PATH, SHELL, etc.). If orch isn't launched from an interactive shell, it also parses `export VAR=VALUE` lines from `~/.zshrc` and `~/.bashrc` so API tokens and credentials are available. To customize which vars are blocked, set `blocked_env` in `~/.orch/config.toml`.
+
 ### Reference projects
 
 If you have code in other projects that Claude should be able to look at — a parser you've already built, an auth pattern you like, a design system — you can mount those directories into every container as read-only reference sites.
@@ -324,6 +326,8 @@ memory = "12g"
 prefer_devcontainer_cli = true
 # Comma-separated host directories to mount read-only as reference projects
 reference_dirs = "/Users/you/Apps,/Users/you/OtherProjects"
+# Comma-separated env vars to block from containers (sensible defaults built in)
+# blocked_env = "HOME,USER,SHELL,PATH,LANG,..."
 
 [dispatch]
 # Max Claude instances running in parallel per project (each gets a worktree)

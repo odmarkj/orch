@@ -14,5 +14,13 @@ build/
 # Claude session data (local only)
 .claude/
 
+# Virtual environment
+bin/
+lib/
+pyvenv.cfg
+
+# Generated devcontainer config (orch creates these dynamically)
+.devcontainer/
+
 # Orch local lifecycle (per-project, committed individually)
 # .orch/ is committed — it holds project.toml

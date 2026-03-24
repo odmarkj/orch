@@ -340,10 +340,12 @@ def _open_plan_tab() -> None:
 def _build_iterm_tab_script(*, profile: str, dedicated: bool, window_title: str,
                              tab_name: str, cmd: str, badge: str = "") -> str:
     """Build AppleScript to open an iTerm2 tab with profile fallback."""
+    from .iterm import _applescript_quote
     badge_line = f'set badge to "{badge}"' if badge else ""
     if badge:
         from .iterm import _iterm_badge_cmd
         cmd = f"{_iterm_badge_cmd(badge)} && {cmd}"
+    cmd = _applescript_quote(cmd)
     if dedicated:
         return f"""
         tell application "iTerm2"
@@ -385,7 +387,7 @@ def _build_iterm_tab_script(*, profile: str, dedicated: bool, window_title: str,
                 tell current session
                     set name to "{tab_name}"
                     {badge_line}
-                    write text "{cmd}"
+                    write text {cmd}
                     set thetty to tty
                 end tell
             end tell
@@ -416,7 +418,7 @@ def _build_iterm_tab_script(*, profile: str, dedicated: bool, window_title: str,
                 tell current session
                     set name to "{tab_name}"
                     {badge_line}
-                    write text "{cmd}"
+                    write text {cmd}
                     set thetty to tty
                 end tell
             end tell

@@ -157,6 +157,9 @@ def open_input_tab(project: Project) -> None:
     badge         = _iterm_badge_cmd(project_name)
     claude_cmd    = _build_claude_cmd(project)
     project_path  = str(project.path)
+    shell_cmd     = _applescript_quote(
+        f"{badge} && cd {project_path} && {claude_cmd}"
+    )
 
     if dedicated:
         script = f"""
@@ -199,7 +202,7 @@ def open_input_tab(project: Project) -> None:
                 tell current session
                     set name to "{project_name}"
                     set badge to "{project_name}"
-                    write text "{badge} && cd {project_path} && {claude_cmd}"
+                    write text {shell_cmd}
                     set thetty to tty
                 end tell
             end tell
@@ -230,7 +233,7 @@ def open_input_tab(project: Project) -> None:
                 tell current session
                     set name to "{project_name}"
                     set badge to "{project_name}"
-                    write text "{badge} && cd {project_path} && {claude_cmd}"
+                    write text {shell_cmd}
                     set thetty to tty
                 end tell
             end tell

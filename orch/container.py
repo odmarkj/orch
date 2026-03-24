@@ -26,6 +26,72 @@ if TYPE_CHECKING:
     from .models import Project
 
 
+# ── Extract env vars from shell profile ──────────────────────────────────────
+#
+# VS Code sources the user's shell profile (~/.zshrc) before launching
+# containers, so env vars like API tokens are available to the devcontainer
+# CLI's ${localEnv:...} expansion.  orch may not be launched from an
+# interactive shell, so we parse `export VAR=VALUE` lines from the user's
+# shell profile and inject them into the process environment automatically.
+
+import re
+
+_EXPORT_RE = re.compile(
+    r"""^\s*export\s+"""          # export keyword
+    r"""([A-Za-z_][A-Za-z0-9_]*)"""  # variable name
+    r"""=(.*)$""",                # = value (rest of line)
+)
+
+
+def _parse_shell_exports(path: Path) -> dict[str, str]:
+    """Extract ``export KEY=VALUE`` assignments from a shell profile.
+
+    Handles single-quoted, double-quoted, and unquoted values.
+    Ignores commented lines and anything that isn't a simple static export
+    (e.g. ``export PATH=$HOME/bin:$PATH`` is skipped because the value
+    contains a ``$`` reference that can't be resolved statically).
+    """
+    result: dict[str, str] = {}
+    if not path.is_file():
+        return result
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if line.startswith("#"):
+            continue
+        m = _EXPORT_RE.match(line)
+        if not m:
+            continue
+        key = m.group(1)
+        val = m.group(2).strip()
+        # Strip matching quotes
+        if (val.startswith('"') and val.endswith('"')) or \
+           (val.startswith("'") and val.endswith("'")):
+            val = val[1:-1]
+        # Skip values that reference other variables — we can't resolve them
+        if "$" in val:
+            continue
+        if key:
+            result[key] = val
+    return result
+
+
+def _load_shell_env() -> None:
+    """Load exported env vars from the user's shell profile into ``os.environ``.
+
+    Checks ``~/.zshrc`` and ``~/.bashrc`` (in that order).  Only sets vars
+    that are not already present in the environment, so explicitly exported
+    shell vars still take precedence.
+    """
+    for name in (".zshrc", ".bashrc"):
+        profile = Path.home() / name
+        for key, val in _parse_shell_exports(profile).items():
+            if key not in os.environ:
+                os.environ[key] = val
+
+
+_load_shell_env()
+
+
 # ── Default config ───────────────────────────────────────────────────────────
 
 DEFAULT_IMAGE = "mcr.microsoft.com/devcontainers/base:ubuntu"
@@ -42,11 +108,23 @@ ORCH_POST_CREATE = (
     " && echo 'export TERM=xterm-256color' >> ~/.bashrc"
 )
 
-# Env vars to always pass through from host
-DEFAULT_PASSTHROUGH_ENV = [
-    "ANTHROPIC_API_KEY",
-    "CLOUDFLARE_API_TOKEN",
-    "CLOUDFLARE_ACCOUNT_ID",
+# Env vars that should never be passed into containers (blocklist).
+# Override via ``blocked_env`` in ~/.orch/config.toml [container] section.
+DEFAULT_BLOCKED_ENV = [
+    "HOME",
+    "USER",
+    "SHELL",
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "TERM",
+    "TMPDIR",
+    "LOGNAME",
+    "HOSTNAME",
+    "PWD",
+    "OLDPWD",
+    "SHLVL",
+    "_",
 ]
 
 # Terminal identity env vars to forward into docker exec so that CLI tools
@@ -142,7 +220,7 @@ def _load_container_config() -> dict:
         "enabled": True,
         "image": DEFAULT_IMAGE,
         "memory": DEFAULT_MEMORY,
-        "passthrough_env": ",".join(DEFAULT_PASSTHROUGH_ENV),
+        "blocked_env": ",".join(DEFAULT_BLOCKED_ENV),
         "prefer_devcontainer_cli": True,
     }
     config_file = Path.home() / ".orch" / "config.toml"
@@ -166,6 +244,26 @@ def _load_container_config() -> dict:
                 val = False
             defaults[key] = val
     return defaults
+
+
+def _passthrough_env_vars(cfg: dict | None = None) -> dict[str, str]:
+    """Return env vars to pass into containers.
+
+    All vars in ``os.environ`` are passed through *except* those on the
+    blocklist.  The blocklist defaults to ``DEFAULT_BLOCKED_ENV`` and can
+    be overridden via ``blocked_env`` in ``~/.orch/config.toml``.
+    """
+    if cfg is None:
+        cfg = _load_container_config()
+    blocked = {
+        v.strip().upper()
+        for v in cfg.get("blocked_env", "").split(",")
+        if v.strip()
+    }
+    return {
+        k: v for k, v in os.environ.items()
+        if k.upper() not in blocked and v
+    }
 
 
 # ── Host path passthrough mounts ──────────────────────────────────────────────
@@ -362,8 +460,25 @@ def _prepare_devcontainer_config(project: "Project") -> Path:
             config = json.loads(dc_json.read_text())
             dc_base.write_text(json.dumps(config, indent=2) + "\n")
 
-        # Ensure CLAUDE_CONFIG_DIR is set
+        # Inject all host env vars (minus blocklist) into containerEnv.
+        # This also resolves any ${localEnv:...} placeholders the user may
+        # have in their base config — we replace them with concrete values
+        # so there's no dependency on the devcontainer CLI's localEnv
+        # resolution (which requires the calling process to already have
+        # the var set in its environment).
         container_env = config.get("containerEnv", {})
+        passthrough = _passthrough_env_vars(cfg)
+        # Resolve ${localEnv:VAR} placeholders in existing values
+        for key, val in list(container_env.items()):
+            if isinstance(val, str) and "${localEnv:" in val:
+                ref_var = val.split("${localEnv:")[1].split("}")[0]
+                resolved = passthrough.get(ref_var) or os.environ.get(ref_var, "")
+                if resolved:
+                    container_env[key] = resolved
+        # Inject remaining passthrough vars (don't overwrite explicit user config)
+        for key, val in passthrough.items():
+            if key not in container_env:
+                container_env[key] = val
         container_env["CLAUDE_CONFIG_DIR"] = f"{CONTAINER_HOME}/.claude"
         config["containerEnv"] = container_env
 
@@ -395,6 +510,15 @@ def _prepare_devcontainer_config(project: "Project") -> Path:
             container_env = config.get("containerEnv", {})
             container_env["SSH_AUTH_SOCK"] = ssh_env
             config["containerEnv"] = container_env
+
+        # Mount Wrangler config so Cloudflare CLI auth persists
+        wrangler_host = Path.home() / ".wrangler"
+        if wrangler_host.is_dir():
+            wrangler_target = f"{CONTAINER_HOME}/.wrangler"
+            if not any(_mount_target(m) == wrangler_target for m in merged_mounts):
+                merged_mounts.append(
+                    f"source={wrangler_host},target={wrangler_target},type=bind"
+                )
 
         # Mount reference directories (read-only)
         for host, target in _reference_mounts():
@@ -431,13 +555,9 @@ def _prepare_devcontainer_config(project: "Project") -> Path:
     config = dict(DEVCONTAINER_TEMPLATE)
     config["name"] = f"orch — {project.name}"
 
-    # Add env var passthrough
-    env_vars = [v.strip() for v in cfg.get("passthrough_env", "").split(",") if v.strip()]
+    # Add env var passthrough (all host env vars except blocklisted ones)
     container_env = dict(config.get("containerEnv", {}))
-    for var in env_vars:
-        host_val = os.environ.get(var, "")
-        if host_val:
-            container_env[var] = host_val
+    container_env.update(_passthrough_env_vars(cfg))
     config["containerEnv"] = container_env
 
     # Mount Claude config and auth from host
@@ -449,6 +569,13 @@ def _prepare_devcontainer_config(project: "Project") -> Path:
     if claude_json_file.exists():
         config["mounts"].append(
             f"source={claude_json_file},target={CONTAINER_HOME}/.claude.json,type=bind"
+        )
+
+    # Mount Wrangler config so Cloudflare CLI auth persists
+    wrangler_host = Path.home() / ".wrangler"
+    if wrangler_host.is_dir():
+        config["mounts"].append(
+            f"source={wrangler_host},target={CONTAINER_HOME}/.wrangler,type=bind"
         )
 
     # Forward host SSH agent into the container
@@ -478,14 +605,11 @@ def _devcontainer_up(project: "Project") -> str:
     """Use devcontainer CLI to start container. Returns container ID."""
     _prepare_devcontainer_config(project)
 
-    # Pass through env vars
+    # Pass through env vars (all host env vars except blocklisted ones)
     cfg = _load_container_config()
-    env_vars = [v.strip() for v in cfg.get("passthrough_env", "").split(",") if v.strip()]
     env_args = []
-    for var in env_vars:
-        val = os.environ.get(var, "")
-        if val:
-            env_args += ["--remote-env", f"{var}={val}"]
+    for key, val in _passthrough_env_vars(cfg).items():
+        env_args += ["--remote-env", f"{key}={val}"]
 
     # If no container is tracked by orch, remove any stale devcontainer-
     # managed container so a fresh one is created with the current config
@@ -557,13 +681,10 @@ def _docker_run(project: "Project") -> str:
         capture_output=True,
     )
 
-    # Build env args
-    env_vars = [v.strip() for v in cfg.get("passthrough_env", "").split(",") if v.strip()]
+    # Build env args (all host env vars except blocklisted ones)
     env_args = []
-    for var in env_vars:
-        val = os.environ.get(var, "")
-        if val:
-            env_args += ["-e", f"{var}={val}"]
+    for key, val in _passthrough_env_vars(cfg).items():
+        env_args += ["-e", f"{key}={val}"]
 
     claude_host = Path.home() / ".claude"
     claude_json = Path.home() / ".claude.json"
@@ -574,6 +695,11 @@ def _docker_run(project: "Project") -> str:
     ]
     if claude_json.exists():
         mount_args += ["-v", f"{claude_json}:{CONTAINER_HOME}/.claude.json"]
+
+    # Mount Wrangler config so Cloudflare CLI auth persists
+    wrangler_host = Path.home() / ".wrangler"
+    if wrangler_host.is_dir():
+        mount_args += ["-v", f"{wrangler_host}:{CONTAINER_HOME}/.wrangler"]
 
     # Forward host SSH agent for git operations
     ssh = _ssh_agent_mount()
@@ -1075,13 +1201,18 @@ def exec_claude_in_iterm(project: "Project", with_shell: bool = False) -> None:
 
     # Build commands — prepend iTerm2 badge escape sequence so the project
     # name is always visible as a watermark, even if Claude changes the title
+    from .iterm import _applescript_quote
     badge = _iterm_badge_cmd(project.name)
     if need_claude:
         args = _build_claude_args(project)
         tenv = _terminal_env_flags()
-        claude_cmd = f"{badge} && docker exec -it {tenv} -u {CONTAINER_USER} -w {workdir} {cid} claude {args}"
+        claude_cmd = _applescript_quote(
+            f"{badge} && docker exec -it {tenv} -u {CONTAINER_USER} -w {workdir} {cid} claude {args}"
+        )
     if need_shell:
-        shell_cmd = f"{badge} && docker exec -it -u {CONTAINER_USER} -w {workdir} {cid} bash"
+        shell_cmd = _applescript_quote(
+            f"{badge} && docker exec -it -u {CONTAINER_USER} -w {workdir} {cid} bash"
+        )
 
     # ── Single-tab case (no shell, or shell already open) ────────────────
     if need_claude and not need_shell:
@@ -1151,7 +1282,7 @@ def exec_claude_in_iterm(project: "Project", with_shell: bool = False) -> None:
                 tell current session
                     set name to "{tab_name}"
                     set badge to "{project.name}"
-                    write text "{claude_cmd}"
+                    write text {claude_cmd}
                     set claudeTty to tty
                 end tell
                 -- Shell tab (always a new tab)
@@ -1163,7 +1294,7 @@ def exec_claude_in_iterm(project: "Project", with_shell: bool = False) -> None:
                 tell current session
                     set name to "{shell_tab_name}"
                     set badge to "{project.name}"
-                    write text "{shell_cmd}"
+                    write text {shell_cmd}
                     set shellTty to tty
                 end tell
                 -- Switch focus back to Claude tab
@@ -1202,7 +1333,7 @@ def exec_claude_in_iterm(project: "Project", with_shell: bool = False) -> None:
                 tell current session
                     set name to "{tab_name}"
                     set badge to "{project.name}"
-                    write text "{claude_cmd}"
+                    write text {claude_cmd}
                     set claudeTty to tty
                 end tell
                 try
@@ -1213,7 +1344,7 @@ def exec_claude_in_iterm(project: "Project", with_shell: bool = False) -> None:
                 tell current session
                     set name to "{shell_tab_name}"
                     set badge to "{project.name}"
-                    write text "{shell_cmd}"
+                    write text {shell_cmd}
                     set shellTty to tty
                 end tell
                 repeat with aTab in tabs
@@ -1242,7 +1373,9 @@ def _build_single_tab_script(*, profile: str, dedicated: bool,
                               tab_name: str, cmd: str,
                               badge: str = "") -> str:
     """Build AppleScript to open a single iTerm2 tab."""
+    from .iterm import _applescript_quote
     badge_line = f'set badge to "{badge}"' if badge else ""
+    cmd = _applescript_quote(cmd)
     if dedicated:
         return f"""
         tell application "iTerm2"
@@ -1284,7 +1417,7 @@ def _build_single_tab_script(*, profile: str, dedicated: bool,
                 tell current session
                     set name to "{tab_name}"
                     {badge_line}
-                    write text "{cmd}"
+                    write text {cmd}
                     set thetty to tty
                 end tell
             end tell
@@ -1315,7 +1448,7 @@ def _build_single_tab_script(*, profile: str, dedicated: bool,
                 tell current session
                     set name to "{tab_name}"
                     {badge_line}
-                    write text "{cmd}"
+                    write text {cmd}
                     set thetty to tty
                 end tell
             end tell
@@ -1343,8 +1476,11 @@ def exec_shell_in_iterm(project: "Project") -> None:
     # Ensure container is running
     cid = ensure_running(project)
     workdir = _container_workdir(cid, project)
+    from .iterm import _applescript_quote
     badge = _iterm_badge_cmd(project.name)
-    shell_cmd = f"{badge} && docker exec -it -u {CONTAINER_USER} -w {workdir} {cid} bash"
+    shell_cmd = _applescript_quote(
+        f"{badge} && docker exec -it -u {CONTAINER_USER} -w {workdir} {cid} bash"
+    )
 
     cfg = _load_config()
     profile = cfg["iterm"].get("profile", "orch")
@@ -1392,7 +1528,7 @@ def exec_shell_in_iterm(project: "Project") -> None:
                 tell current session
                     set name to "{tab_name}"
                     set badge to "{project.name}"
-                    write text "{shell_cmd}"
+                    write text {shell_cmd}
                     set thetty to tty
                 end tell
             end tell
@@ -1423,7 +1559,7 @@ def exec_shell_in_iterm(project: "Project") -> None:
                 tell current session
                     set name to "{tab_name}"
                     set badge to "{project.name}"
-                    write text "{shell_cmd}"
+                    write text {shell_cmd}
                     set thetty to tty
                 end tell
             end tell
@@ -1451,8 +1587,11 @@ def _send_task_to_container(project: "Project", task: str) -> None:
     safe_task = task.replace("'", "'\\''")
     args = _build_claude_args(project)
     tenv = _terminal_env_flags()
+    from .iterm import _applescript_quote
     badge = _iterm_badge_cmd(project.name)
-    claude_cmd = f"{badge} && docker exec -it {tenv} -u {CONTAINER_USER} -w {workdir} {cid} claude {args} -p '{safe_task}'"
+    claude_cmd = _applescript_quote(
+        f"{badge} && docker exec -it {tenv} -u {CONTAINER_USER} -w {workdir} {cid} claude {args} -p '{safe_task}'"
+    )
 
     cfg = _load_config()
     profile = cfg["iterm"].get("profile", "orch")
@@ -1500,7 +1639,7 @@ def _send_task_to_container(project: "Project", task: str) -> None:
                 end if
                 tell current session
                     set name to "{tab_name}"
-                    write text "{claude_cmd}"
+                    write text {claude_cmd}
                 end tell
             end tell
         end tell
@@ -1528,7 +1667,7 @@ def _send_task_to_container(project: "Project", task: str) -> None:
                 end if
                 tell current session
                     set name to "{tab_name}"
-                    write text "{claude_cmd}"
+                    write text {claude_cmd}
                 end tell
             end tell
         end tell
