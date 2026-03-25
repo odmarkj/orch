@@ -111,13 +111,13 @@ ORCH_POST_CREATE = (
 # Env vars that should never be passed into containers (blocklist).
 # Override via ``blocked_env`` in ~/.orch/config.toml [container] section.
 DEFAULT_BLOCKED_ENV = [
+    # Shell / system identity
     "HOME",
     "USER",
     "SHELL",
     "PATH",
     "LANG",
     "LC_ALL",
-    "TERM",
     "TMPDIR",
     "LOGNAME",
     "HOSTNAME",
@@ -125,6 +125,29 @@ DEFAULT_BLOCKED_ENV = [
     "OLDPWD",
     "SHLVL",
     "_",
+    "COMMAND_MODE",
+    # macOS internals
+    "SECURITYSESSIONID",
+    "__CFBundleIdentifier",
+    "__CF_USER_TEXT_ENCODING",
+    "XPC_FLAGS",
+    "XPC_SERVICE_NAME",
+    "LaunchInstanceID",
+    "OSLogRateLimit",
+    # iTerm / terminal session
+    "LC_TERMINAL",
+    "LC_TERMINAL_VERSION",
+    "TERM",
+    "TERM_SESSION_ID",
+    "TERM_PROGRAM",
+    "TERM_PROGRAM_VERSION",
+    "TERM_FEATURES",
+    "TERMINFO_DIRS",
+    "COLORFGBG",
+    "COLORTERM",
+    "ITERM_PROFILE",
+    "ITERM_SESSION_ID",
+    "CF_USER_TEXT_ENCODING",
 ]
 
 # Terminal identity env vars to forward into docker exec so that CLI tools
@@ -203,6 +226,7 @@ DEVCONTAINER_TEMPLATE = {
             "installTools": True,
         },
         "ghcr.io/devcontainers/features/git:1": {},
+        "ghcr.io/shyim/devcontainers-features/bun:0": {},
     },
     "containerEnv": {
         "CLAUDE_CONFIG_DIR": f"{CONTAINER_HOME}/.claude",
@@ -260,9 +284,13 @@ def _passthrough_env_vars(cfg: dict | None = None) -> dict[str, str]:
         for v in cfg.get("blocked_env", "").split(",")
         if v.strip()
     }
+    # Prefixes that indicate macOS/system internals — block any var matching
+    blocked_prefixes = ("__CF", "XPC_", "ITERM_", "Apple_")
     return {
         k: v for k, v in os.environ.items()
-        if k.upper() not in blocked and v
+        if k.upper() not in blocked
+        and not k.startswith(blocked_prefixes)
+        and v
     }
 
 
@@ -482,6 +510,13 @@ def _prepare_devcontainer_config(project: "Project") -> Path:
         container_env["CLAUDE_CONFIG_DIR"] = f"{CONTAINER_HOME}/.claude"
         config["containerEnv"] = container_env
 
+        # Ensure required devcontainer features are present
+        features = config.get("features", {})
+        for feat_key, feat_val in DEVCONTAINER_TEMPLATE["features"].items():
+            if feat_key not in features:
+                features[feat_key] = feat_val
+        config["features"] = features
+
         # Replace any existing ~/.claude mount with orch's, or add it
         claude_host = str(Path.home() / ".claude")
         claude_mount = f"source={claude_host},target={CONTAINER_HOME}/.claude,type=bind"
@@ -605,11 +640,9 @@ def _devcontainer_up(project: "Project") -> str:
     """Use devcontainer CLI to start container. Returns container ID."""
     _prepare_devcontainer_config(project)
 
-    # Pass through env vars (all host env vars except blocklisted ones)
-    cfg = _load_container_config()
-    env_args = []
-    for key, val in _passthrough_env_vars(cfg).items():
-        env_args += ["--remote-env", f"{key}={val}"]
+    # Env vars are already in containerEnv within the devcontainer.json
+    # written by _prepare_devcontainer_config — no need for --remote-env.
+    env_args: list[str] = []
 
     # If no container is tracked by orch, remove any stale devcontainer-
     # managed container so a fresh one is created with the current config
@@ -884,6 +917,101 @@ def _inject_credentials(cid: str) -> None:
     )
 
 
+# ── Plugin path compatibility ─────────────────────────────────────────────────
+
+
+def _symlink_host_claude_dir(cid: str) -> None:
+    """Create a symlink from the host .claude path so plugin paths resolve.
+
+    Claude Code plugins store absolute paths (installPath, installLocation)
+    in ~/.claude/plugins/*.json.  When ~/.claude is bind-mounted from the
+    host, those paths reference the host home (e.g. /Users/alice/.claude)
+    which doesn't exist inside the container (/home/vscode/.claude).
+
+    We create a symlink at the host path pointing to the container path
+    so that plugin marketplace validation and loading succeed.
+    """
+    host_claude = Path.home() / ".claude"
+    if not host_claude.exists():
+        return
+
+    host_claude_str = str(host_claude)
+    container_claude = f"{CONTAINER_HOME}/.claude"
+
+    # If host path == container path, no symlink needed
+    if host_claude_str == container_claude:
+        return
+
+    subprocess.run(
+        ["docker", "exec", cid, "bash", "-c",
+         f"mkdir -p $(dirname {shlex.quote(host_claude_str)}) && "
+         f"ln -sfn {shlex.quote(container_claude)} {shlex.quote(host_claude_str)}"],
+        capture_output=True,
+        timeout=10,
+    )
+
+
+# ── Plugin setup ─────────────────────────────────────────────────────────────
+
+
+def _setup_plugins(cid: str) -> None:
+    """Run Setup hooks for bind-mounted plugins inside the container.
+
+    When ~/.claude is bind-mounted from the host, plugin caches are shared
+    but may lack platform-specific artifacts (node_modules built for Linux,
+    Bun binaries, etc.).  This reads each installed plugin's hooks.json and
+    runs its Setup hook inside the container so the plugin can install
+    whatever it needs for the container environment.
+    """
+    installed_path = Path.home() / ".claude" / "plugins" / "installed_plugins.json"
+    if not installed_path.exists():
+        return
+
+    try:
+        registry = json.loads(installed_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return
+
+    for _plugin_name, installs in registry.get("plugins", {}).items():
+        for install_info in installs:
+            # Resolve plugin root: translate host path to container path
+            host_install = install_info.get("installPath", "")
+            if not host_install:
+                continue
+            host_claude = str(Path.home() / ".claude")
+            container_install = host_install.replace(
+                host_claude, f"{CONTAINER_HOME}/.claude", 1
+            )
+
+            # Read hooks.json for this plugin
+            hooks_file = Path(host_install) / "hooks" / "hooks.json"
+            if not hooks_file.exists():
+                continue
+
+            try:
+                hooks_config = json.loads(hooks_file.read_text())
+            except (json.JSONDecodeError, OSError):
+                continue
+
+            setup_hooks = hooks_config.get("hooks", {}).get("Setup", [])
+            for group in setup_hooks:
+                for hook in group.get("hooks", []):
+                    if hook.get("type") != "command":
+                        continue
+                    # Substitute CLAUDE_PLUGIN_ROOT with the container path
+                    cmd = hook["command"].replace(
+                        "${CLAUDE_PLUGIN_ROOT}", container_install
+                    )
+                    timeout = hook.get("timeout", 60)
+                    subprocess.run(
+                        ["docker", "exec", "-u", CONTAINER_USER, cid,
+                         "bash", "-c", cmd],
+                        capture_output=True,
+                        timeout=max(timeout, 10),
+                        env={**os.environ, "CLAUDE_PLUGIN_ROOT": container_install},
+                    )
+
+
 # ── Git identity ──────────────────────────────────────────────────────────────
 
 GIT_USER_NAME = "Orch & Claude"
@@ -1020,6 +1148,12 @@ def ensure_running(project: "Project") -> str:
 
     # Inject host OAuth credentials so Claude doesn't prompt for login
     _inject_credentials(cid)
+
+    # Symlink host .claude path so plugin absolute paths resolve in container
+    _symlink_host_claude_dir(cid)
+
+    # Run plugin setup hooks so bind-mounted plugins install container deps
+    _setup_plugins(cid)
 
     # Tell Claude about available reference projects
     _inject_reference_context(cid)
