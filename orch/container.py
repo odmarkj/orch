@@ -524,10 +524,32 @@ def _prepare_devcontainer_config(project: "Project") -> Path:
         claude_mount = f"source={claude_host},target={CONTAINER_HOME}/.claude,type=bind"
 
         existing_mounts = config.get("mounts", [])
+        # Rewrite any mount sources that reference a stale home directory
+        # (e.g. from a different machine) to the current home.
+        current_home = str(Path.home())
+        fixed_mounts = []
+        for m in existing_mounts:
+            if isinstance(m, str) and "source=" in m:
+                src = m.split("source=")[1].split(",")[0]
+                # If the source starts with /Users/ or /home/ but doesn't
+                # match the current home, rewrite it.
+                if (src.startswith(("/Users/", "/home/"))
+                        and not src.startswith(current_home)):
+                    # Extract the path relative to the old home dir
+                    # e.g. /Users/odmarkj/.claude.json -> .claude.json
+                    parts = src.split("/", 3)  # ['', 'Users', 'odmarkj', '.claude.json']
+                    if len(parts) >= 4:
+                        rel = parts[3]
+                        new_src = f"{current_home}/{rel}"
+                        m = m.replace(f"source={src}", f"source={new_src}")
+                fixed_mounts.append(m)
+            else:
+                fixed_mounts.append(m)
+
         merged_mounts = []
         has_claude_mount = False
 
-        for m in existing_mounts:
+        for m in fixed_mounts:
             target = _mount_target(m)
             if target and target.rstrip("/").endswith("/.claude"):
                 has_claude_mount = True
