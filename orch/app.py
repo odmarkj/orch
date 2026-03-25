@@ -725,8 +725,10 @@ class OrchApp(App):
                     notify_input_needed(p, q)
                     if container_is_running(p):
                         exec_claude_in_iterm(p)
-                    else:
-                        open_input_tab(p)
+                    # Don't fall back to open_input_tab — if containers are
+                    # enabled (the default), opening a host-side Claude session
+                    # is wrong and creates phantom terminals.  The notification
+                    # is enough; the user can open a session manually.
 
                 self.run_worker(_handle_input, thread=True)
                 self._refresh_project_item(project)
