@@ -1530,10 +1530,11 @@ def exec_claude_in_iterm(project: "Project", with_shell: bool = False) -> None:
 def _build_single_tab_script(*, profile: str, dedicated: bool,
                               tab_name: str, cmd: str,
                               badge: str = "") -> str:
-    """Build AppleScript to open a single iTerm2 tab."""
-    from .iterm import _applescript_quote
+    """Build AppleScript to open a single iTerm2 tab.
+
+    ``cmd`` must already be AppleScript-quoted (via ``_applescript_quote``).
+    """
     badge_line = f'set badge to "{badge}"' if badge else ""
-    cmd = _applescript_quote(cmd)
     if dedicated:
         return f"""
         tell application "iTerm2"
