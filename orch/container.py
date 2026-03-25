@@ -148,6 +148,9 @@ DEFAULT_BLOCKED_ENV = [
     "ITERM_PROFILE",
     "ITERM_SESSION_ID",
     "CF_USER_TEXT_ENCODING",
+    # Tool paths that reference host filesystem
+    "BUN_INSTALL",
+    "WRANGLER_HOME",
 ]
 
 # Terminal identity env vars to forward into docker exec so that CLI tools
@@ -226,7 +229,6 @@ DEVCONTAINER_TEMPLATE = {
             "installTools": True,
         },
         "ghcr.io/devcontainers/features/git:1": {},
-        "ghcr.io/shyim/devcontainers-features/bun:0": {},
     },
     "containerEnv": {
         "CLAUDE_CONFIG_DIR": f"{CONTAINER_HOME}/.claude",
