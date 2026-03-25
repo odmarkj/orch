@@ -26,7 +26,7 @@ from watchdog.events import FileSystemEventHandler
 
 from .models import Project
 from .discovery import discover_projects
-from .iterm import notify_input_needed, notify_resumed, clear_stale_handle, open_input_tab
+from .iterm import notify_input_needed, notify_resumed, clear_stale_handle
 from .container import (
     clear_stale_container, is_running as container_is_running,
     ensure_running, exec_claude_in_iterm, stop as container_stop,
@@ -725,10 +725,8 @@ class OrchApp(App):
                     notify_input_needed(p, q)
                     if container_is_running(p):
                         exec_claude_in_iterm(p)
-                    # Don't fall back to open_input_tab — if containers are
-                    # enabled (the default), opening a host-side Claude session
-                    # is wrong and creates phantom terminals.  The notification
-                    # is enough; the user can open a session manually.
+                    # No fallback to host — notification is enough.
+                    # User can open a host session manually via keybinding.
 
                 self.run_worker(_handle_input, thread=True)
                 self._refresh_project_item(project)
@@ -1045,6 +1043,7 @@ class OrchApp(App):
 
         def _open():
             try:
+                from .iterm import open_input_tab
                 open_input_tab(p)
                 self.call_from_thread(self._stop_spinner_and_refresh, p,
                                       f"iTerm2 tab opened for {p.name}")
