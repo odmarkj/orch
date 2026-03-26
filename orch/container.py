@@ -213,6 +213,17 @@ SETTINGS_LOCAL = {
                 ],
             }
         ],
+        "UserPromptSubmit": [
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": f"python3 {CONTAINER_HOME}/.claude/bin/screenshot-hook.py",
+                        "timeout": 5,
+                    }
+                ],
+            }
+        ],
     },
 }
 
@@ -229,6 +240,7 @@ DEVCONTAINER_TEMPLATE = {
             "installTools": True,
         },
         "ghcr.io/devcontainers/features/git:1": {},
+        "ghcr.io/shyim/devcontainers-features/bun:0": {},
     },
     "containerEnv": {
         "CLAUDE_CONFIG_DIR": f"{CONTAINER_HOME}/.claude",
@@ -237,6 +249,79 @@ DEVCONTAINER_TEMPLATE = {
     "postCreateCommand": ORCH_POST_CREATE,
     "runArgs": ["--memory=12g", "--memory-swap=12g"],
 }
+
+
+# ── Screenshot proxy hook ────────────────────────────────────────────────────
+#
+# When a user drags a macOS screenshot thumbnail into iTerm, the pasted path
+# points into /var/folders/.../TemporaryItems/NSIRD_screencaptureui_*/ which
+# is SIP-protected — Docker's VM cannot read it, so bind mounts won't help.
+#
+# This UserPromptSubmit hook (running inside the container) detects the temp
+# path pattern, writes a request file to .claude/ (bind-mounted and watched
+# by orch on the host), then polls for a done file.  The orch host process
+# reads the file with the user's permissions and uses `docker cp` to inject
+# it into the container at the same path — so Claude Code can read it.
+
+_SCREENSHOT_HOOK_SCRIPT = """\
+#!/usr/bin/env python3
+\"\"\"UserPromptSubmit hook: request host-side copy of macOS screenshot temp files.\"\"\"
+import sys, json, re, os, time
+
+data = json.load(sys.stdin)
+prompt = data.get("prompt", "")
+
+# Match macOS screenshot thumbnail temp paths
+PATTERN = (
+    r"/var/folders/.+?/TemporaryItems/"
+    r"NSIRD_screencaptureui_\\w+/"
+    r"[^/]+\\.(?:png|jpg|jpeg|gif|webp|tiff)"
+)
+raw_paths = [m.group() for m in re.finditer(PATTERN, prompt, re.IGNORECASE)]
+
+# Unescape shell-escaped paths (iTerm pastes backslash-space for spaces)
+paths = [re.sub(r'\\\\(.)', r'\\1', p) for p in raw_paths]
+
+if not paths:
+    sys.exit(0)
+
+project_dir = os.environ.get("CLAUDE_PROJECT_DIR", os.getcwd())
+claude_dir = os.path.join(project_dir, ".claude")
+req_file = os.path.join(claude_dir, "_screenshot_copy_request")
+done_file = os.path.join(claude_dir, "_screenshot_copy_done")
+
+# Clean stale done marker
+try:
+    os.unlink(done_file)
+except OSError:
+    pass
+
+# Signal the host
+with open(req_file, "w") as f:
+    f.write("\\n".join(paths))
+
+# Poll for host to complete the copy (up to 4 seconds)
+for _ in range(40):
+    if os.path.exists(done_file):
+        try:
+            os.unlink(done_file)
+        except OSError:
+            pass
+        try:
+            os.unlink(req_file)
+        except OSError:
+            pass
+        break
+    time.sleep(0.1)
+else:
+    try:
+        os.unlink(req_file)
+    except OSError:
+        pass
+
+# Don't modify the prompt
+print("{}")
+"""
 
 
 # ── Config loading ───────────────────────────────────────────────────────────
@@ -317,7 +402,9 @@ def _host_passthrough_mounts() -> list[tuple[str, str]]:
     file inside the container.
 
     Reads ``host_passthrough_dirs`` from [container] config.  Defaults to
-    the user's Desktop and Downloads on macOS (common screenshot locations).
+    the user's Desktop and Downloads on macOS (common screenshot locations),
+    plus the macOS temp directory ($TMPDIR) where screenshot thumbnails live
+    before they are moved to their final destination.
     """
     cfg = _load_container_config()
     raw = cfg.get("host_passthrough_dirs", "")
@@ -332,10 +419,15 @@ def _host_passthrough_mounts() -> list[tuple[str, str]]:
 
     result = []
     for d in dirs:
-        host = Path(d).expanduser().resolve()
-        if host.is_dir():
-            # Mount at the same absolute path so host paths resolve as-is
-            result.append((str(host), str(host)))
+        original = str(Path(d).expanduser())
+        resolved = str(Path(d).expanduser().resolve())
+        if Path(resolved).is_dir():
+            # Use the resolved path as Docker source (Docker Desktop needs
+            # real paths) but the *original* path as the container target so
+            # it matches what iTerm pastes.  This matters on macOS where
+            # /var is a symlink to /private/var — TMPDIR gives /var/folders/…
+            # but resolve() produces /private/var/folders/… .
+            result.append((resolved, original))
     return result
 
 
@@ -365,8 +457,10 @@ def _reference_mounts() -> list[tuple[str, str]]:
 
 # ── SSH agent forwarding ─────────────────────────────────────────────────────
 
-# Target path for the SSH agent socket inside the container
-_CONTAINER_SSH_AUTH_SOCK = "/tmp/ssh-agent.sock"
+# Target path for the SSH agent socket inside the container.
+# IMPORTANT: Must NOT be under /tmp — devcontainer features like
+# docker-in-docker mount /tmp as tmpfs, which shadows bind mounts.
+_CONTAINER_SSH_AUTH_SOCK = "/run/ssh-agent.sock"
 
 
 def _ssh_agent_mount() -> tuple[str, str] | None:
@@ -564,8 +658,13 @@ def _prepare_devcontainer_config(project: "Project") -> Path:
         ssh = _ssh_agent_mount()
         if ssh:
             ssh_mount, ssh_env = ssh
-            if not any(_mount_target(m) == _CONTAINER_SSH_AUTH_SOCK for m in merged_mounts):
-                merged_mounts.append(ssh_mount)
+            # Remove any stale SSH socket mounts (e.g. old /tmp/ssh-agent.sock
+            # path that gets shadowed by docker-in-docker tmpfs on /tmp)
+            merged_mounts = [
+                m for m in merged_mounts
+                if not (_mount_target(m) or "").endswith("/ssh-agent.sock")
+            ]
+            merged_mounts.append(ssh_mount)
             container_env = config.get("containerEnv", {})
             container_env["SSH_AUTH_SOCK"] = ssh_env
             config["containerEnv"] = container_env
@@ -827,16 +926,65 @@ def _install_claude_in_container(cid: str) -> None:
 # ── Permission setup ─────────────────────────────────────────────────────────
 
 def _setup_permissions(cid: str, project: "Project | None" = None) -> None:
-    """Write settings.local.json and mark onboarding complete inside the container."""
-    settings_json = json.dumps(SETTINGS_LOCAL, indent=2)
-    workdir = _container_workdir(cid, project)
+    """Merge orch settings into settings.local.json inside the container.
 
-    # Write to the project's .claude dir inside the container (as vscode user)
+    Reads any existing settings.local.json (e.g. project-level hooks written
+    by curated-context bootstrap) and deep-merges orch's required permissions
+    and hooks on top, preserving entries from other sources.
+    """
+    workdir = _container_workdir(cid, project)
+    settings_path = f"{workdir}/.claude/settings.local.json"
+
+    # Read existing settings.local.json from the container (may not exist)
+    existing: dict = {}
+    result = subprocess.run(
+        ["docker", "exec", "-u", CONTAINER_USER, cid, "bash", "-c",
+         f"cat {settings_path} 2>/dev/null || echo '{{}}'"],
+        capture_output=True, text=True, timeout=10,
+    )
+    if result.returncode == 0 and result.stdout.strip():
+        try:
+            existing = json.loads(result.stdout)
+        except json.JSONDecodeError:
+            existing = {}
+
+    # Deep-merge: orch permissions are authoritative, hooks are additive
+    merged = existing.copy()
+
+    # Permissions: orch's allow list is authoritative
+    merged["permissions"] = SETTINGS_LOCAL["permissions"]
+
+    # Hooks: merge per event type — prepend orch hooks, keep existing
+    orch_hooks = SETTINGS_LOCAL.get("hooks", {})
+    existing_hooks = existing.get("hooks", {})
+    merged_hooks: dict = {}
+    all_events = set(orch_hooks.keys()) | set(existing_hooks.keys())
+    for event in all_events:
+        orch_list = orch_hooks.get(event, [])
+        existing_list = existing_hooks.get(event, [])
+        # Deduplicate: skip existing entries whose command already appears
+        orch_cmds = {
+            h.get("command", "")
+            for group in orch_list
+            for h in group.get("hooks", [])
+        }
+        deduped_existing = []
+        for group in existing_list:
+            filtered_hooks = [
+                h for h in group.get("hooks", [])
+                if h.get("command", "") not in orch_cmds
+            ]
+            if filtered_hooks:
+                deduped_existing.append({**group, "hooks": filtered_hooks})
+        merged_hooks[event] = orch_list + deduped_existing
+    merged["hooks"] = merged_hooks
+
+    merged_json = json.dumps(merged, indent=2)
     subprocess.run(
         ["docker", "exec", "-u", CONTAINER_USER, cid, "bash", "-c",
          f"mkdir -p {workdir}/.claude && "
-         f"cat > {workdir}/.claude/settings.local.json << 'ORCHEOF'\n"
-         f"{settings_json}\n"
+         f"cat > {settings_path} << 'ORCHEOF'\n"
+         f"{merged_json}\n"
          f"ORCHEOF"],
         capture_output=True,
         timeout=10,
@@ -942,6 +1090,20 @@ def _inject_credentials(cid: str) -> None:
 
 
 # ── Plugin path compatibility ─────────────────────────────────────────────────
+
+
+def _deploy_screenshot_hook(cid: str) -> None:
+    """Write the screenshot UserPromptSubmit hook script into the container."""
+    bin_dir = f"{CONTAINER_HOME}/.claude/bin"
+    script_path = f"{bin_dir}/screenshot-hook.py"
+    escaped = _SCREENSHOT_HOOK_SCRIPT.replace("'", "'\\''")
+    subprocess.run(
+        ["docker", "exec", "-u", CONTAINER_USER, cid, "bash", "-c",
+         f"mkdir -p {bin_dir} && printf '%s' '{escaped}' > {script_path} && "
+         f"chmod +x {script_path}"],
+        capture_output=True,
+        timeout=10,
+    )
 
 
 def _symlink_host_claude_dir(cid: str) -> None:
@@ -1172,6 +1334,9 @@ def ensure_running(project: "Project") -> str:
 
     # Inject host OAuth credentials so Claude doesn't prompt for login
     _inject_credentials(cid)
+
+    # Deploy the screenshot copy hook so dragged screenshots work in containers
+    _deploy_screenshot_hook(cid)
 
     # Symlink host .claude path so plugin absolute paths resolve in container
     _symlink_host_claude_dir(cid)

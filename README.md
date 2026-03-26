@@ -90,6 +90,17 @@ Containers persist across project switches. Orch only removes them when you expl
 
 **Environment variables** — orch automatically passes all host environment variables into containers, minus a sensible blocklist (HOME, PATH, SHELL, etc.). If orch isn't launched from an interactive shell, it also parses `export VAR=VALUE` lines from `~/.zshrc` and `~/.bashrc` so API tokens and credentials are available. To customize which vars are blocked, set `blocked_env` in `~/.orch/config.toml`.
 
+### Screenshot support
+
+Dragging macOS screenshots directly into a Claude container session works out of the box. Take a screenshot with `Cmd+Shift+4`, drag the thumbnail from the corner of your screen into the iTerm tab, and Claude can read the image.
+
+This is non-trivial because macOS stores in-flight screenshot thumbnails in a SIP-protected temp directory (`/var/folders/.../TemporaryItems/`) that Docker's VM cannot access. Orch works around this with a two-part proxy:
+
+1. A **UserPromptSubmit hook** inside the container detects screenshot temp paths in your prompt and writes a copy request to `.claude/` (which is bind-mounted to the host)
+2. The **orch host process** watches for these requests, copies the file into the container via `docker cp` (the host process runs as the user and has SIP access), and signals completion before Claude tries to read the file
+
+The result is the same drag-and-drop workflow you'd use with Claude on the host — no extra steps, no clipboard workarounds, no changed screenshot settings.
+
 ### Reference projects
 
 If you have code in other projects that Claude should be able to look at — a parser you've already built, an auth pattern you like, a design system — you can mount those directories into every container as read-only reference sites.
@@ -246,6 +257,9 @@ Requires `ANTHROPIC_API_KEY` in your environment or iTerm2 profile.
 | `g` | Toggle auto-dispatch (parallel worktrees) |
 | `e` | Open iTerm2 tab with Claude (host) |
 | `c` | Open iTerm2 tab with Claude (container) |
+| `x` | Open shell in container |
+| `dd` | Stop and remove container |
+| `R` | Rebuild container from scratch |
 | `l` | Tail docker logs in iTerm2 tab |
 | `p` | Generate day plan in iTerm2 tab |
 | `b` | Toggle mobile web bridge on/off |

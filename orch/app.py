@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import random
+import time
+import threading
 from pathlib import Path
 from typing import Callable
 
@@ -82,21 +84,26 @@ CONTAINER_ICON_OFF = "[dim]□[/]"
 
 
 class StatusFileHandler(FileSystemEventHandler):
-    """Watchdog handler — calls back into the TUI on any .claude/ or TODOS.md change."""
+    """Watchdog handler — only fires for .claude/ files and TODOS.md."""
 
     def __init__(self, callback: Callable[[str], None]):
         self._cb = callback
 
+    @staticmethod
+    def _relevant(path: str) -> bool:
+        """Only care about .claude/ contents and TODOS.md — ignore everything else."""
+        return "/.claude/" in path or path.endswith("/TODOS.md")
+
     def on_modified(self, event):
-        if not event.is_directory:
+        if not event.is_directory and self._relevant(event.src_path):
             self._cb(event.src_path)
 
     def on_created(self, event):
-        if not event.is_directory:
+        if not event.is_directory and self._relevant(event.src_path):
             self._cb(event.src_path)
 
     def on_deleted(self, event):
-        if not event.is_directory:
+        if not event.is_directory and self._relevant(event.src_path):
             self._cb(event.src_path)
 
 
@@ -112,7 +119,9 @@ class ProjectItem(ListItem):
 
     def _build_label(self) -> str:
         indicator = INDICATOR.get(self.project.status_indicator, INDICATOR["idle"])
-        cbox = CONTAINER_ICON if container_is_running(self.project) else CONTAINER_ICON_OFF
+        app = self.app
+        is_running = app._cached_container_is_running(self.project) if isinstance(app, OrchApp) else container_is_running(self.project)
+        cbox = CONTAINER_ICON if is_running else CONTAINER_ICON_OFF
         auto = "[bold magenta]⚡[/]" if self.project.auto_dispatch_enabled else ""
         count = self.project.pending_count
         badge = f" [dim]{count}t[/]" if count else ""
@@ -198,8 +207,9 @@ class StatusPane(Static):
             else "[dim italic]No status yet — Claude hasn't written to .claude/status[/]"
         )
 
-        # Container status
-        cid = container_is_running(project)
+        # Container status (use cached check to avoid spawning docker inspect)
+        app = self.app
+        cid = app._cached_container_is_running(project) if isinstance(app, OrchApp) else container_is_running(project)
         if cid:
             container_line = f"\n[bold blue]■[/] Container running ({cid[:12]})"
         else:
@@ -562,6 +572,7 @@ class OrchApp(App):
         Binding("c", "container_up", "Container", show=True),
         Binding("x", "container_shell", "Shell(ctr)", show=True),
         Binding("d", "container_down_press", "Down(dd)", show=True),
+        Binding("R", "container_rebuild", "Rebuild", show=True),
         Binding("l", "open_logs", "Logs", show=True),
         Binding("p", "open_plan", "Plan", show=True),
         Binding("b", "toggle_bridge", "Bridge", show=True),
@@ -585,6 +596,13 @@ class OrchApp(App):
         self._mobile: bool = False
         self._active_tab: int = 0  # 0=projects, 1=status, 2=todos
         self._dispatch_timers: dict[str, Timer] = {}  # project path -> pending dispatch timer
+        # Container status cache: path -> (timestamp, container_id | None)
+        self._container_cache: dict[str, tuple[float, str | None]] = {}
+        self._container_cache_ttl: float = 10.0  # seconds
+        # Debounce: coalesce rapid file-change events per project
+        self._debounce_timers: dict[str, threading.Timer] = {}
+        self._debounce_lock = threading.Lock()
+        self._debounce_delay: float = 0.3  # seconds
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -602,7 +620,7 @@ class OrchApp(App):
                 yield Static("todos", id="right-title")
                 yield Markdown("", id="todos-view")
         yield Static(
-            "[dim]j/k[/] navigate  [dim]Enter[/] select  [dim]t[/]ask  [dim]a[/]dd todo  [dim]e[/]xec  [dim]c[/]ontainer  [dim]x[/] shell(ctr)  [dim]dd[/] down\n"
+            "[dim]j/k[/] navigate  [dim]Enter[/] select  [dim]t[/]ask  [dim]a[/]dd todo  [dim]e[/]xec  [dim]c[/]ontainer  [dim]x[/] shell(ctr)  [dim]dd[/] down  [dim]R[/]ebuild\n"
             "[dim]l[/]ogs  [dim]p[/]lan  [dim]b[/]ridge  [dim]s[/]tage  [dim]i[/]gnore  [dim]g[/] auto  [dim]o[/] config  [dim]r[/]efresh  [dim]q[/]uit  [dim]Esc[/] cancel",
             id="help-bar",
             markup=True,
@@ -710,8 +728,34 @@ class OrchApp(App):
         self._observer.start()
 
     def _on_file_changed(self, path: str) -> None:
-        """Called from watchdog thread — post a message to the main thread."""
-        self.call_from_thread(self._handle_file_change, path)
+        """Called from watchdog thread — debounce rapid events per project."""
+        # Find which project this path belongs to for debounce grouping
+        p = Path(path)
+        key = path  # default: per-file debounce
+        for proj in self.projects:
+            try:
+                if p.is_relative_to(proj.path):
+                    key = str(proj.path)
+                    break
+            except ValueError:
+                pass
+
+        # Immediate dispatch for high-priority files (input waiting, screenshots)
+        if p.name in ("waiting_for_input", "_screenshot_copy_request"):
+            self.call_from_thread(self._handle_file_change, path)
+            return
+
+        with self._debounce_lock:
+            existing = self._debounce_timers.get(key)
+            if existing:
+                existing.cancel()
+            timer = threading.Timer(
+                self._debounce_delay,
+                lambda: self.call_from_thread(self._handle_file_change, path),
+            )
+            timer.daemon = True
+            self._debounce_timers[key] = timer
+            timer.start()
 
     def _handle_file_change(self, path: str) -> None:
         changed = Path(path)
@@ -749,13 +793,25 @@ class OrchApp(App):
 
         # ── container_id changed: container started/stopped ───────────────────
         if changed.name == "container_id":
+            project = self._project_for_path(changed)
+            if project:
+                self._invalidate_container_cache(project)
             self._refresh_project_item_for_path(changed)
             if self.selected_project and changed.is_relative_to(self.selected_project.path):
                 self._refresh_panes()
             # Container just started — check if there are pending todos to dispatch
-            project = self._project_for_path(changed)
             if project and changed.exists():
                 self._schedule_dispatch_check(project)
+            return
+
+        # ── Screenshot copy request: host copies file into container ─────────
+        if changed.name == "_screenshot_copy_request" and changed.exists():
+            project = self._project_for_path(changed)
+            if project:
+                self.run_worker(
+                    lambda p=project, f=changed: self._handle_screenshot_copy(p, f),
+                    thread=True,
+                )
             return
 
         # ── iterm handles: no action needed ───────────────────────────────────
@@ -787,6 +843,65 @@ class OrchApp(App):
                 pass
         return None
 
+    def _handle_screenshot_copy(self, project: "Project", request_file: Path) -> None:
+        """Copy screenshot files from host into the container via docker cp.
+
+        Called when the in-container UserPromptSubmit hook writes a request
+        file listing macOS screenshot temp paths it needs copied in.
+        """
+        import subprocess as _sp
+
+        cid = project.container_id
+        if not cid:
+            return
+
+        try:
+            paths = request_file.read_text().strip().splitlines()
+        except OSError:
+            return
+
+        for host_path in paths:
+            host_path = host_path.strip()
+            if not host_path:
+                continue
+            # Create target directory inside the container
+            target_dir = str(Path(host_path).parent)
+            _sp.run(
+                ["docker", "exec", "-u", "root", cid,
+                 "mkdir", "-p", target_dir],
+                capture_output=True, timeout=5,
+            )
+            # Copy from host (user has SIP access) into container
+            _sp.run(
+                ["docker", "cp", host_path, f"{cid}:{host_path}"],
+                capture_output=True, timeout=10,
+            )
+            # Fix ownership so vscode user can read it
+            _sp.run(
+                ["docker", "exec", "-u", "root", cid,
+                 "chown", "vscode:vscode", host_path],
+                capture_output=True, timeout=5,
+            )
+
+        # Signal completion
+        done_file = request_file.parent / "_screenshot_copy_done"
+        done_file.write_text("done")
+
+    def _cached_container_is_running(self, project: "Project") -> str | None:
+        """Return cached container status, refreshing if stale (> TTL seconds)."""
+        key = str(project.path)
+        now = time.monotonic()
+        cached = self._container_cache.get(key)
+        if cached and (now - cached[0]) < self._container_cache_ttl:
+            return cached[1]
+        result = container_is_running(project)
+        self._container_cache[key] = (now, result)
+        return result
+
+    def _invalidate_container_cache(self, project: "Project") -> None:
+        """Force next check to call docker inspect."""
+        self._container_cache.pop(str(project.path), None)
+
     def _refresh_project_item(self, project: Project) -> None:
         lv = self.query_one("#project-list", ListView)
         for item in lv.query(ProjectItem):
@@ -815,7 +930,7 @@ class OrchApp(App):
 
     def _ensure_container(self, project: Project) -> None:
         """Start container in background if not already running."""
-        if container_is_running(project):
+        if self._cached_container_is_running(project):
             return
 
         # Start the spinner
@@ -1026,6 +1141,34 @@ class OrchApp(App):
         self.notify(f"Container stopped for {p.name}")
         self._refresh_project_item(p)
         self._refresh_panes()
+
+    def action_container_rebuild(self) -> None:
+        """Stop, remove, and rebuild the container from scratch."""
+        if self._input_focused:
+            return
+        p = self.selected_project
+        if not p:
+            self.notify("No project selected", severity="warning")
+            return
+
+        pane = self.query_one("#status-pane", StatusPane)
+        pane.start_spinner("Rebuilding container", p)
+
+        def _rebuild():
+            try:
+                # Stop existing container (if any)
+                if container_is_running(p):
+                    container_stop(p)
+                self._invalidate_container_cache(p)
+                # Start fresh — ensure_running will create a new container
+                exec_claude_in_iterm(p, with_shell=True)
+                self.call_from_thread(self._stop_spinner_and_refresh, p,
+                                      f"Container rebuilt for {p.name}")
+            except Exception as e:
+                self.call_from_thread(self._stop_spinner_and_refresh, p,
+                                      f"Rebuild failed: {e}", "error")
+
+        self.run_worker(_rebuild, thread=True)
 
     def action_exec_shell(self) -> None:
         """Open an iTerm2 tab with Claude on the host (no container)."""
@@ -1432,6 +1575,11 @@ class OrchApp(App):
         for timer in self._dispatch_timers.values():
             timer.stop()
         self._dispatch_timers.clear()
+        # Stop debounce timers
+        with self._debounce_lock:
+            for timer in self._debounce_timers.values():
+                timer.cancel()
+            self._debounce_timers.clear()
         if self._observer:
             self._observer.stop()
             self._observer.join()
