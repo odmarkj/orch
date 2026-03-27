@@ -160,6 +160,30 @@ class Project:
         except FileNotFoundError:
             return []
 
+    # ── JSONL session directory ─────────────────────────────────────────────
+
+    @property
+    def jsonl_dirs(self) -> list[Path]:
+        """Return possible ~/.claude/projects/ dirs containing JSONL session files.
+
+        Container projects use /workspaces/{name} encoding, host projects use
+        the full encoded path.  Returns both so the watcher covers either case.
+        """
+        base = Path.home() / ".claude" / "projects"
+        # Container path: /workspaces/{name} → -workspaces-{name}
+        container_dir = base / f"-workspaces-{self.name}"
+        # Host path: /Users/joe/Apps/proj → -Users-joe-Apps-proj
+        host_dir = base / str(self.path).replace("/", "-").lstrip("-")
+        dirs = []
+        for d in (container_dir, host_dir):
+            if d.is_dir():
+                dirs.append(d)
+        return dirs
+
+    @property
+    def waiting_for_input_file(self) -> Path:
+        return self.claude_dir / "waiting_for_input"
+
     # ── Per-project config ────────────────────────────────────────────────────
 
     @property
@@ -169,12 +193,78 @@ class Project:
     @property
     def code_review_enabled(self) -> bool:
         """Check if code review is enabled for this project (off by default)."""
+        return self._read_orch_config_bool("code_review", False)
+
+    @property
+    def test_cmd(self) -> str | None:
+        """Test command to run after auto-dispatch tasks. Checks .orch/project.toml first, then auto-detects."""
+        explicit = self._read_orch_config_str("test_cmd")
+        if explicit is not None:
+            return explicit
+        return self._detect_test_cmd()
+
+    def _detect_test_cmd(self) -> str | None:
+        """Auto-detect test command from project files."""
+        import json
+
+        # package.json → npm test (only if script exists and isn't the default placeholder)
+        pkg = self.path / "package.json"
+        if pkg.is_file():
+            try:
+                scripts = json.loads(pkg.read_text()).get("scripts", {})
+                test_script = scripts.get("test", "")
+                if test_script and "no test specified" not in test_script:
+                    return "npm test"
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        # pyproject.toml → pytest
+        if (self.path / "pyproject.toml").is_file():
+            return "pytest -x"
+
+        # Makefile with test target
+        makefile = self.path / "Makefile"
+        if makefile.is_file():
+            try:
+                for line in makefile.read_text().splitlines():
+                    if line.startswith("test:") or line.startswith("test "):
+                        return "make test"
+            except OSError:
+                pass
+
+        # Cargo.toml → cargo test
+        if (self.path / "Cargo.toml").is_file():
+            return "cargo test"
+
+        # go.mod → go test
+        if (self.path / "go.mod").is_file():
+            return "go test ./..."
+
+        return None
+
+    @property
+    def max_fix_attempts(self) -> int:
+        """Max times Claude will retry fixing failed tests (default 3)."""
+        val = self._read_orch_config_str("max_fix_attempts")
+        if val is not None:
+            try:
+                return int(val)
+            except ValueError:
+                pass
+        return 3
+
+    def _read_orch_config_str(self, key: str) -> str | None:
         try:
             for line in self.orch_config_file.read_text().splitlines():
                 stripped = line.strip()
-                if stripped.startswith("code_review") and "=" in stripped:
-                    val = stripped.split("=", 1)[1].strip().strip('"').strip("'").lower()
-                    return val == "true"
+                if stripped.startswith(key) and "=" in stripped:
+                    return stripped.split("=", 1)[1].strip().strip('"').strip("'")
         except FileNotFoundError:
             pass
-        return False
+        return None
+
+    def _read_orch_config_bool(self, key: str, default: bool = False) -> bool:
+        val = self._read_orch_config_str(key)
+        if val is not None:
+            return val.lower() == "true"
+        return default

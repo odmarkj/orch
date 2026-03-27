@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import random
 import time
 import threading
@@ -107,7 +108,45 @@ class StatusFileHandler(FileSystemEventHandler):
             self._cb(event.src_path)
 
 
-# ── Widgets ───────────────────────────────────────────────────────────────────
+class SessionJournalHandler(FileSystemEventHandler):
+    """Watchdog handler for JSONL session files under ~/.claude/projects/."""
+
+    def __init__(self, callback: Callable[[str], None]):
+        self._cb = callback
+
+    def on_modified(self, event):
+        if not event.is_directory and event.src_path.endswith(".jsonl"):
+            self._cb(event.src_path)
+
+
+def _tail_read_jsonl(path: Path, chunk_size: int = 8192) -> list[dict]:
+    """Read the last few JSON lines from a JSONL file efficiently.
+
+    Seeks to the end minus *chunk_size* bytes, reads forward, and parses
+    complete lines.  Returns entries in order (oldest first).
+    """
+    try:
+        size = path.stat().st_size
+        if size == 0:
+            return []
+        with open(path, "rb") as f:
+            f.seek(max(0, size - chunk_size))
+            data = f.read().decode("utf-8", errors="replace")
+        entries: list[dict] = []
+        for line in data.strip().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue  # partial first line after seek
+        return entries
+    except (OSError, ValueError):
+        return []
+
+
+# ─��� Widgets ──────────────────────────────────────────────���────────────────────
 
 class ProjectItem(ListItem):
     def __init__(self, project: Project) -> None:
@@ -603,6 +642,10 @@ class OrchApp(App):
         self._debounce_timers: dict[str, threading.Timer] = {}
         self._debounce_lock = threading.Lock()
         self._debounce_delay: float = 0.3  # seconds
+        # JSONL journal watcher state
+        self._journal_debounce_timers: dict[str, threading.Timer] = {}
+        self._journal_debounce_delay: float = 3.0  # seconds — wait for turn to settle
+        self._jsonl_dir_to_project: dict[str, Project] = {}
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -718,6 +761,7 @@ class OrchApp(App):
         if not self.projects:
             return
         handler = StatusFileHandler(self._on_file_changed)
+        journal_handler = SessionJournalHandler(self._on_journal_changed)
         self._observer = Observer()
         watched = set()
         for p in self.projects:
@@ -725,6 +769,13 @@ class OrchApp(App):
             if target not in watched:
                 self._observer.schedule(handler, target, recursive=True)
                 watched.add(target)
+            # Watch JSONL session directories for this project
+            for jdir in p.jsonl_dirs:
+                jdir_str = str(jdir)
+                if jdir_str not in watched:
+                    self._observer.schedule(journal_handler, jdir_str, recursive=False)
+                    watched.add(jdir_str)
+                    self._jsonl_dir_to_project[jdir_str] = p
         self._observer.start()
 
     def _on_file_changed(self, path: str) -> None:
@@ -832,6 +883,109 @@ class OrchApp(App):
             project = self._project_for_path(changed)
             if project:
                 self._schedule_dispatch_check(project)
+
+    # ── JSONL session journal detection ─────────────────────────────────────
+
+    def _on_journal_changed(self, path: str) -> None:
+        """Called from watchdog thread when a JSONL session file is modified.
+
+        Debounces with a 3-second delay so we only check after Claude's turn
+        has fully settled (thinking → tool_use → text → system/turn_duration).
+        """
+        with self._debounce_lock:
+            existing = self._journal_debounce_timers.get(path)
+            if existing:
+                existing.cancel()
+            timer = threading.Timer(
+                self._journal_debounce_delay,
+                lambda: self._check_journal_state(path),
+            )
+            timer.daemon = True
+            self._journal_debounce_timers[path] = timer
+            timer.start()
+
+    def _check_journal_state(self, path: str) -> None:
+        """Tail-read a JSONL session file and detect if Claude is waiting.
+
+        Uses the waiting_for_input file as a dedup gate: only writes it if
+        it doesn't already exist, so duplicate notifications are impossible.
+        """
+        jsonl_path = Path(path)
+        # Map JSONL directory back to project
+        parent_str = str(jsonl_path.parent)
+        project = self._jsonl_dir_to_project.get(parent_str)
+        if not project:
+            return
+
+        entries = _tail_read_jsonl(jsonl_path)
+        if not entries:
+            return
+
+        # Walk backwards to find the last meaningful entry
+        # (skip file-history-snapshot and progress noise)
+        last_meaningful = None
+        prev_assistant_text = None
+        for entry in reversed(entries):
+            etype = entry.get("type")
+            if etype in ("file-history-snapshot", "progress"):
+                continue
+            if last_meaningful is None:
+                last_meaningful = entry
+            # Also find the last assistant/text entry (may precede system entry)
+            if (etype == "assistant" and prev_assistant_text is None):
+                content = entry.get("message", {}).get("content", [])
+                if isinstance(content, list):
+                    ctypes = [c.get("type") for c in content if isinstance(c, dict)]
+                    if "text" in ctypes:
+                        prev_assistant_text = entry
+                        break
+                elif isinstance(content, str):
+                    prev_assistant_text = entry
+                    break
+            if last_meaningful and prev_assistant_text:
+                break
+
+        if not last_meaningful:
+            return
+
+        wfi = project.waiting_for_input_file
+        etype = last_meaningful.get("type")
+        subtype = last_meaningful.get("subtype", "")
+
+        # Turn complete: system/turn_duration follows assistant/text
+        if etype == "system" and subtype == "turn_duration" and prev_assistant_text:
+            if not wfi.exists():
+                # Extract tail of Claude's last message for notification context
+                content = prev_assistant_text.get("message", {}).get("content", [])
+                text = ""
+                if isinstance(content, list):
+                    parts = [
+                        c.get("text", "")
+                        for c in content
+                        if isinstance(c, dict) and c.get("type") == "text"
+                    ]
+                    text = " ".join(parts).strip()[-300:]
+                elif isinstance(content, str):
+                    text = content.strip()[-300:]
+                # Ensure .claude/ dir exists and write the gate file.
+                # The existing StatusFileHandler watchdog will detect the
+                # creation and fire _handle_file_change → notify_input_needed.
+                wfi.parent.mkdir(parents=True, exist_ok=True)
+                wfi.write_text(text or "Waiting for input")
+            return
+
+        # Activity resumed: user message or new assistant work after we notified
+        if etype in ("user", "assistant") and wfi.exists():
+            # Don't clear on tool_result — that's mid-turn tooling
+            msg = last_meaningful.get("message", {})
+            content = msg.get("content", [])
+            if isinstance(content, str):
+                # Actual user prompt text — activity resumed.
+                # Deletion is detected by StatusFileHandler → notify_resumed.
+                try:
+                    wfi.unlink()
+                except FileNotFoundError:
+                    pass
 
     def _project_for_path(self, path: Path) -> Project | None:
         """Find the project that owns this path."""
@@ -1505,10 +1659,17 @@ class OrchApp(App):
         pr_url = results.get("pr_url")
         branch = results.get("branch", "")
         truncated = todo_text[:40] + ("…" if len(todo_text) > 40 else "")
+        test_info = ""
+        if results.get("tests_passed") is True:
+            attempts = results.get("test_attempts", 1)
+            test_info = f" (tests passed, {attempts} attempt{'s' if attempts > 1 else ''})"
+        elif results.get("tests_passed") is False:
+            attempts = results.get("test_attempts", 0)
+            test_info = f" (tests FAILED after {attempts} attempts)"
         if pr_url:
-            self.notify(f"✓ {truncated} → PR: {pr_url}")
+            self.notify(f"✓ {truncated}{test_info} → PR: {pr_url}")
         else:
-            self.notify(f"✓ {truncated} → branch: {branch}")
+            self.notify(f"✓ {truncated}{test_info} → branch: {branch}")
 
         # If there's a code review, write it as a comment on the PR
         review = results.get("review", "")

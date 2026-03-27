@@ -14,6 +14,7 @@ orch CLI
   orch container <project> down     Stop container
   orch container <project> status   Check container status
   orch container <project> exec     Exec into container running claude
+  orch container build-base         Build pre-cached base image with Claude Code
   orch ignore <project>              Hide project from orch
   orch ignore <project> --undo      Un-hide project
   orch setup                        First-time setup
@@ -200,7 +201,21 @@ def cmd_container(argv: list[str]) -> None:
 
     if len(argv) < 1:
         print("Usage: orch container <project> [up|down|status|exec]")
+        print("       orch container build-base   Build pre-cached base image")
         sys.exit(1)
+
+    # Handle build-base before project lookup (no project needed)
+    if argv[0] == "build-base":
+        from .container import build_base_image, CLAUDE_CODE_VERSION, ORCH_BASE_IMAGE
+        print(f"  Building {ORCH_BASE_IMAGE} with Claude Code v{CLAUDE_CODE_VERSION}…")
+        try:
+            tag = build_base_image()
+            print(f"  Done. Image: {tag}")
+            print(f"  All new containers will use this pre-built image.")
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        return
 
     project_name = argv[0]
     action = argv[1] if len(argv) > 1 else "up"

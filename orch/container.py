@@ -95,6 +95,8 @@ _load_shell_env()
 # ── Default config ───────────────────────────────────────────────────────────
 
 DEFAULT_IMAGE = "mcr.microsoft.com/devcontainers/base:ubuntu"
+ORCH_BASE_IMAGE = "orch-base:latest"
+CLAUDE_CODE_VERSION = "2.1.86"
 DEFAULT_MEMORY = "12g"
 CONTAINER_PREFIX = "orch-"
 WORKSPACE_DIR = "/workspace"
@@ -106,6 +108,7 @@ ORCH_POST_CREATE = (
     "printf 'set nocompatible\\nset backspace=indent,eol,start\\n' > ~/.vimrc"
     " && echo 'alias vim=vi' >> ~/.bashrc"
     " && echo 'export TERM=xterm-256color' >> ~/.bashrc"
+    f" && (command -v claude >/dev/null 2>&1 || npm install -g @anthropic-ai/claude-code@{CLAUDE_CODE_VERSION})"
 )
 
 # Env vars that should never be passed into containers (blocklist).
@@ -194,6 +197,31 @@ SETTINGS_LOCAL = {
         ]
     },
     "hooks": {
+        "Stop": [
+            {
+                "matcher": "",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": (
+                            "cat /dev/stdin"
+                            " | python3 -c \""
+                            "import sys,json;"
+                            "d=json.load(sys.stdin);"
+                            "t=d.get('transcript',[]);"
+                            "msgs=[m for m in t if m.get('role')=='assistant'];"
+                            "txt='';"
+                            "\nif msgs:"
+                            "\n parts=[p.get('text','') for p in msgs[-1].get('content',[]) if p.get('type')=='text'];"
+                            "\n txt=' '.join(parts).strip()[-300:];"
+                            "\nopen('.claude/waiting_for_input','w').write(txt or 'Waiting for input')"
+                            "\""
+                        ),
+                        "timeout": 5,
+                    }
+                ],
+            }
+        ],
         "Notification": [
             {
                 "matcher": "",
@@ -218,7 +246,16 @@ SETTINGS_LOCAL = {
                 "hooks": [
                     {
                         "type": "command",
-                        "command": f"python3 {CONTAINER_HOME}/.claude/bin/screenshot-hook.py",
+                        "command": "rm -f .claude/waiting_for_input",
+                        "timeout": 2,
+                    }
+                ],
+            },
+            {
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "python3 $HOME/.claude/bin/screenshot-hook.py",
                         "timeout": 5,
                     }
                 ],
@@ -232,7 +269,7 @@ DEVCONTAINER_TEMPLATE = {
     "name": "orch sandbox",
     "image": DEFAULT_IMAGE,
     "features": {
-        "ghcr.io/anthropics/devcontainer-features/claude-code:1.0": {},
+        "ghcr.io/anthropics/devcontainer-features/claude-code:1": {},
         "ghcr.io/devcontainers/features/node:1": {"version": "22"},
         "ghcr.io/devcontainers/features/common-utils:2": {},
         "ghcr.io/devcontainers/features/python:1": {
@@ -240,7 +277,6 @@ DEVCONTAINER_TEMPLATE = {
             "installTools": True,
         },
         "ghcr.io/devcontainers/features/git:1": {},
-        "ghcr.io/shyim/devcontainers-features/bun:0": {},
     },
     "containerEnv": {
         "CLAUDE_CONFIG_DIR": f"{CONTAINER_HOME}/.claude",
@@ -322,6 +358,52 @@ else:
 # Don't modify the prompt
 print("{}")
 """
+
+
+# ── Pre-built base image ─────────────────────────────────────────────────────
+
+
+def _orch_base_image_exists() -> bool:
+    """Check if the orch-base Docker image is available locally."""
+    result = subprocess.run(
+        ["docker", "image", "inspect", ORCH_BASE_IMAGE],
+        capture_output=True,
+    )
+    return result.returncode == 0
+
+
+def build_base_image() -> str:
+    """Build the orch-base Docker image with Claude Code pre-installed.
+
+    Returns the image tag on success.
+    """
+    dockerfile = (
+        f"FROM {DEFAULT_IMAGE}\n"
+        f"RUN apt-get update -qq && apt-get install -y -qq nodejs npm \\\n"
+        f"    && npm install -g @anthropic-ai/claude-code@{CLAUDE_CODE_VERSION} \\\n"
+        f"    && apt-get clean && rm -rf /var/lib/apt/lists/*\n"
+    )
+    result = subprocess.run(
+        ["docker", "build", "-t", ORCH_BASE_IMAGE, "-f", "-", "."],
+        input=dockerfile,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Failed to build {ORCH_BASE_IMAGE}:\n{result.stderr}")
+    return ORCH_BASE_IMAGE
+
+
+def _effective_image() -> str:
+    """Return the best available base image.
+
+    Uses the pre-built orch-base image if it exists locally, otherwise
+    falls back to the default devcontainer base image.
+    """
+    if _orch_base_image_exists():
+        return ORCH_BASE_IMAGE
+    return DEFAULT_IMAGE
 
 
 # ── Config loading ───────────────────────────────────────────────────────────
@@ -584,6 +666,10 @@ def _prepare_devcontainer_config(project: "Project") -> Path:
             config = json.loads(dc_json.read_text())
             dc_base.write_text(json.dumps(config, indent=2) + "\n")
 
+        # Upgrade to pre-built image if using the default base image
+        if config.get("image") == DEFAULT_IMAGE:
+            config["image"] = _effective_image()
+
         # Inject all host env vars (minus blocklist) into containerEnv.
         # This also resolves any ${localEnv:...} placeholders the user may
         # have in their base config — we replace them with concrete values
@@ -608,8 +694,11 @@ def _prepare_devcontainer_config(project: "Project") -> Path:
 
         # Ensure required devcontainer features are present
         features = config.get("features", {})
+        # Build a set of feature base names (without version) already present
+        existing_bases = {k.rsplit(":", 1)[0] for k in features}
         for feat_key, feat_val in DEVCONTAINER_TEMPLATE["features"].items():
-            if feat_key not in features:
+            feat_base = feat_key.rsplit(":", 1)[0]
+            if feat_key not in features and feat_base not in existing_bases:
                 features[feat_key] = feat_val
         config["features"] = features
 
@@ -712,6 +801,10 @@ def _prepare_devcontainer_config(project: "Project") -> Path:
 
     config = dict(DEVCONTAINER_TEMPLATE)
     config["name"] = f"orch — {project.name}"
+
+    # Use the pre-built orch-base image if available (Claude Code
+    # is already installed, so the feature just verifies).
+    config["image"] = _effective_image()
 
     # Add env var passthrough (all host env vars except blocklisted ones)
     container_env = dict(config.get("containerEnv", {}))
@@ -827,7 +920,8 @@ def _find_container_by_label(project: "Project") -> str:
 def _docker_run(project: "Project") -> str:
     """Use raw docker to start container. Returns container ID."""
     cfg = _load_container_config()
-    image = cfg.get("image", DEFAULT_IMAGE)
+    # Prefer pre-built orch-base image, then user config, then default
+    image = _effective_image() if _orch_base_image_exists() else cfg.get("image", DEFAULT_IMAGE)
     memory = cfg.get("memory", DEFAULT_MEMORY)
     container_name = f"{CONTAINER_PREFIX}{project.name}"
 
@@ -917,7 +1011,7 @@ def _install_claude_in_container(cid: str) -> None:
     subprocess.run(
         ["docker", "exec", cid, "bash", "-c",
          "command -v node || (apt-get update -qq && apt-get install -y -qq nodejs npm) && "
-         "npm install -g @anthropic-ai/claude-code"],
+         f"npm install -g @anthropic-ai/claude-code@{CLAUDE_CODE_VERSION}"],
         capture_output=True,
         timeout=180,
     )
@@ -2252,32 +2346,98 @@ def _create_pr(worktree_path: Path, branch_name: str, todo_text: str, review_tex
     return None
 
 
+def _run_tests(worktree_path: Path, test_cmd: str, timeout: int = 300) -> tuple[bool, str]:
+    """
+    Run the project's test command in the worktree.
+    Returns (passed, output) where output includes both stdout and stderr.
+    """
+    result = subprocess.run(
+        test_cmd,
+        shell=True,
+        capture_output=True,
+        text=True,
+        cwd=str(worktree_path),
+        timeout=timeout,
+    )
+    output = ""
+    if result.stdout:
+        output += result.stdout
+    if result.stderr:
+        output += "\n" + result.stderr
+    # Cap output to avoid blowing up the prompt
+    output = output.strip()
+    if len(output) > 8000:
+        output = output[-8000:]
+    return result.returncode == 0, output
+
+
 def run_task_in_worktree(project: "Project", todo_text: str) -> dict:
     """
-    Full pipeline: worktree -> Claude task -> code review -> commit -> push -> PR.
-    Returns a dict with results: {branch, worktree, pr_url, review}.
+    Full pipeline: worktree -> Claude task -> test-fix loop -> code review -> commit -> push -> PR.
+    Returns a dict with results: {branch, worktree, pr_url, review, test_attempts, tests_passed}.
     """
     worktree_path, branch_name = create_worktree(project, todo_text)
-    results = {"branch": branch_name, "worktree": str(worktree_path), "pr_url": None, "review": ""}
+    results = {
+        "branch": branch_name,
+        "worktree": str(worktree_path),
+        "pr_url": None,
+        "review": "",
+        "test_attempts": 0,
+        "tests_passed": None,
+    }
+
+    test_cmd = project.test_cmd
+    max_fix = project.max_fix_attempts if test_cmd else 0
 
     try:
-        # Run Claude on the task inside the worktree
+        # ── Initial Claude run ──────────────────────────────────────────
         safe_task = todo_text.replace("'", "'\\''")
         task_prompt = (
             f"Work on this task: {safe_task}\n\n"
             f"When done, make sure all changes are saved. Do not commit or push."
         )
-        safe_prompt = task_prompt.replace("'", "'\\''")
 
         subprocess.run(
-            ["claude", "--dangerously-skip-permissions", "-p", safe_prompt],
+            ["claude", "--dangerously-skip-permissions", "-p", task_prompt],
             capture_output=True,
             text=True,
             cwd=str(worktree_path),
             timeout=600,
         )
 
-        # Code review (if enabled for project)
+        # ── Test-fix loop ───────────────────────────────────────────────
+        if test_cmd:
+            for attempt in range(1, max_fix + 2):  # attempt 1 = first test run
+                results["test_attempts"] = attempt
+                passed, test_output = _run_tests(worktree_path, test_cmd)
+
+                if passed:
+                    results["tests_passed"] = True
+                    break
+
+                # Last attempt failed — record and move on
+                if attempt > max_fix:
+                    results["tests_passed"] = False
+                    break
+
+                # Send failure back to Claude for fixing
+                fix_prompt = (
+                    f"The tests failed (attempt {attempt}/{max_fix}). "
+                    f"Fix the failing tests and make sure all changes are saved. "
+                    f"Do not commit or push.\n\n"
+                    f"Test command: {test_cmd}\n\n"
+                    f"Test output:\n```\n{test_output}\n```"
+                )
+
+                subprocess.run(
+                    ["claude", "--dangerously-skip-permissions", "-p", fix_prompt],
+                    capture_output=True,
+                    text=True,
+                    cwd=str(worktree_path),
+                    timeout=600,
+                )
+
+        # ── Code review (if enabled) ────────────────────────────────────
         if project.code_review_enabled:
             # First do a temporary commit so review can diff
             subprocess.run(["git", "add", "-A"], capture_output=True, cwd=str(worktree_path), timeout=10)

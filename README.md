@@ -227,6 +227,7 @@ orch logs <project> -g error        # Grep filter
 orch logs <project> --list          # Show discovered containers
 orch logs <project> --past          # Read saved log files
 orch bridge                         # Start mobile web bridge (Ctrl-C to stop)
+orch container build-base            # Pre-build base image with Claude Code
 orch container <project> up         # Start devcontainer for project
 orch container <project> down       # Stop container
 orch container <project> status     # Check container status
@@ -302,9 +303,14 @@ pip install -e . --break-system-packages
 
 ```bash
 orch setup
+
+# Recommended: pre-build the base image with Claude Code installed
+orch container build-base
 ```
 
-This will:
+`build-base` creates a local `orch-base:latest` Docker image with Claude Code pre-installed. This is optional — containers will still work without it — but it significantly speeds up container startup since Claude Code doesn't need to be installed from scratch each time.
+
+`orch setup` will:
 1. Symlink the iTerm2 dynamic profile
 2. Verify macOS notification support (built-in, no extra install needed)
 3. Check for Docker and `devcontainer` CLI
