@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <em>One terminal, all your projects. Built for shipping — not just building.</em>
+  <em>You are the team. Orch is your ops layer.</em>
 </p>
 
 <p align="center">
@@ -15,7 +15,7 @@
 </p>
 
 <p align="center">
-  <a href="#the-problem">The Problem</a> &bull;
+  <a href="#who-this-is-for">Who This Is For</a> &bull;
   <a href="#quick-start">Quick Start</a> &bull;
   <a href="#how-it-works">How It Works</a> &bull;
   <a href="#architecture">Architecture</a> &bull;
@@ -27,29 +27,32 @@
 
 ---
 
-## The Problem
+## Who this is for
 
-If you're building multiple projects with Claude Code, you know the pain:
+You're one person — or maybe two or three — shipping real products. Not a 20-person team with dedicated DevOps, a QA department, and CI pipelines that someone else maintains. **You** write the code, run the dev server, test locally, fix the bug, push to production, and handle the customer email that comes in while you're doing all of that. Across multiple projects.
 
-- **Context switching is manual** — you `cd` between projects, open tabs, lose track of what's running where
-- **No visibility** — which Claude session is active? Which is stuck waiting for input? Which project stalled three weeks ago?
-- **Permission friction** — Claude asks for approval on every file write and shell command, breaking autonomous workflows
-- **No prioritization** — with ten projects in flight, it's hard to know which one to push forward today
+Claude Code changed the game — you can move faster than ever. But now the bottleneck isn't writing code. It's everything around it:
 
-You end up juggling terminal tabs, forgetting which projects need attention, and losing momentum to overhead instead of shipping.
+- **You're the context switch.** Five projects open, five terminal tabs, five different states of "where was I?" You `cd` between them, re-read the last commit, try to remember what you were doing. The overhead eats the speed Claude gave you.
+- **You can't see what's happening.** Claude is running in one tab. Is it done? Is it stuck waiting for a yes/no? Is it spinning on a bad approach? You won't know until you check — and you're in another tab.
+- **Permission prompts kill flow.** Claude asks to write a file. You approve. Claude asks to run a test. You approve. Claude asks to edit another file. Twenty interruptions into a task that should have been autonomous.
+- **Nothing tells you what matters.** Ten projects, ten TODO lists, ten different levels of "almost shipped." You pick whatever feels urgent, not what actually moves the needle. Three projects sit in MVP purgatory for weeks.
+- **Local iteration has no structure.** You test by hand, eyeball the output, push when it looks right. There's no feedback loop between "Claude wrote code" and "this actually works" that doesn't involve you sitting there watching.
+
+Tools like [Composio](https://github.com/ComposioHQ/agent-orchestrator) solve this for teams — they dispatch agents across a CI pipeline with GitHub PR review workflows baked in. That's great if you have the infrastructure and the people to run it. But if you're the whole team, you need something different. You need the dev server running, the tests passing locally, the iteration happening in front of you, and the production-ready code going out as a PR when it's actually ready.
 
 ### Where orch fits
 
-orch gives you a single control plane for all your Claude Code projects. It discovers projects automatically, tracks their lifecycle, runs Claude in isolated containers with full permissions, and tells you what to work on next.
+Orch is the ops layer for the person who is the team. It doesn't assume you have CI. It doesn't assume someone else reviews your PRs. It gives you a single terminal where every project is visible, every Claude session is tracked, and the work that matters floats to the top.
 
-| Without orch | With orch |
+| Your day without orch | Your day with orch |
 |-------------|-----------|
-| Manually `cd` between projects | Select from a live project list |
-| Claude asks permission for everything | Containers run with `--dangerously-skip-permissions` |
-| No idea which session is active or stuck | Real-time status dots and notifications |
-| Context lost between sessions | Session resume built in |
-| No sense of project momentum | Lifecycle tracking with stall detection |
-| "What should I work on?" | AI day planner with prioritized focus |
+| Open five terminal tabs, `cd` into each project, try to remember where you left off | Open orch. Every project is there. Status dots show what's running, what's waiting, what's idle. |
+| Claude asks permission 20 times during a refactor. You babysit the tab. | Claude runs in an isolated container with full permissions. You check back when it's done. |
+| A Claude session needs input. You don't notice for 40 minutes. | macOS notification fires. iTerm2 tab opens with the session resumed. You answer, move on. |
+| You start the day staring at ten projects. Pick one based on gut feeling. | `orch plan` reads every project's stage, stall score, pending todos, and tells you the three that matter today. |
+| A project sits in "almost done" for three weeks because nothing reminds you. | Stall detection flags it. Launch debt score rises. The day planner keeps surfacing it until you ship or kill it. |
+| You want to knock out five small tasks but can only run one Claude at a time. | Press `g`. Orch dispatches them in parallel — three at once, each in its own worktree — and opens PRs when they're done. |
 
 ---
 
@@ -68,13 +71,13 @@ orch setup
 orch
 ```
 
-That's it. Orch auto-discovers any project in `~/Sites/` that has a `.claude/` directory. Run Claude Code in a project once and it appears automatically.
+That's it. Orch auto-discovers any project under `~/Sites/` with a `.git/` directory. No registration, no config files per project — just code.
 
 ---
 
 ## How It Works
 
-Orch operates through three core systems that work together:
+Everything runs on your machine. No cloud services, no CI dependency, no team infrastructure required. Orch operates through a few core systems that work together:
 
 ### Live status monitoring
 
@@ -481,5 +484,5 @@ A special thanks to our project sponsors:
 ---
 
 <p align="center">
-  <sub>Built for the Claude Code ecosystem</sub>
+  <sub>Built for people who ship, not people who manage people who ship.</sub>
 </p>

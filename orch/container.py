@@ -108,8 +108,14 @@ ORCH_POST_CREATE = (
     "printf 'set nocompatible\\nset backspace=indent,eol,start\\n' > ~/.vimrc"
     " && echo 'alias vim=vi' >> ~/.bashrc"
     " && echo 'export TERM=xterm-256color' >> ~/.bashrc"
-    f" && (command -v claude >/dev/null 2>&1 || npm install -g @anthropic-ai/claude-code@{CLAUDE_CODE_VERSION})"
+    " && (command -v claude >/dev/null 2>&1"
+    f" || sudo npm install -g @anthropic-ai/claude-code@{CLAUDE_CODE_VERSION}"
+    f" || npm install -g @anthropic-ai/claude-code@{CLAUDE_CODE_VERSION})"
 )
+
+# Unique marker to detect whether ORCH_POST_CREATE was already merged into
+# an existing postCreateCommand (avoids re-appending on every rebuild).
+_ORCH_POST_MARKER = "command -v claude"
 
 # Env vars that should never be passed into containers (blocklist).
 # Override via ``blocked_env`` in ~/.orch/config.toml [container] section.
@@ -788,7 +794,7 @@ def _prepare_devcontainer_config(project: "Project") -> Path:
         # Merge orch shell setup into postCreateCommand
         existing_post = config.get("postCreateCommand", "")
         if isinstance(existing_post, str):
-            if ORCH_POST_CREATE not in existing_post:
+            if _ORCH_POST_MARKER not in existing_post:
                 parts = [p for p in (existing_post, ORCH_POST_CREATE) if p]
                 config["postCreateCommand"] = " && ".join(parts)
         # If it's a list/object form, leave it alone — those are complex
