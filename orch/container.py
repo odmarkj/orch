@@ -210,17 +210,28 @@ SETTINGS_LOCAL = {
                     {
                         "type": "command",
                         "command": (
-                            "cat /dev/stdin"
-                            " | python3 -c \""
-                            "import sys,json;"
-                            "d=json.load(sys.stdin);"
-                            "t=d.get('transcript',[]);"
-                            "msgs=[m for m in t if m.get('role')=='assistant'];"
-                            "txt='';"
-                            "\nif msgs:"
-                            "\n parts=[p.get('text','') for p in msgs[-1].get('content',[]) if p.get('type')=='text'];"
-                            "\n txt=' '.join(parts).strip()[-300:];"
-                            "\nopen('.claude/waiting_for_input','w').write(txt or 'Waiting for input')"
+                            "python3 -c \""
+                            "import sys,json,os\n"
+                            "try:\n"
+                            "  d=json.load(sys.stdin)\n"
+                            "except Exception:\n"
+                            "  sys.exit(0)\n"
+                            "if d.get('stop_hook_active'):\n"
+                            "  sys.exit(0)\n"
+                            "# Only signal input needed for interactive sessions.\n"
+                            "# If an auto_dispatch or pending_task flag exists, Claude\n"
+                            "# was running an automated task — don't open iTerm.\n"
+                            "if os.path.exists('.claude/auto_dispatch') or os.path.exists('.claude/pending_task') or os.path.exists('.claude/active_todo'):\n"
+                            "  sys.exit(0)\n"
+                            "msg=d.get('last_assistant_message','')\n"
+                            "if not msg:\n"
+                            "  t=d.get('transcript',[])\n"
+                            "  msgs=[m for m in t if m.get('role')=='assistant']\n"
+                            "  if msgs:\n"
+                            "    parts=[p.get('text','') for p in msgs[-1].get('content',[]) if p.get('type')=='text']\n"
+                            "    msg=' '.join(parts).strip()\n"
+                            "txt=(msg or 'Waiting for input')[-300:]\n"
+                            "open('.claude/waiting_for_input','w').write(txt)\n"
                             "\""
                         ),
                         "timeout": 5,
@@ -235,11 +246,14 @@ SETTINGS_LOCAL = {
                     {
                         "type": "command",
                         "command": (
-                            "cat /dev/stdin"
-                            " | python3 -c \""
-                            "import sys,json; d=json.load(sys.stdin);"
+                            "python3 -c \""
+                            "import sys,json\n"
+                            "try:\n"
+                            "  d=json.load(sys.stdin)\n"
+                            "except Exception:\n"
+                            "  sys.exit(0)\n"
                             "open('.claude/waiting_for_input','w')"
-                            ".write(d.get('title','') + ': ' + d.get('message','Input needed'))"
+                            ".write(d.get('title','') + ': ' + d.get('message','Input needed'))\n"
                             "\""
                         ),
                         "timeout": 5,
