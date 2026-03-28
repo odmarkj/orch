@@ -160,6 +160,10 @@ DEFAULT_BLOCKED_ENV = [
     # Tool paths that reference host filesystem
     "BUN_INSTALL",
     "WRANGLER_HOME",
+    # Credentials that should not be baked into devcontainer config files.
+    # They are still available at runtime via orch's dynamic env passthrough.
+    "CLOUDFLARE_API_TOKEN",
+    "CLOUDFLARE_ACCOUNT_ID",
 ]
 
 # Terminal identity env vars to forward into docker exec so that CLI tools
