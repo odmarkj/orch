@@ -643,6 +643,8 @@ class OrchApp(App):
         self._debounce_timers: dict[str, threading.Timer] = {}
         self._debounce_lock = threading.Lock()
         self._debounce_delay: float = 0.3  # seconds
+        self._wfi_last_fired: dict[str, float] = {}  # per-project cooldown for waiting_for_input
+        self._wfi_cooldown: float = 3.0  # seconds — suppress duplicate iTerm opens
         # JSONL journal watcher state
         self._journal_debounce_timers: dict[str, threading.Timer] = {}
         self._journal_debounce_delay: float = 3.0  # seconds — wait for turn to settle
@@ -796,6 +798,19 @@ class OrchApp(App):
 
         # Immediate dispatch for high-priority files (input waiting, screenshots)
         if p.name in ("waiting_for_input", "_screenshot_copy_request"):
+            # Cooldown for waiting_for_input: Stop + Notification hooks both
+            # write this file, and watchdog may fire create+modify events for
+            # each write.  Without a guard, 3-4 rapid events each call
+            # exec_claude_in_iterm before the handle file is written, opening
+            # duplicate windows.
+            if p.name == "waiting_for_input" and p.exists():
+                proj_key = str(p.parent.parent)  # .claude -> project root
+                now = time.monotonic()
+                with self._debounce_lock:
+                    last = self._wfi_last_fired.get(proj_key, 0.0)
+                    if now - last < self._wfi_cooldown:
+                        return  # suppress duplicate
+                    self._wfi_last_fired[proj_key] = now
             self.call_from_thread(self._handle_file_change, path)
             return
 
@@ -834,6 +849,10 @@ class OrchApp(App):
 
         # ── waiting_for_input deleted: Claude resumed ─────────────────────────
         if changed.name == "waiting_for_input" and not changed.exists():
+            # Clear cooldown so next stop event can fire immediately
+            proj_key = str(changed.parent.parent)
+            with self._debounce_lock:
+                self._wfi_last_fired.pop(proj_key, None)
             project = self._project_for_path(changed)
             if project:
                 self.run_worker(
