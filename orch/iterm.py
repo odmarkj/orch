@@ -170,17 +170,21 @@ def open_input_tab(project: Project) -> None:
             set foundOrch to false
             repeat with w in windows
                 if not foundOrch then
-                    repeat with aTab in tabs of w
-                        if not foundOrch then
-                            repeat with aSession in sessions of aTab
-                                if profile name of aSession is "{profile}" then
-                                    set orchWindow to w
-                                    set foundOrch to true
-                                    exit repeat
-                                end if
-                            end repeat
-                        end if
-                    end repeat
+                    try
+                        repeat with aTab in tabs of w
+                            if not foundOrch then
+                                repeat with aSession in sessions of aTab
+                                    if profile name of aSession is "{profile}" then
+                                        set orchWindow to w
+                                        set foundOrch to true
+                                        exit repeat
+                                    end if
+                                end repeat
+                            end if
+                        end repeat
+                    on error
+                        -- Window/tab reference went stale; skip it
+                    end try
                 end if
             end repeat
             if orchWindow is missing value then

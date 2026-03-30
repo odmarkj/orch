@@ -218,7 +218,13 @@ SETTINGS_LOCAL = {
                             "python3 -c \""
                             "import sys,json,os\n"
                             "try:\n"
-                            "  d=json.load(sys.stdin)\n"
+                            "  raw=sys.stdin.buffer.read()\n"
+                            "except Exception:\n"
+                            "  sys.exit(0)\n"
+                            "if not raw:\n"
+                            "  sys.exit(0)\n"
+                            "try:\n"
+                            "  d=json.loads(raw)\n"
                             "except Exception:\n"
                             "  sys.exit(0)\n"
                             "if d.get('stop_hook_active'):\n"
@@ -236,6 +242,7 @@ SETTINGS_LOCAL = {
                             "    parts=[p.get('text','') for p in msgs[-1].get('content',[]) if p.get('type')=='text']\n"
                             "    msg=' '.join(parts).strip()\n"
                             "txt=(msg or 'Waiting for input')[-300:]\n"
+                            "os.makedirs('.claude',exist_ok=True)\n"
                             "open('.claude/waiting_for_input','w').write(txt)\n"
                             "\""
                         ),
@@ -252,11 +259,18 @@ SETTINGS_LOCAL = {
                         "type": "command",
                         "command": (
                             "python3 -c \""
-                            "import sys,json\n"
+                            "import sys,json,os\n"
                             "try:\n"
-                            "  d=json.load(sys.stdin)\n"
+                            "  raw=sys.stdin.buffer.read()\n"
                             "except Exception:\n"
                             "  sys.exit(0)\n"
+                            "if not raw:\n"
+                            "  sys.exit(0)\n"
+                            "try:\n"
+                            "  d=json.loads(raw)\n"
+                            "except Exception:\n"
+                            "  sys.exit(0)\n"
+                            "os.makedirs('.claude',exist_ok=True)\n"
                             "open('.claude/waiting_for_input','w')"
                             ".write(d.get('title','') + ': ' + d.get('message','Input needed'))\n"
                             "\""
@@ -1073,7 +1087,12 @@ def _setup_permissions(cid: str, project: "Project | None" = None) -> None:
     # Permissions: orch's allow list is authoritative
     merged["permissions"] = SETTINGS_LOCAL["permissions"]
 
-    # Hooks: merge per event type — prepend orch hooks, keep existing
+    # Hooks: merge per event type — prepend orch hooks, keep existing.
+    # To identify stale orch hooks from prior versions (whose command text
+    # may have changed), we match on signature substrings that appear in
+    # every version of an orch-managed hook.  Any existing hook containing
+    # one of these signatures is treated as an orch hook and replaced.
+    _ORCH_SIGNATURES = ("waiting_for_input", "screenshot-hook")
     orch_hooks = SETTINGS_LOCAL.get("hooks", {})
     existing_hooks = existing.get("hooks", {})
     merged_hooks: dict = {}
@@ -1081,17 +1100,11 @@ def _setup_permissions(cid: str, project: "Project | None" = None) -> None:
     for event in all_events:
         orch_list = orch_hooks.get(event, [])
         existing_list = existing_hooks.get(event, [])
-        # Deduplicate: skip existing entries whose command already appears
-        orch_cmds = {
-            h.get("command", "")
-            for group in orch_list
-            for h in group.get("hooks", [])
-        }
         deduped_existing = []
         for group in existing_list:
             filtered_hooks = [
                 h for h in group.get("hooks", [])
-                if h.get("command", "") not in orch_cmds
+                if not any(sig in h.get("command", "") for sig in _ORCH_SIGNATURES)
             ]
             if filtered_hooks:
                 deduped_existing.append({**group, "hooks": filtered_hooks})
@@ -1748,17 +1761,21 @@ def exec_claude_in_iterm(project: "Project", with_shell: bool = False) -> None:
             set foundOrch to false
             repeat with w in windows
                 if not foundOrch then
-                    repeat with aTab in tabs of w
-                        if not foundOrch then
-                            repeat with aSession in sessions of aTab
-                                if profile name of aSession is "{profile}" then
-                                    set orchWindow to w
-                                    set foundOrch to true
-                                    exit repeat
-                                end if
-                            end repeat
-                        end if
-                    end repeat
+                    try
+                        repeat with aTab in tabs of w
+                            if not foundOrch then
+                                repeat with aSession in sessions of aTab
+                                    if profile name of aSession is "{profile}" then
+                                        set orchWindow to w
+                                        set foundOrch to true
+                                        exit repeat
+                                    end if
+                                end repeat
+                            end if
+                        end repeat
+                    on error
+                        -- Window/tab reference went stale; skip it
+                    end try
                 end if
             end repeat
             if orchWindow is missing value then
@@ -1885,17 +1902,21 @@ def _build_single_tab_script(*, profile: str, dedicated: bool,
             set foundOrch to false
             repeat with w in windows
                 if not foundOrch then
-                    repeat with aTab in tabs of w
-                        if not foundOrch then
-                            repeat with aSession in sessions of aTab
-                                if profile name of aSession is "{profile}" then
-                                    set orchWindow to w
-                                    set foundOrch to true
-                                    exit repeat
-                                end if
-                            end repeat
-                        end if
-                    end repeat
+                    try
+                        repeat with aTab in tabs of w
+                            if not foundOrch then
+                                repeat with aSession in sessions of aTab
+                                    if profile name of aSession is "{profile}" then
+                                        set orchWindow to w
+                                        set foundOrch to true
+                                        exit repeat
+                                    end if
+                                end repeat
+                            end if
+                        end repeat
+                    on error
+                        -- Window/tab reference went stale; skip it
+                    end try
                 end if
             end repeat
             if orchWindow is missing value then
