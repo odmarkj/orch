@@ -13,6 +13,7 @@ Container IDs are tracked in .claude/container_id per project.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import platform
@@ -1154,6 +1155,13 @@ def _mark_onboarding_complete(cid: str, config_path: str) -> None:
 
 # ── Credential injection ────────────────────────────────────────────────────
 
+# Tracks the keychain fingerprint last injected into each container.
+# When the periodic refresh fires, we only overwrite the container's
+# .credentials.json if the keychain has CHANGED (i.e. the user re-authed
+# on the host).  This prevents clobbering tokens that the container's
+# Claude Code has self-refreshed via its own OAuth refresh_token flow.
+_last_injected_fingerprint: dict[str, str] = {}  # cid -> md5 hex
+
 
 def _extract_host_credentials() -> str | None:
     """Extract Claude OAuth credentials from the macOS Keychain.
@@ -1185,7 +1193,7 @@ def _extract_host_credentials() -> str | None:
     return cred
 
 
-def _inject_credentials(cid: str) -> None:
+def _inject_credentials(cid: str, *, force: bool = False) -> None:
     """Extract OAuth credentials from macOS Keychain and write them into the
     container as a plaintext credentials file.
 
@@ -1193,10 +1201,25 @@ def _inject_credentials(cid: str) -> None:
     fallback when the macOS Keychain is unavailable.  We extract the token
     from the host Keychain and write it directly to that path inside the
     container.
+
+    When *force* is False (the default for periodic refreshes), the write is
+    skipped if the keychain credentials haven't changed since the last
+    injection.  This prevents overwriting tokens that the container's Claude
+    Code has self-refreshed via its OAuth refresh_token.
+
+    Set *force=True* for initial injection (container startup) or when the
+    user explicitly requests a credential refresh.
     """
     cred_json = _extract_host_credentials()
     if not cred_json:
         return  # No credentials to inject (not macOS, or not logged in)
+
+    fingerprint = hashlib.md5(cred_json.encode()).hexdigest()
+
+    if not force and _last_injected_fingerprint.get(cid) == fingerprint:
+        # Keychain hasn't changed — don't overwrite container's
+        # potentially self-refreshed token.
+        return
 
     safe_cred = shlex.quote(cred_json)
     cred_path = f"{CONTAINER_HOME}/.claude/.credentials.json"
@@ -1205,6 +1228,7 @@ def _inject_credentials(cid: str) -> None:
          f"printf '%s' {safe_cred} > {cred_path} && chmod 600 {cred_path}"],
         capture_output=True, timeout=10,
     )
+    _last_injected_fingerprint[cid] = fingerprint
 
 
 # ── Plugin path compatibility ─────────────────────────────────────────────────
@@ -1219,6 +1243,37 @@ def _deploy_screenshot_hook(cid: str) -> None:
         ["docker", "exec", "-u", CONTAINER_USER, cid, "bash", "-c",
          f"mkdir -p {bin_dir} && printf '%s' '{escaped}' > {script_path} && "
          f"chmod +x {script_path}"],
+        capture_output=True,
+        timeout=10,
+    )
+
+
+_REAUTH_SCRIPT = """\
+#!/usr/bin/env bash
+# orch-reauth: Re-authenticate Claude Code inside a container.
+#
+# Run this from the container shell tab when Claude shows a login error.
+# It runs 'claude login' which will print a URL — open that in your browser
+# to complete the OAuth flow. The new token is saved automatically.
+
+set -e
+echo ""
+echo "Starting Claude Code login..."
+echo "A URL will appear below — open it in your browser to authenticate."
+echo ""
+claude login
+echo ""
+echo "Done! You can now resume your Claude session."
+"""
+
+
+def _deploy_reauth_helper(cid: str) -> None:
+    """Write the orch-reauth script into the container's PATH."""
+    script_path = "/usr/local/bin/orch-reauth"
+    escaped = _REAUTH_SCRIPT.replace("'", "'\\''")
+    subprocess.run(
+        ["docker", "exec", "-u", "root", cid, "bash", "-c",
+         f"printf '%s' '{escaped}' > {script_path} && chmod +x {script_path}"],
         capture_output=True,
         timeout=10,
     )
@@ -1451,10 +1506,13 @@ def ensure_running(project: "Project") -> str:
     _fix_ssh_socket_permissions(cid)
 
     # Inject host OAuth credentials so Claude doesn't prompt for login
-    _inject_credentials(cid)
+    _inject_credentials(cid, force=True)
 
     # Deploy the screenshot copy hook so dragged screenshots work in containers
     _deploy_screenshot_hook(cid)
+
+    # Deploy reauth helper so users can re-login from inside the container
+    _deploy_reauth_helper(cid)
 
     # Symlink host .claude path so plugin absolute paths resolve in container
     _symlink_host_claude_dir(cid)
@@ -1569,11 +1627,11 @@ def _container_workdir(cid: str, project: "Project | None" = None) -> str:
 def _ensure_credentials_injected(cid: str) -> None:
     """Re-inject credentials from the host Keychain into the container.
 
-    Always refreshes credentials so that updated OAuth tokens (e.g. after
-    a token refresh on the host) are picked up without restarting the
-    container.  This is called before each Claude session.
+    Uses force=True so that opening a new session always picks up any
+    host re-authentication.  This is called before each Claude session
+    (explicit user action), not from periodic background refresh.
     """
-    _inject_credentials(cid)
+    _inject_credentials(cid, force=True)
 
 
 def exec_cmd(project: "Project") -> str:

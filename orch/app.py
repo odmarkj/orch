@@ -619,6 +619,7 @@ class OrchApp(App):
         Binding("i", "ignore_project", "Ignore", show=True),
         Binding("g", "toggle_auto_dispatch", "Auto(g)", show=True),
         Binding("o", "edit_config", "Config", show=True),
+        Binding("A", "refresh_auth", "Auth", show=True),
         Binding("escape", "blur_input", "Cancel", show=False),
     ]
 
@@ -664,7 +665,7 @@ class OrchApp(App):
                 yield Markdown("", id="todos-view")
         yield Static(
             "[dim]j/k[/] navigate  [dim]Enter[/] select  [dim]t[/]ask  [dim]a[/]dd todo  [dim]e[/]xec  [dim]c[/]ontainer  [dim]x[/] shell(ctr)  [dim]dd[/] down  [dim]R[/]ebuild\n"
-            "[dim]l[/]ogs  [dim]p[/]lan  [dim]b[/]ridge  [dim]s[/]tage  [dim]i[/]gnore  [dim]g[/] auto  [dim]o[/] config  [dim]r[/]efresh  [dim]q[/]uit  [dim]Esc[/] cancel",
+            "[dim]l[/]ogs  [dim]p[/]lan  [dim]b[/]ridge  [dim]s[/]tage  [dim]i[/]gnore  [dim]g[/] auto  [dim]o[/] config  [dim]A[/]uth  [dim]r[/]efresh  [dim]q[/]uit  [dim]Esc[/] cancel",
             id="help-bar",
             markup=True,
         )
@@ -685,9 +686,11 @@ class OrchApp(App):
             self.query_one("#project-list", ListView).focus()
         # Check if we should start in mobile mode
         self._check_mobile(self.size.width)
-        # Refresh OAuth credentials in running containers every 30 minutes
-        # so tokens don't expire mid-session
-        self.set_interval(30 * 60, self._refresh_credentials)
+        # Check for host re-authentication every 10 minutes and push new
+        # credentials into running containers.  The injection is fingerprinted
+        # so it only writes when the keychain token actually changed, avoiding
+        # overwrite of tokens the container's Claude has self-refreshed.
+        self.set_interval(10 * 60, self._refresh_credentials)
 
     def _refresh_credentials(self) -> None:
         """Re-inject OAuth credentials from host Keychain into all running containers."""
@@ -1466,6 +1469,27 @@ class OrchApp(App):
         )
         _run_iterm_script(script)
         self.notify("Config opened in iTerm2")
+
+    def action_refresh_auth(self) -> None:
+        """Force-refresh OAuth credentials from host Keychain into all running containers."""
+        if self._input_focused:
+            return
+
+        def _do_refresh():
+            refreshed = 0
+            for p in self.projects:
+                cid = container_is_running(p)
+                if cid:
+                    _inject_credentials(cid, force=True)
+                    refreshed += 1
+            self.call_from_thread(
+                self.notify,
+                f"Auth refreshed in {refreshed} container(s)" if refreshed
+                else "No running containers to refresh",
+                severity="information" if refreshed else "warning",
+            )
+
+        self.run_worker(_do_refresh, thread=True)
 
     @on(Input.Submitted, "#task-input")
     def on_input_submitted(self, event: Input.Submitted) -> None:
