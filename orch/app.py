@@ -898,6 +898,13 @@ class OrchApp(App):
                 )
             return
 
+        # ── Bridge request: cross-project agent communication ─────────────────
+        if changed.name == "bridge_request" and changed.exists():
+            project = self._project_for_path(changed)
+            if project:
+                self._handle_bridge_request(project)
+            return
+
         # ── iterm handles: no action needed ───────────────────────────────────
         if changed.name in ("iterm_handle", "iterm_container_handle", "iterm_container_shell_handle", "iterm_log_handle"):
             return
@@ -1856,6 +1863,100 @@ class OrchApp(App):
 
         # Still try to dispatch remaining todos
         self._schedule_dispatch_check(project)
+
+    # ── Bridge handlers ────────────────────────────────────────────────────
+
+    def _handle_bridge_request(self, source_project: Project) -> None:
+        """Handle a bridge_request file created by an agent."""
+        from .bridge_comm import (
+            parse_bridge_request,
+            handle_bridge_request,
+            MAX_BRIDGE_DEPTH,
+            BridgeResponse,
+            _deliver_response,
+            _archive_request_file,
+        )
+
+        request = parse_bridge_request(source_project)
+        if not request:
+            self.notify(
+                f"Bridge: invalid request from {source_project.name}",
+                severity="warning",
+            )
+            return
+
+        # Depth limit
+        if request.depth > MAX_BRIDGE_DEPTH:
+            self.notify(
+                f"Bridge: {source_project.name} rejected (max depth exceeded)",
+                severity="warning",
+            )
+            resp = BridgeResponse(
+                id=request.id,
+                source=request.source_project,
+                target=request.target,
+                intent=request.intent,
+                summary=request.summary,
+                status="failed",
+                result="Max bridge depth exceeded.",
+            )
+            _deliver_response(request, resp)
+            _archive_request_file(request)
+            return
+
+        truncated = request.summary[:50] + ("…" if len(request.summary) > 50 else "")
+        self.notify(f"Bridge: {source_project.name} → {request.target}: {truncated}")
+
+        def _run(req=request):
+            try:
+                response = handle_bridge_request(req, self.projects)
+                self.call_from_thread(
+                    self._on_bridge_complete, source_project, req, response,
+                )
+            except Exception as e:
+                self.call_from_thread(
+                    self._on_bridge_failed, source_project, req, e,
+                )
+
+        self.run_worker(_run, thread=True)
+
+    def _on_bridge_complete(
+        self,
+        source: Project,
+        request,
+        response,
+    ) -> None:
+        status_icon = "✓" if response.status == "completed" else "✗"
+        truncated = request.summary[:40] + ("…" if len(request.summary) > 40 else "")
+        msg = f"Bridge {status_icon}: {truncated} → {response.status}"
+        if response.pr_url:
+            msg += f" PR: {response.pr_url}"
+        self.notify(msg)
+
+    def _on_bridge_failed(
+        self,
+        source: Project,
+        request,
+        error: Exception,
+    ) -> None:
+        from .bridge_comm import BridgeResponse, _deliver_response, _archive_request_file
+
+        self.notify(
+            f"Bridge failed: {request.summary[:40]} — {error}",
+            severity="error",
+        )
+        # Deliver a failed response so the source agent knows
+        resp = BridgeResponse(
+            id=request.id,
+            source=request.source_project,
+            target=request.target,
+            intent=request.intent,
+            summary=request.summary,
+            status="failed",
+            result=str(error),
+        )
+        _deliver_response(request, resp)
+        _archive_request_file(request)
 
     def _post_review_comment(self, pr_url: str, review: str) -> None:
         """Post a code review comment on the PR using gh CLI."""

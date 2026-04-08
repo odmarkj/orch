@@ -899,6 +899,14 @@ def _prepare_devcontainer_config(project: "Project") -> Path:
                     f"source={host},target={target},type=bind,readonly"
                 )
 
+        # Mount worktree root so dispatch/bridge tasks run inside container
+        worktree_root = str(project.path.parent / ".orch-worktrees")
+        if not any(_mount_target(m) == worktree_root for m in merged_mounts):
+            Path(worktree_root).mkdir(parents=True, exist_ok=True)
+            merged_mounts.append(
+                f"source={worktree_root},target={worktree_root},type=bind"
+            )
+
         config["mounts"] = merged_mounts
 
         # Merge orch shell setup into postCreateCommand
@@ -972,6 +980,13 @@ def _prepare_devcontainer_config(project: "Project") -> Path:
         config["mounts"].append(
             f"source={host},target={target},type=bind,readonly"
         )
+
+    # Mount worktree root so dispatch/bridge tasks run inside container
+    worktree_root = str(project.path.parent / ".orch-worktrees")
+    Path(worktree_root).mkdir(parents=True, exist_ok=True)
+    config["mounts"].append(
+        f"source={worktree_root},target={worktree_root},type=bind"
+    )
 
     dc_orch.write_text(json.dumps(config, indent=2) + "\n")
     return dc_orch
@@ -1094,6 +1109,11 @@ def _docker_run(project: "Project") -> str:
     # Mount host passthrough dirs at their original paths (read-only)
     for host, target in _host_passthrough_mounts():
         mount_args += ["-v", f"{host}:{target}:ro"]
+
+    # Mount worktree root so dispatch/bridge tasks run inside container
+    worktree_root = project.path.parent / ".orch-worktrees"
+    worktree_root.mkdir(parents=True, exist_ok=True)
+    mount_args += ["-v", f"{worktree_root}:{worktree_root}"]
 
     cmd = [
         "docker", "run", "-d",
@@ -2232,6 +2252,70 @@ def _slugify(text: str, max_len: int = 30) -> str:
     return slug[:max_len]
 
 
+def worktree_container_path(project: "Project", worktree_path: Path) -> str:
+    """Map a host worktree path to its container mount path.
+
+    We mount the worktree root at the same host path inside the container,
+    so the path is identical.
+    """
+    return str(worktree_path)
+
+
+def run_claude_in_container(
+    project: "Project",
+    prompt: str,
+    workdir: str | None = None,
+    timeout: int = 600,
+) -> subprocess.CompletedProcess:
+    """Run Claude inside the project's container with a prompt.
+
+    Ensures the container is running first.  Uses ``docker exec`` (blocking,
+    not detached) so the caller can capture output.  Used by both the
+    auto-dispatch pipeline and the bridge.
+    """
+    cid = ensure_running(project)
+    if workdir is None:
+        workdir = _container_workdir(cid, project)
+
+    safe_prompt = prompt.replace("'", "'\\''")
+
+    return subprocess.run(
+        [
+            "docker", "exec",
+            "-u", CONTAINER_USER,
+            "-w", workdir,
+            cid, "bash", "-c",
+            f"claude --dangerously-skip-permissions -p '{safe_prompt}'",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
+def _run_git_in_container(
+    project: "Project",
+    worktree_path: Path,
+    git_args: list[str],
+    timeout: int = 30,
+) -> subprocess.CompletedProcess:
+    """Run a git command inside the container at *worktree_path*."""
+    cid = ensure_running(project)
+    container_wt = worktree_container_path(project, worktree_path)
+    cmd_str = " ".join(shlex.quote(a) for a in ["git"] + git_args)
+    return subprocess.run(
+        [
+            "docker", "exec",
+            "-u", CONTAINER_USER,
+            "-w", container_wt,
+            cid, "bash", "-c", cmd_str,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+
+
 def _ensure_worktrees_gitignored(project: "Project") -> None:
     """Add .orch-worktrees to the parent directory's .gitignore if not already present."""
     gitignore = project.path / ".gitignore"
@@ -2252,9 +2336,14 @@ def _ensure_worktrees_gitignored(project: "Project") -> None:
         pass
 
 
-def create_worktree(project: "Project", todo_text: str) -> tuple[Path, str]:
-    """
-    Create a git worktree for the given todo.
+def create_worktree(
+    project: "Project", todo_text: str, *, branch_prefix: str = "auto",
+) -> tuple[Path, str]:
+    """Create a git worktree for the given task.
+
+    *branch_prefix* controls the branch namespace (``auto/`` for dispatch,
+    ``bridge/`` for bridge requests).
+
     Returns (worktree_path, branch_name).
     """
     import random as _rand
@@ -2263,7 +2352,7 @@ def create_worktree(project: "Project", todo_text: str) -> tuple[Path, str]:
 
     slug = _slugify(todo_text)
     suffix = _rand.randint(1000, 9999)
-    branch_name = f"auto/{slug}-{suffix}"
+    branch_name = f"{branch_prefix}/{slug}-{suffix}"
     worktree_dir = project.path.parent / f".orch-worktrees" / f"{project.name}-{slug}-{suffix}"
 
     worktree_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -2308,16 +2397,12 @@ def remove_worktree(project: "Project", worktree_path: Path, branch_name: str = 
 
 def _run_code_review(project: "Project", worktree_path: Path, branch_name: str) -> str:
     """
-    Run Claude code review on the worktree changes.
+    Run Claude code review on the worktree changes inside the container.
     Returns the review text.
     """
     # Get the diff of changes in the worktree
-    diff_result = subprocess.run(
-        ["git", "diff", "HEAD~1"],
-        capture_output=True,
-        text=True,
-        cwd=str(worktree_path),
-        timeout=30,
+    diff_result = _run_git_in_container(
+        project, worktree_path, ["diff", "HEAD~1"], timeout=30,
     )
     diff_text = diff_result.stdout.strip()
     if not diff_text:
@@ -2330,48 +2415,42 @@ def _run_code_review(project: "Project", worktree_path: Path, branch_name: str) 
         "If the changes look good, say so briefly.\n\n"
         f"```diff\n{diff_text[:8000]}\n```"
     )
-    safe_prompt = review_prompt.replace("'", "'\\''")
 
-    result = subprocess.run(
-        ["claude", "--dangerously-skip-permissions", "-p", safe_prompt],
-        capture_output=True,
-        text=True,
-        cwd=str(worktree_path),
-        timeout=120,
+    container_wt = worktree_container_path(project, worktree_path)
+    result = run_claude_in_container(
+        project, review_prompt, workdir=container_wt, timeout=120,
     )
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
-def _commit_and_push_worktree(worktree_path: Path, branch_name: str, todo_text: str) -> None:
-    """Stage all changes, commit, and push the worktree branch."""
+def _commit_and_push_worktree(
+    project: "Project", worktree_path: Path, branch_name: str, todo_text: str,
+) -> None:
+    """Stage all changes, commit, and push the worktree branch inside the container."""
     # Stage all changes
-    subprocess.run(
-        ["git", "add", "-A"],
-        capture_output=True, cwd=str(worktree_path), timeout=30,
-    )
+    _run_git_in_container(project, worktree_path, ["add", "-A"], timeout=30)
 
     # Check if there are changes to commit
-    status = subprocess.run(
-        ["git", "status", "--porcelain"],
-        capture_output=True, text=True, cwd=str(worktree_path), timeout=10,
+    status = _run_git_in_container(
+        project, worktree_path, ["status", "--porcelain"], timeout=10,
     )
     if not status.stdout.strip():
         return  # Nothing to commit
 
     # Commit
     safe_msg = todo_text[:72]
-    subprocess.run(
-        ["git", "commit", "-m", f"auto: {safe_msg}"],
-        capture_output=True, text=True, cwd=str(worktree_path), timeout=30,
+    _run_git_in_container(
+        project, worktree_path, ["commit", "-m", f"auto: {safe_msg}"], timeout=30,
     )
 
     # Push with retries (exponential backoff)
     import time
     delays = [2, 4, 8, 16]
     for attempt in range(5):
-        result = subprocess.run(
-            ["git", "push", "-u", "origin", branch_name],
-            capture_output=True, text=True, cwd=str(worktree_path), timeout=60,
+        result = _run_git_in_container(
+            project, worktree_path,
+            ["push", "-u", "origin", branch_name],
+            timeout=60,
         )
         if result.returncode == 0:
             return
@@ -2381,29 +2460,41 @@ def _commit_and_push_worktree(worktree_path: Path, branch_name: str, todo_text: 
     # Final attempt failed — not fatal, just log
 
 
-def _create_pr(worktree_path: Path, branch_name: str, todo_text: str, review_text: str = "") -> str | None:
-    """
-    Create a pull request for the worktree branch using gh CLI.
-    Returns the PR URL or None if gh is unavailable.
-    """
-    import shutil
-    if not shutil.which("gh"):
-        return None
+def _create_pr(
+    project: "Project",
+    worktree_path: Path,
+    branch_name: str,
+    todo_text: str,
+    review_text: str = "",
+    title_prefix: str = "auto",
+) -> str | None:
+    """Create a pull request for the worktree branch using gh inside the container.
 
+    Returns the PR URL or None on failure.
+    """
     body = f"## Auto-dispatched task\n\n{todo_text}\n"
     if review_text:
         body += f"\n## Code Review\n\n{review_text}\n"
 
-    safe_title = f"auto: {todo_text[:60]}"
+    safe_title = f"{title_prefix}: {todo_text[:60]}"
+    safe_body = body.replace("'", "'\\''")
+    safe_title_sh = safe_title.replace("'", "'\\''")
 
+    cid = ensure_running(project)
+    container_wt = worktree_container_path(project, worktree_path)
+    gh_cmd = (
+        f"gh pr create --title '{safe_title_sh}' "
+        f"--body '{safe_body}' --head '{branch_name}'"
+    )
     result = subprocess.run(
-        ["gh", "pr", "create",
-         "--title", safe_title,
-         "--body", body,
-         "--head", branch_name],
+        [
+            "docker", "exec",
+            "-u", CONTAINER_USER,
+            "-w", container_wt,
+            cid, "bash", "-c", gh_cmd,
+        ],
         capture_output=True,
         text=True,
-        cwd=str(worktree_path),
         timeout=30,
     )
     if result.returncode == 0:
@@ -2411,17 +2502,25 @@ def _create_pr(worktree_path: Path, branch_name: str, todo_text: str, review_tex
     return None
 
 
-def _run_tests(worktree_path: Path, test_cmd: str, timeout: int = 300) -> tuple[bool, str]:
-    """
-    Run the project's test command in the worktree.
+def _run_tests(
+    project: "Project", worktree_path: Path, test_cmd: str, timeout: int = 300,
+) -> tuple[bool, str]:
+    """Run the project's test command inside the container.
+
     Returns (passed, output) where output includes both stdout and stderr.
     """
+    cid = ensure_running(project)
+    container_wt = worktree_container_path(project, worktree_path)
+
     result = subprocess.run(
-        test_cmd,
-        shell=True,
+        [
+            "docker", "exec",
+            "-u", CONTAINER_USER,
+            "-w", container_wt,
+            cid, "bash", "-c", test_cmd,
+        ],
         capture_output=True,
         text=True,
-        cwd=str(worktree_path),
         timeout=timeout,
     )
     output = ""
@@ -2437,11 +2536,15 @@ def _run_tests(worktree_path: Path, test_cmd: str, timeout: int = 300) -> tuple[
 
 
 def run_task_in_worktree(project: "Project", todo_text: str) -> dict:
-    """
-    Full pipeline: worktree -> Claude task -> test-fix loop -> code review -> commit -> push -> PR.
-    Returns a dict with results: {branch, worktree, pr_url, review, test_attempts, tests_passed}.
+    """Full pipeline: worktree -> container Claude -> test-fix -> review -> commit -> push -> PR.
+
+    All Claude invocations, tests, and git operations run inside the
+    project's container via ``docker exec``.
+
+    Returns a dict: {branch, worktree, pr_url, review, test_attempts, tests_passed}.
     """
     worktree_path, branch_name = create_worktree(project, todo_text)
+    container_wt = worktree_container_path(project, worktree_path)
     results = {
         "branch": branch_name,
         "worktree": str(worktree_path),
@@ -2455,26 +2558,21 @@ def run_task_in_worktree(project: "Project", todo_text: str) -> dict:
     max_fix = project.max_fix_attempts if test_cmd else 0
 
     try:
+        # Ensure the container is up before any docker exec calls
+        ensure_running(project)
+
         # ── Initial Claude run ──────────────────────────────────────────
-        safe_task = todo_text.replace("'", "'\\''")
         task_prompt = (
-            f"Work on this task: {safe_task}\n\n"
+            f"Work on this task: {todo_text}\n\n"
             f"When done, make sure all changes are saved. Do not commit or push."
         )
-
-        subprocess.run(
-            ["claude", "--dangerously-skip-permissions", "-p", task_prompt],
-            capture_output=True,
-            text=True,
-            cwd=str(worktree_path),
-            timeout=600,
-        )
+        run_claude_in_container(project, task_prompt, workdir=container_wt, timeout=600)
 
         # ── Test-fix loop ───────────────────────────────────────────────
         if test_cmd:
             for attempt in range(1, max_fix + 2):  # attempt 1 = first test run
                 results["test_attempts"] = attempt
-                passed, test_output = _run_tests(worktree_path, test_cmd)
+                passed, test_output = _run_tests(project, worktree_path, test_cmd)
 
                 if passed:
                     results["tests_passed"] = True
@@ -2493,22 +2591,16 @@ def run_task_in_worktree(project: "Project", todo_text: str) -> dict:
                     f"Test command: {test_cmd}\n\n"
                     f"Test output:\n```\n{test_output}\n```"
                 )
-
-                subprocess.run(
-                    ["claude", "--dangerously-skip-permissions", "-p", fix_prompt],
-                    capture_output=True,
-                    text=True,
-                    cwd=str(worktree_path),
-                    timeout=600,
-                )
+                run_claude_in_container(project, fix_prompt, workdir=container_wt, timeout=600)
 
         # ── Code review (if enabled) ────────────────────────────────────
         if project.code_review_enabled:
             # First do a temporary commit so review can diff
-            subprocess.run(["git", "add", "-A"], capture_output=True, cwd=str(worktree_path), timeout=10)
-            subprocess.run(
-                ["git", "commit", "-m", f"wip: {todo_text[:50]}"],
-                capture_output=True, text=True, cwd=str(worktree_path), timeout=10,
+            _run_git_in_container(project, worktree_path, ["add", "-A"], timeout=10)
+            _run_git_in_container(
+                project, worktree_path,
+                ["commit", "-m", f"wip: {todo_text[:50]}"],
+                timeout=10,
             )
             review = _run_code_review(project, worktree_path, branch_name)
             results["review"] = review
@@ -2520,21 +2612,23 @@ def run_task_in_worktree(project: "Project", todo_text: str) -> dict:
                 review_file.write_text(review)
         else:
             # Just commit directly
-            _commit_and_push_worktree(worktree_path, branch_name, todo_text)
+            _commit_and_push_worktree(project, worktree_path, branch_name, todo_text)
 
         # Push (handles both cases — review already committed, or fresh commit)
         if project.code_review_enabled:
             # Amend commit with final message and push
-            subprocess.run(
-                ["git", "commit", "--amend", "-m", f"auto: {todo_text[:72]}"],
-                capture_output=True, text=True, cwd=str(worktree_path), timeout=10,
+            _run_git_in_container(
+                project, worktree_path,
+                ["commit", "--amend", "-m", f"auto: {todo_text[:72]}"],
+                timeout=10,
             )
             import time
             delays = [2, 4, 8, 16]
             for attempt in range(5):
-                result = subprocess.run(
-                    ["git", "push", "-u", "origin", branch_name, "--force-with-lease"],
-                    capture_output=True, text=True, cwd=str(worktree_path), timeout=60,
+                result = _run_git_in_container(
+                    project, worktree_path,
+                    ["push", "-u", "origin", branch_name, "--force-with-lease"],
+                    timeout=60,
                 )
                 if result.returncode == 0:
                     break
@@ -2542,7 +2636,9 @@ def run_task_in_worktree(project: "Project", todo_text: str) -> dict:
                     time.sleep(delays[attempt])
 
         # Create PR
-        pr_url = _create_pr(worktree_path, branch_name, todo_text, results.get("review", ""))
+        pr_url = _create_pr(
+            project, worktree_path, branch_name, todo_text, results.get("review", ""),
+        )
         results["pr_url"] = pr_url
 
     except Exception:
