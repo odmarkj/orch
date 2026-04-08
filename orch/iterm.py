@@ -9,6 +9,7 @@ Design contract:
     That's it. No tab management.
   - All behaviour is driven by ~/.orch/config.toml so nothing requires a
     code change to customise.
+  - Sessions run inside the Lima VM via limactl shell + tmux.
 """
 
 from __future__ import annotations
@@ -159,10 +160,9 @@ def open_input_tab(project: Project) -> None:
     dedicated     = cfg["iterm"].get("dedicated_window", True)
     window_title  = cfg["iterm"].get("window_title", "orch sessions")
     badge         = _iterm_badge_cmd(project_name)
-    claude_cmd    = _build_claude_cmd(project)
-    project_path  = str(project.path)
+    vm_cmd        = _build_vm_claude_cmd(project)
     shell_cmd     = _applescript_quote(
-        f"{badge} && cd {project_path} && {claude_cmd}"
+        f"{badge} && {vm_cmd}"
     )
 
     if dedicated:
@@ -348,8 +348,6 @@ def clear_stale_handle(project: Project) -> None:
     """
     handle_names = [
         "iterm_handle",
-        "iterm_container_handle",
-        "iterm_container_shell_handle",
         "iterm_log_handle",
     ]
     for name in handle_names:
@@ -381,18 +379,206 @@ def _run_iterm_script(script: str) -> str:
     return result.stdout.strip()
 
 
-def _build_claude_cmd(project: Project) -> str:
+def _build_vm_claude_cmd(project: Project) -> str:
+    """Build the command to run Claude inside the Lima VM via tmux.
+
+    Uses limactl shell to enter the VM, then attaches to or creates
+    a named tmux session. The claude process inside tmux runs in a
+    sandboxed mount namespace (project dir writable, rest read-only).
+    tmux itself runs unsandboxed so session listing works.
     """
-    Build the claude CLI invocation. Resumes the active session if
-    .claude/sessions.json exists and has an 'active' key.
-    """
+    import shlex
+    from .vm import VM_NAME, sandbox_cmd
+
+    project_dir = str(project.path)
+    tmux_name = f"orch-{project.name}"
+    claude_args = "--dangerously-skip-permissions"
+
+    # Resume active session if available
     sessions_file = project.claude_dir / "sessions.json"
     if sessions_file.exists():
         try:
             data = json.loads(sessions_file.read_text())
             session_id = data.get("active")
             if session_id:
-                return f"claude --resume {session_id}"
+                claude_args += f" --resume {session_id}"
         except (json.JSONDecodeError, KeyError):
             pass
-    return "claude"
+
+    # Sandbox wraps the claude command only — tmux runs normally.
+    # The scope name matches the tmux session so cleanup can stop it.
+    sandboxed_claude = sandbox_cmd(
+        f"cd {shlex.quote(project_dir)} && claude {claude_args}",
+        writable_dirs=[project_dir],
+        scope=tmux_name,
+    )
+
+    # Attach to existing session, or create new one running sandboxed claude
+    inner = (
+        f"export TERM=xterm-256color; "
+        f"tmux attach-session -t {shlex.quote(tmux_name)} 2>/dev/null || "
+        f"tmux new-session -s {shlex.quote(tmux_name)} "
+        f"-c {shlex.quote(project_dir)} "
+        f"{shlex.quote(sandboxed_claude)}"
+    )
+    return f"limactl shell {VM_NAME} -- bash -lc {shlex.quote(inner)}"
+
+
+def open_vm_session(project: Project, with_shell: bool = False) -> None:
+    """Open a NEW iTerm2 window with Claude running in the VM.
+
+    Every invocation creates a fresh window — pressing the key multiple
+    times gives independent sessions (same as old container behavior).
+    Claude runs inside a sandboxed mount namespace (project dir writable,
+    rest of ~/Apps read-only). The shell tab is unsandboxed.
+    """
+    import shlex
+    from .vm import VM_NAME, sandbox_cmd
+    from .agent import session_exists, fire_first_session_hook
+
+    # Fire on_first_session hook if no existing session
+    if not session_exists(project):
+        fire_first_session_hook(project)
+
+    # Clear stale status from previous sessions
+    try:
+        project.status_file.write_text("Starting session")
+    except OSError:
+        pass
+
+    cfg = _load_config()
+    profile = cfg["iterm"].get("profile", "orch")
+    project_dir = str(project.path)
+
+    tab_name = f"{project.name}"
+    badge = _iterm_badge_cmd(project.name)
+    claude_args = "--dangerously-skip-permissions"
+
+    # Resume session if available
+    sessions_file = project.claude_dir / "sessions.json"
+    if sessions_file.exists():
+        try:
+            data = json.loads(sessions_file.read_text())
+            session_id = data.get("active")
+            if session_id:
+                claude_args += f" --resume {session_id}"
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+    # Sandbox wraps claude only — tmux runs normally for session detection.
+    # The scope name matches the tmux session so cleanup can stop it.
+    tmux_name = f"orch-{project.name}"
+    sandboxed_claude = sandbox_cmd(
+        f"cd {shlex.quote(project_dir)} && claude {claude_args}",
+        writable_dirs=[project_dir],
+        scope=tmux_name,
+    )
+    inner_cmd = (
+        f"export TERM=xterm-256color COLORTERM=truecolor; "
+        f"tmux kill-session -t {shlex.quote(tmux_name)} 2>/dev/null; "
+        f"tmux new-session -s {shlex.quote(tmux_name)} "
+        f"-c {shlex.quote(project_dir)} "
+        f"{shlex.quote(sandboxed_claude)}"
+    )
+    vm_cmd = f"limactl shell {VM_NAME} -- bash -lc {shlex.quote(inner_cmd)}"
+    claude_cmd = _applescript_quote(f"{badge} && {vm_cmd}")
+
+    if with_shell:
+        shell_tab_name = f"{project.name} (shell)"
+        shell_inner = f"cd {shlex.quote(project_dir)} && bash"
+        shell_vm_cmd = f"limactl shell {VM_NAME} -- bash -lc {shlex.quote(shell_inner)}"
+        shell_cmd = _applescript_quote(f"{badge} && {shell_vm_cmd}")
+
+        script = f"""
+        tell application "iTerm2"
+            try
+                set newWindow to (create window with profile "{profile}")
+            on error
+                set newWindow to (create window with default profile)
+            end try
+            tell newWindow
+                tell current session
+                    set name to "{tab_name}"
+                    set badge to "{project.name}"
+                    write text {claude_cmd}
+                    set claudeTty to tty
+                end tell
+                try
+                    create tab with profile "{profile}"
+                on error
+                    create tab with default profile
+                end try
+                tell current session
+                    set name to "{shell_tab_name}"
+                    set badge to "{project.name}"
+                    write text {shell_cmd}
+                end tell
+                repeat with aTab in tabs
+                    try
+                        repeat with aSession in sessions of aTab
+                            try
+                                if tty of aSession is claudeTty then
+                                    select aTab
+                                    exit repeat
+                                end if
+                            on error
+                            end try
+                        end repeat
+                    on error
+                    end try
+                end repeat
+            end tell
+        end tell
+        """
+    else:
+        script = f"""
+        tell application "iTerm2"
+            try
+                set newWindow to (create window with profile "{profile}")
+            on error
+                set newWindow to (create window with default profile)
+            end try
+            tell newWindow
+                tell current session
+                    set name to "{tab_name}"
+                    set badge to "{project.name}"
+                    write text {claude_cmd}
+                end tell
+            end tell
+        end tell
+        """
+
+    _run_iterm_script(script)
+
+
+def open_vm_shell(project: Project) -> None:
+    """Open a shell inside the VM at the project directory."""
+    import shlex
+    from .vm import VM_NAME
+
+    cfg = _load_config()
+    profile = cfg["iterm"].get("profile", "orch")
+    project_dir = shlex.quote(str(project.path))
+    badge = _iterm_badge_cmd(project.name)
+
+    inner = f"cd {project_dir} && bash"
+    vm_cmd = f"limactl shell {VM_NAME} -- bash -lc {shlex.quote(inner)}"
+    shell_cmd = _applescript_quote(f"{badge} && {vm_cmd}")
+
+    script = f"""
+    tell application "iTerm2"
+        try
+            set newWindow to (create window with profile "{profile}")
+        on error
+            set newWindow to (create window with default profile)
+        end try
+        tell newWindow
+            tell current session
+                set name to "{project.name} (shell)"
+                set badge to "{project.name}"
+                write text {shell_cmd}
+            end tell
+        end tell
+    end tell
+    """
+    _run_iterm_script(script)

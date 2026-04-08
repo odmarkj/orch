@@ -91,21 +91,9 @@ class Project:
             return ""
 
     @property
-    def container_id_file(self) -> Path:
-        return self.claude_dir / "container_id"
-
-    @property
-    def container_id(self) -> str | None:
-        try:
-            cid = self.container_id_file.read_text().strip()
-            return cid or None
-        except FileNotFoundError:
-            return None
-
-    @property
-    def has_devcontainer(self) -> bool:
-        dc_dir = self.path / ".devcontainer"
-        return (dc_dir / "devcontainer.json").is_file() or (dc_dir / "orch" / "devcontainer.json").is_file()
+    def tmux_session(self) -> str:
+        """Canonical tmux session name for this project inside the VM."""
+        return f"orch-{self.name}"
 
     # ── Auto-dispatch properties ─────────────────────────────────────────────
 
@@ -165,20 +153,16 @@ class Project:
 
     @property
     def jsonl_dirs(self) -> list[Path]:
-        """Return possible ~/.claude/projects/ dirs containing JSONL session files.
+        """Return ~/.claude/projects/ dirs containing JSONL session files.
 
-        Container projects use /workspaces/{name} encoding, host projects use
-        the full encoded path.  Returns both so the watcher covers either case.
+        With Lima VM, paths are identical to host paths, so we only need
+        the host-style encoding.
         """
         base = Path.home() / ".claude" / "projects"
-        # Container path: /workspaces/{name} → -workspaces-{name}
-        container_dir = base / f"-workspaces-{self.name}"
-        # Host path: /Users/joe/Apps/proj → -Users-joe-Apps-proj
         host_dir = base / str(self.path).replace("/", "-").lstrip("-")
         dirs = []
-        for d in (container_dir, host_dir):
-            if d.is_dir():
-                dirs.append(d)
+        if host_dir.is_dir():
+            dirs.append(host_dir)
         return dirs
 
     @property
@@ -253,6 +237,35 @@ class Project:
             except ValueError:
                 pass
         return 3
+
+    # ── Session lifecycle hooks ────────────────────────────────────────────
+
+    @property
+    def on_first_session_hook(self) -> str | None:
+        """Command to run when the first session starts."""
+        return self._read_orch_config_section_str("hooks", "on_first_session")
+
+    @property
+    def on_last_session_hook(self) -> str | None:
+        """Command to run when the last session ends."""
+        return self._read_orch_config_section_str("hooks", "on_last_session")
+
+    def _read_orch_config_section_str(self, section: str, key: str) -> str | None:
+        """Read a key from a specific [section] in .orch/project.toml."""
+        try:
+            in_section = False
+            for line in self.orch_config_file.read_text().splitlines():
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                if stripped.startswith("[") and stripped.endswith("]"):
+                    in_section = stripped[1:-1].strip() == section
+                    continue
+                if in_section and stripped.startswith(key) and "=" in stripped:
+                    return stripped.split("=", 1)[1].strip().strip('"').strip("'")
+        except FileNotFoundError:
+            pass
+        return None
 
     def _read_orch_config_str(self, key: str) -> str | None:
         try:

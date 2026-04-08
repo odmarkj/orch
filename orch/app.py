@@ -30,11 +30,8 @@ from watchdog.events import FileSystemEventHandler
 from .models import Project
 from .discovery import discover_projects
 from .iterm import notify_input_needed, notify_resumed, clear_stale_handle
-from .container import (
-    clear_stale_container, is_running as container_is_running,
-    ensure_running, exec_claude_in_iterm, stop as container_stop,
-    _inject_credentials,
-)
+from .vm import vm_ensure_running
+from .agent import session_exists, kill_session
 
 
 # ── Status dot colours ───────────────────────────────────────────────────────
@@ -80,8 +77,8 @@ SPINNER_WORDS = [
     "Incubating",
 ]
 
-CONTAINER_ICON = "[bold blue]■[/]"
-CONTAINER_ICON_OFF = "[dim]□[/]"
+SESSION_ICON = "[bold blue]■[/]"
+SESSION_ICON_OFF = "[dim]□[/]"
 
 
 class StatusFileHandler(FileSystemEventHandler):
@@ -159,12 +156,12 @@ class ProjectItem(ListItem):
     def _build_label(self) -> str:
         indicator = INDICATOR.get(self.project.status_indicator, INDICATOR["idle"])
         app = self.app
-        is_running = app._cached_container_is_running(self.project) if isinstance(app, OrchApp) else container_is_running(self.project)
-        cbox = CONTAINER_ICON if is_running else CONTAINER_ICON_OFF
+        has_session = app._has_session_cached(self.project) if isinstance(app, OrchApp) else False
+        sbox = SESSION_ICON if has_session else SESSION_ICON_OFF
         auto = "[bold magenta]⚡[/]" if self.project.auto_dispatch_enabled else ""
         count = self.project.pending_count
         badge = f" [dim]{count}t[/]" if count else ""
-        return f"{indicator}{cbox}{auto} {self.project.name}{badge}"
+        return f"{indicator}{sbox}{auto} {self.project.name}{badge}"
 
     def refresh_label(self) -> None:
         self.query_one(Label).update(self._build_label())
@@ -239,20 +236,23 @@ class StatusPane(Static):
             self.update("[dim]No project selected[/]")
             return
 
+        # Status from .claude/status (written by JSONL journal handler or Claude)
         status = project.current_status
-        status_line = (
-            f"[bold]{status}[/]"
-            if status
-            else "[dim italic]No status yet — Claude hasn't written to .claude/status[/]"
-        )
-
-        # Container status (use cached check to avoid spawning docker inspect)
-        app = self.app
-        cid = app._cached_container_is_running(project) if isinstance(app, OrchApp) else container_is_running(project)
-        if cid:
-            container_line = f"\n[bold blue]■[/] Container running ({cid[:12]})"
+        indicator = project.status_indicator
+        if status:
+            color = {"active": "green", "waiting": "yellow"}.get(indicator, "dim")
+            dot = {"active": "●", "waiting": "●"}.get(indicator, "○")
+            status_line = f"[bold {color}]{dot} {status}[/]"
         else:
-            container_line = "\n[dim]□ No container[/]"
+            status_line = "[dim]○ No status yet[/]"
+
+        # Session existence from cache
+        app = self.app
+        has_session = app._has_session_cached(project) if isinstance(app, OrchApp) else False
+        if has_session:
+            session_line = f"\n[bold blue]■[/] {project.tmux_session}"
+        else:
+            session_line = "\n[dim]□ No session — press [bold]c[/dim] to start[/]"
 
         # Pull first non-blank line of CLAUDE.md as the project abstract
         abstract = ""
@@ -263,19 +263,13 @@ class StatusPane(Static):
                 abstract = line
                 break
 
-        abstract_line = (
-            f"\n[dim]{abstract}[/]"
-            if abstract
-            else ""
-        )
-
+        abstract_line = f"\n[dim]{abstract}[/]" if abstract else ""
         path_line = f"\n\n[dim]{project.path}[/]"
-
         error_line = ""
         if self._error:
-            error_line = f"\n\n[bold red]Container error:[/]\n[red]{self._error}[/]"
+            error_line = f"\n\n[bold red]Error:[/]\n[red]{self._error}[/]"
 
-        self.update(f"{status_line}{container_line}{abstract_line}{path_line}{error_line}")
+        self.update(f"{status_line}{session_line}{abstract_line}{path_line}{error_line}")
 
 
 # ── Mobile tab bar ────────────────────────────────────────────────────────────
@@ -610,10 +604,9 @@ class OrchApp(App):
         Binding("t", "focus_input_task", "Task", show=True),
         Binding("a", "focus_input_todo", "Add Todo", show=True),
         Binding("e", "exec_shell", "Shell", show=True),
-        Binding("c", "container_up", "Container", show=True),
-        Binding("x", "container_shell", "Shell(ctr)", show=True),
-        Binding("d", "container_down_press", "Down(dd)", show=True),
-        Binding("R", "container_rebuild", "Rebuild", show=True),
+        Binding("c", "session_start", "Claude", show=True),
+        Binding("x", "vm_shell", "VM Shell", show=True),
+        Binding("d", "session_stop_press", "Stop(dd)", show=True),
         Binding("l", "open_logs", "Logs", show=True),
         Binding("p", "open_plan", "Plan", show=True),
         Binding("b", "toggle_bridge", "Bridge", show=True),
@@ -621,7 +614,6 @@ class OrchApp(App):
         Binding("i", "ignore_project", "Ignore", show=True),
         Binding("g", "toggle_auto_dispatch", "Auto(g)", show=True),
         Binding("o", "edit_config", "Config", show=True),
-        Binding("A", "refresh_auth", "Auth", show=True),
         Binding("escape", "blur_input", "Cancel", show=False),
     ]
 
@@ -638,9 +630,6 @@ class OrchApp(App):
         self._mobile: bool = False
         self._active_tab: int = 0  # 0=projects, 1=status, 2=todos
         self._dispatch_timers: dict[str, Timer] = {}  # project path -> pending dispatch timer
-        # Container status cache: path -> (timestamp, container_id | None)
-        self._container_cache: dict[str, tuple[float, str | None]] = {}
-        self._container_cache_ttl: float = 10.0  # seconds
         # Debounce: coalesce rapid file-change events per project
         self._debounce_timers: dict[str, threading.Timer] = {}
         self._debounce_lock = threading.Lock()
@@ -649,8 +638,10 @@ class OrchApp(App):
         self._wfi_cooldown: float = 3.0  # seconds — suppress duplicate iTerm opens
         # JSONL journal watcher state
         self._journal_debounce_timers: dict[str, threading.Timer] = {}
-        self._journal_debounce_delay: float = 3.0  # seconds — wait for turn to settle
+        self._journal_debounce_delay: float = 0.5  # seconds — short debounce for live status
         self._jsonl_dir_to_project: dict[str, Project] = {}
+        # Session existence cache: project name -> bool (refreshed periodically)
+        self._session_cache: dict[str, bool] = {}
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -668,8 +659,8 @@ class OrchApp(App):
                 yield Static("todos", id="right-title")
                 yield Markdown("", id="todos-view")
         yield Static(
-            "[dim]j/k[/] navigate  [dim]Enter[/] select  [dim]t[/]ask  [dim]a[/]dd todo  [dim]e[/]xec  [dim]c[/]ontainer  [dim]x[/] shell(ctr)  [dim]dd[/] down  [dim]R[/]ebuild\n"
-            "[dim]l[/]ogs  [dim]p[/]lan  [dim]b[/]ridge  [dim]s[/]tage  [dim]i[/]gnore  [dim]g[/] auto  [dim]o[/] config  [dim]A[/]uth  [dim]r[/]efresh  [dim]q[/]uit  [dim]Esc[/] cancel",
+            "[dim]j/k[/] navigate  [dim]Enter[/] select  [dim]t[/]ask  [dim]a[/]dd todo  [dim]e[/]xec  [dim]c[/]laude  [dim]x[/] vm shell  [dim]dd[/] stop\n"
+            "[dim]l[/]ogs  [dim]p[/]lan  [dim]b[/]ridge  [dim]s[/]tage  [dim]i[/]gnore  [dim]g[/] auto  [dim]o[/] config  [dim]r[/]efresh  [dim]q[/]uit  [dim]Esc[/] cancel",
             id="help-bar",
             markup=True,
         )
@@ -680,30 +671,84 @@ class OrchApp(App):
         self._start_watcher()
         # Clear any stale handles left from a previous orch session
         self.run_worker(
-            lambda: [
-                (clear_stale_handle(p), clear_stale_container(p))
-                for p in self.projects
-            ],
+            lambda: [clear_stale_handle(p) for p in self.projects],
             thread=True,
         )
         if self.projects:
             self.query_one("#project-list", ListView).focus()
         # Check if we should start in mobile mode
         self._check_mobile(self.size.width)
-        # Check for host re-authentication every 10 minutes and push new
-        # credentials into running containers.  The injection is fingerprinted
-        # so it only writes when the keychain token actually changed, avoiding
-        # overwrite of tokens the container's Claude has self-refreshed.
-        self.set_interval(10 * 60, self._refresh_credentials)
+        # Refresh session state periodically (every 5 seconds)
+        self.set_interval(5.0, self._refresh_session_cache)
+        # Initial session cache population
+        self.run_worker(self._do_refresh_session_cache, thread=True)
 
-    def _refresh_credentials(self) -> None:
-        """Re-inject OAuth credentials from host Keychain into all running containers."""
-        def _do_refresh():
-            for p in self.projects:
-                cid = container_is_running(p)
-                if cid:
-                    _inject_credentials(cid)
-        self.run_worker(_do_refresh, thread=True)
+    def _refresh_session_cache(self) -> None:
+        """Trigger a background refresh of session state via tmux capture."""
+        self.run_worker(self._do_refresh_session_cache, thread=True)
+
+    def _do_refresh_session_cache(self) -> None:
+        """Query tmux sessions in the VM and update the cache.
+
+        Detached sessions (iTerm window closed) are auto-killed since
+        they're always stale in our model — the user closed the window.
+        Also fires session lifecycle hooks on transitions.
+        """
+        from .agent import list_sessions, kill_session, fire_first_session_hook, fire_last_session_hook, _kill_session_tree
+        from .vm import vm_is_running, vm_exec
+
+        if not vm_is_running():
+            if self._session_cache:
+                # Fire hooks for any sessions that were active
+                for p in self.projects:
+                    if self._session_cache.get(p.name, False):
+                        fire_last_session_hook(p)
+                self._session_cache.clear()
+                self.call_from_thread(self._refresh_all_labels)
+            return
+
+        try:
+            active = list_sessions()
+        except Exception:
+            return  # VM unreachable, keep stale cache
+
+        # Kill detached sessions — they're stale (iTerm window was closed).
+        # Use _kill_session_tree to also kill the sandboxed process tree,
+        # since signals don't propagate through sudo/unshare/su.
+        for s in active:
+            if not s["attached"]:
+                _kill_session_tree(s["name"])
+
+        # Only count attached sessions as active
+        active_names = {s["project"] for s in active if s["attached"]}
+
+        changed = False
+        for p in self.projects:
+            was = self._session_cache.get(p.name, False)
+            now = p.name in active_names
+            if was != now:
+                changed = True
+                # Fire lifecycle hooks on transitions
+                if now and not was:
+                    fire_first_session_hook(p)
+                elif was and not now:
+                    fire_last_session_hook(p)
+            self._session_cache[p.name] = now
+
+        if changed:
+            self.call_from_thread(self._refresh_all_labels)
+
+    def _has_session_cached(self, project) -> bool:
+        """Check if a session exists (from cache)."""
+        return self._session_cache.get(project.name, False)
+
+    def _refresh_all_labels(self) -> None:
+        """Refresh all project list labels and panes."""
+        lv = self.query_one("#project-list", ListView)
+        for item in lv.query(ProjectItem):
+            item.refresh_label()
+        if self.selected_project:
+            self._refresh_panes()
 
     # ── Mobile / tabbed layout ───────────────────────────────────────────────
 
@@ -809,13 +854,11 @@ class OrchApp(App):
             except ValueError:
                 pass
 
-        # Immediate dispatch for high-priority files (input waiting, screenshots)
-        if p.name in ("waiting_for_input", "_screenshot_copy_request"):
-            # Cooldown for waiting_for_input: Stop + Notification hooks both
-            # write this file, and watchdog may fire create+modify events for
-            # each write.  Without a guard, 3-4 rapid events each call
-            # exec_claude_in_iterm before the handle file is written, opening
-            # duplicate windows.
+        # Immediate dispatch for high-priority files (input waiting)
+        if p.name == "waiting_for_input":
+            # Cooldown: Stop + Notification hooks both write this file, and
+            # watchdog may fire create+modify events for each write.  Without
+            # a guard, rapid events can open duplicate iTerm windows.
             if p.name == "waiting_for_input" and p.exists():
                 proj_key = str(p.parent.parent)  # .claude -> project root
                 now = time.monotonic()
@@ -875,29 +918,6 @@ class OrchApp(App):
                     self._refresh_panes()
             return
 
-        # ── container_id changed: container started/stopped ───────────────────
-        if changed.name == "container_id":
-            project = self._project_for_path(changed)
-            if project:
-                self._invalidate_container_cache(project)
-            self._refresh_project_item_for_path(changed)
-            if self.selected_project and changed.is_relative_to(self.selected_project.path):
-                self._refresh_panes()
-            # Container just started — check if there are pending todos to dispatch
-            if project and changed.exists():
-                self._schedule_dispatch_check(project)
-            return
-
-        # ── Screenshot copy request: host copies file into container ─────────
-        if changed.name == "_screenshot_copy_request" and changed.exists():
-            project = self._project_for_path(changed)
-            if project:
-                self.run_worker(
-                    lambda p=project, f=changed: self._handle_screenshot_copy(p, f),
-                    thread=True,
-                )
-            return
-
         # ── Bridge request: cross-project agent communication ─────────────────
         if changed.name == "bridge_request" and changed.exists():
             project = self._project_for_path(changed)
@@ -906,14 +926,11 @@ class OrchApp(App):
             return
 
         # ── iterm handles: no action needed ───────────────────────────────────
-        if changed.name in ("iterm_handle", "iterm_container_handle", "iterm_container_shell_handle", "iterm_log_handle"):
+        if changed.name in ("iterm_handle", "iterm_log_handle"):
             return
 
-        # ── Auto-dispatch / status files: skip refresh loop ───────────────────
-        # "status" is written by _write_status which already refreshes the UI;
-        # letting it re-enter here causes a feedback loop (JSONL → status write
-        # → file change → dispatch check → more timers).
-        if changed.name in ("active_todo", "auto_dispatch", "status"):
+        # ── Auto-dispatch internal files: skip refresh ───────────────────────
+        if changed.name in ("active_todo", "auto_dispatch"):
             return
 
         # ── General file change: status, todos, etc. ──────────────────────────
@@ -921,8 +938,8 @@ class OrchApp(App):
         if self.selected_project and changed.is_relative_to(self.selected_project.path):
             self._refresh_panes()
 
-        # ── Auto-dispatch check on status or TODOS.md changes ─────────────────
-        if changed.name in ("status", "TODOS.md"):
+        # ── Auto-dispatch check on TODOS.md changes ──────────────────────────
+        if changed.name == "TODOS.md":
             project = self._project_for_path(changed)
             if project:
                 self._schedule_dispatch_check(project)
@@ -1062,7 +1079,10 @@ class OrchApp(App):
     }
 
     def _derive_status(self, last_entry: dict, last_tool: str | None) -> str:
-        """Derive a human-readable status string from the latest journal entry."""
+        """Derive a human-readable status string from the latest journal entry.
+
+        Includes the target of the action when available (file path, command).
+        """
         etype = last_entry.get("type")
         subtype = last_entry.get("subtype", "")
 
@@ -1078,11 +1098,15 @@ class OrchApp(App):
         if etype == "assistant":
             content = last_entry.get("message", {}).get("content", [])
             if isinstance(content, list):
-                # Check for tool_use in this entry
+                # Check for tool_use — extract the target
                 for c in content:
                     if isinstance(c, dict) and c.get("type") == "tool_use":
                         tool = c.get("name", "")
-                        return self._TOOL_LABELS.get(tool, f"Using {tool}")
+                        target = self._extract_tool_target(tool, c.get("input", {}))
+                        label = self._TOOL_LABELS.get(tool, f"Using {tool}")
+                        if target:
+                            return f"{label}: {target}"
+                        return label
                 # Check for thinking
                 for c in content:
                     if isinstance(c, dict) and c.get("type") == "thinking":
@@ -1090,11 +1114,41 @@ class OrchApp(App):
                 # Text-only assistant message
                 return "Responding"
 
-            # If we have a recent tool from a prior assistant entry
             if last_tool:
                 return self._TOOL_LABELS.get(last_tool, f"Using {last_tool}")
 
             return "Working"
+
+        return ""
+
+    @staticmethod
+    def _extract_tool_target(tool: str, input_data: dict) -> str:
+        """Extract a short target description from a tool_use input."""
+        if not isinstance(input_data, dict):
+            return ""
+
+        if tool in ("Read", "Edit", "Write"):
+            path = input_data.get("file_path", "")
+            if path:
+                # Show just the filename, or last 2 path components
+                parts = path.rsplit("/", 2)
+                return "/".join(parts[-2:]) if len(parts) > 2 else path
+
+        if tool == "Bash":
+            cmd = input_data.get("command", "")
+            if cmd:
+                # First 60 chars of the command
+                return cmd[:60] + ("…" if len(cmd) > 60 else "")
+
+        if tool in ("Grep", "Glob"):
+            pattern = input_data.get("pattern", "")
+            if pattern:
+                return f"'{pattern}'"
+
+        if tool == "Agent":
+            desc = input_data.get("description", "")
+            if desc:
+                return desc[:50]
 
         return ""
 
@@ -1124,65 +1178,6 @@ class OrchApp(App):
                 pass
         return None
 
-    def _handle_screenshot_copy(self, project: "Project", request_file: Path) -> None:
-        """Copy screenshot files from host into the container via docker cp.
-
-        Called when the in-container UserPromptSubmit hook writes a request
-        file listing macOS screenshot temp paths it needs copied in.
-        """
-        import subprocess as _sp
-
-        cid = project.container_id
-        if not cid:
-            return
-
-        try:
-            paths = request_file.read_text().strip().splitlines()
-        except OSError:
-            return
-
-        for host_path in paths:
-            host_path = host_path.strip()
-            if not host_path:
-                continue
-            # Create target directory inside the container
-            target_dir = str(Path(host_path).parent)
-            _sp.run(
-                ["docker", "exec", "-u", "root", cid,
-                 "mkdir", "-p", target_dir],
-                capture_output=True, timeout=5,
-            )
-            # Copy from host (user has SIP access) into container
-            _sp.run(
-                ["docker", "cp", host_path, f"{cid}:{host_path}"],
-                capture_output=True, timeout=10,
-            )
-            # Fix ownership so vscode user can read it
-            _sp.run(
-                ["docker", "exec", "-u", "root", cid,
-                 "chown", "vscode:vscode", host_path],
-                capture_output=True, timeout=5,
-            )
-
-        # Signal completion
-        done_file = request_file.parent / "_screenshot_copy_done"
-        done_file.write_text("done")
-
-    def _cached_container_is_running(self, project: "Project") -> str | None:
-        """Return cached container status, refreshing if stale (> TTL seconds)."""
-        key = str(project.path)
-        now = time.monotonic()
-        cached = self._container_cache.get(key)
-        if cached and (now - cached[0]) < self._container_cache_ttl:
-            return cached[1]
-        result = container_is_running(project)
-        self._container_cache[key] = (now, result)
-        return result
-
-    def _invalidate_container_cache(self, project: "Project") -> None:
-        """Force next check to call docker inspect."""
-        self._container_cache.pop(str(project.path), None)
-
     def _refresh_project_item(self, project: Project) -> None:
         lv = self.query_one("#project-list", ListView)
         for item in lv.query(ProjectItem):
@@ -1203,32 +1198,9 @@ class OrchApp(App):
         if isinstance(event.item, ProjectItem):
             self.selected_project = event.item.project
             self._refresh_panes()
-            # Auto-start container in background if not already running
-            self._ensure_container(event.item.project)
             # On mobile, auto-switch to the status tab after selecting a project
             if self._mobile:
                 self._apply_tab(1)
-
-    def _ensure_container(self, project: Project) -> None:
-        """Start container in background if not already running."""
-        if self._cached_container_is_running(project):
-            return
-
-        # Start the spinner
-        pane = self.query_one("#status-pane", StatusPane)
-        pane.start_spinner("Starting container — pulling image, installing tools", project)
-
-        def _start():
-            try:
-                cid = ensure_running(project)
-                self.call_from_thread(self._stop_spinner_and_refresh, project,
-                                      f"Container ready for {project.name} ({cid[:12]})")
-            except Exception as e:
-                self.call_from_thread(self._stop_spinner_and_refresh, project,
-                                      f"Container failed for {project.name}: {e}",
-                                      "error")
-
-        self.run_worker(_start, thread=True)
 
     def _stop_spinner_and_refresh(self, project: Project, message: str,
                                    severity: str = "information") -> None:
@@ -1337,8 +1309,8 @@ class OrchApp(App):
         self._refresh_project_item(p)
 
 
-    def action_container_up(self) -> None:
-        """Open an iTerm2 tab with Claude running inside the container."""
+    def action_session_start(self) -> None:
+        """Open an iTerm2 window with Claude running in the VM."""
         if self._input_focused: return
         if self._mobile:
             self.notify("Not available on mobile — use the bridge instead", severity="warning")
@@ -1349,11 +1321,13 @@ class OrchApp(App):
             return
 
         pane = self.query_one("#status-pane", StatusPane)
-        pane.start_spinner("Launching Claude in container", p)
+        pane.start_spinner("Launching Claude in VM", p)
 
         def _launch():
             try:
-                exec_claude_in_iterm(p, with_shell=True)
+                vm_ensure_running()
+                from .iterm import open_vm_session
+                open_vm_session(p, with_shell=True)
                 self.call_from_thread(self._stop_spinner_and_refresh, p,
                                       f"Claude launched for {p.name}")
             except Exception as e:
@@ -1362,8 +1336,8 @@ class OrchApp(App):
 
         self.run_worker(_launch, thread=True)
 
-    def action_container_shell(self) -> None:
-        """Open an iTerm2 tab with a bash shell inside the container."""
+    def action_vm_shell(self) -> None:
+        """Open an iTerm2 window with a shell in the VM at the project dir."""
         if self._input_focused: return
         if self._mobile:
             self.notify("Not available on mobile — use the bridge instead", severity="warning")
@@ -1374,12 +1348,13 @@ class OrchApp(App):
             return
 
         pane = self.query_one("#status-pane", StatusPane)
-        pane.start_spinner("Opening shell in container", p)
+        pane.start_spinner("Opening VM shell", p)
 
         def _launch():
             try:
-                from .container import exec_shell_in_iterm
-                exec_shell_in_iterm(p)
+                vm_ensure_running()
+                from .iterm import open_vm_shell
+                open_vm_shell(p)
                 self.call_from_thread(self._stop_spinner_and_refresh, p,
                                       f"Shell opened for {p.name}")
             except Exception as e:
@@ -1388,68 +1363,40 @@ class OrchApp(App):
 
         self.run_worker(_launch, thread=True)
 
-    def action_container_down_press(self) -> None:
-        """First d press primes, second d within 0.5s stops the container."""
+    def action_session_stop_press(self) -> None:
+        """First d press primes, second d within 0.5s stops the session."""
         if self._input_focused: return
         if self._d_pressed:
-            # Second press — execute
             self._d_pressed = False
             if self._d_timer:
                 self._d_timer.stop()
                 self._d_timer = None
-            self._do_container_down()
+            self._do_session_stop()
         else:
-            # First press — prime and start timeout
             self._d_pressed = True
-            self.notify("Press [bold]d[/] again to stop container", markup=True)
+            self.notify("Press [bold]d[/] again to stop session", markup=True)
             self._d_timer = self.set_timer(0.8, self._reset_d_press)
 
     def _reset_d_press(self) -> None:
         self._d_pressed = False
         self._d_timer = None
 
-    def _do_container_down(self) -> None:
-        """Stop and remove the container for the selected project."""
+    def _do_session_stop(self) -> None:
+        """Kill the tmux session for the selected project."""
         p = self.selected_project
         if not p:
             self.notify("No project selected", severity="warning")
             return
-        if not container_is_running(p):
-            self.notify(f"No container running for {p.name}", severity="warning")
+        if not session_exists(p):
+            self.notify(f"No session running for {p.name}", severity="warning")
             return
 
-        container_stop(p)
-        self.notify(f"Container stopped for {p.name}")
+        kill_session(p)
+        # Update cache immediately so the poller doesn't double-fire the hook
+        self._session_cache[p.name] = False
+        self.notify(f"Session stopped for {p.name}")
         self._refresh_project_item(p)
         self._refresh_panes()
-
-    def action_container_rebuild(self) -> None:
-        """Stop, remove, and rebuild the container from scratch."""
-        if self._input_focused:
-            return
-        p = self.selected_project
-        if not p:
-            self.notify("No project selected", severity="warning")
-            return
-
-        pane = self.query_one("#status-pane", StatusPane)
-        pane.start_spinner("Rebuilding container", p)
-
-        def _rebuild():
-            try:
-                # Stop existing container (if any)
-                if container_is_running(p):
-                    container_stop(p)
-                self._invalidate_container_cache(p)
-                # Start fresh — ensure_running will create a new container
-                exec_claude_in_iterm(p, with_shell=True)
-                self.call_from_thread(self._stop_spinner_and_refresh, p,
-                                      f"Container rebuilt for {p.name}")
-            except Exception as e:
-                self.call_from_thread(self._stop_spinner_and_refresh, p,
-                                      f"Rebuild failed: {e}", "error")
-
-        self.run_worker(_rebuild, thread=True)
 
     def action_exec_shell(self) -> None:
         """Open an iTerm2 tab with Claude on the host (no container)."""
@@ -1570,11 +1517,11 @@ class OrchApp(App):
             config_file.write_text(
                 "# Orch configuration\n"
                 "#\n"
-                "# Settings are grouped by section (e.g. [container], [iterm]).\n"
+                "# Settings are grouped by section (e.g. [vm], [iterm]).\n"
                 "# Each setting must appear under the correct [section] header —\n"
                 "# a setting placed under the wrong header will be ignored.\n\n"
-                "[container]\n"
-                "# reference_dirs = \"~/Sites,~/Projects\"\n\n"
+                "[vm]\n"
+                "# name = \"orch\"\n\n"
                 "[iterm]\n"
                 "# profile = \"orch\"\n"
                 "# dedicated_window = true\n"
@@ -1593,27 +1540,6 @@ class OrchApp(App):
         )
         _run_iterm_script(script)
         self.notify("Config opened in iTerm2")
-
-    def action_refresh_auth(self) -> None:
-        """Force-refresh OAuth credentials from host Keychain into all running containers."""
-        if self._input_focused:
-            return
-
-        def _do_refresh():
-            refreshed = 0
-            for p in self.projects:
-                cid = container_is_running(p)
-                if cid:
-                    _inject_credentials(cid, force=True)
-                    refreshed += 1
-            self.call_from_thread(
-                self.notify,
-                f"Auth refreshed in {refreshed} container(s)" if refreshed
-                else "No running containers to refresh",
-                severity="information" if refreshed else "warning",
-            )
-
-        self.run_worker(_do_refresh, thread=True)
 
     @on(Input.Submitted, "#task-input")
     def on_input_submitted(self, event: Input.Submitted) -> None:
@@ -1656,27 +1582,18 @@ class OrchApp(App):
         self._refresh_panes()
 
     def _send_task(self, project: Project, task: str) -> None:
-        """
-        Fire-and-forget: run Claude headlessly in the container with the task.
-        No iTerm tab — Claude runs in the background. Status dot updates as it works.
-        """
-        cid = container_is_running(project)
-        if not cid:
-            # Write to pending_task for pickup when a session starts
-            project.claude_dir.mkdir(parents=True, exist_ok=True)
-            (project.claude_dir / "pending_task").write_text(task)
-            self.notify(f"Task queued for {project.name} (no container — will run on next session)")
-            return
+        """Fire-and-forget: run Claude headlessly in the VM with the task."""
+        from .agent import run_headless
 
-        from .container import _run_task_headless
         pane = self.query_one("#status-pane", StatusPane)
         pane.start_spinner("Running task in background", project)
 
         def _run():
             try:
-                _run_task_headless(project, task)
+                vm_ensure_running()
+                run_headless(project, task)
                 self.call_from_thread(self._stop_spinner_and_refresh, project,
-                                      f"Task running for {project.name}")
+                                      f"Task completed for {project.name}")
             except Exception as e:
                 self.call_from_thread(self._stop_spinner_and_refresh, project,
                                       f"Task failed: {e}", "error")
@@ -1721,7 +1638,7 @@ class OrchApp(App):
         Dispatch pending todos in parallel using worktrees.
         Up to max_parallel tasks run concurrently (default 3).
         """
-        from .container import _load_dispatch_config, run_task_in_worktree
+        from .agent import run_task_in_worktree
 
         key = str(project.path)
         self._dispatch_timers.pop(key, None)
@@ -1730,8 +1647,25 @@ class OrchApp(App):
             return
 
         # How many slots are available?
-        cfg = _load_dispatch_config()
-        max_parallel = cfg.get("max_parallel", 3)
+        max_parallel = 3
+        config_file = Path.home() / ".orch" / "config.toml"
+        if config_file.exists():
+            section = None
+            for raw in config_file.read_text().splitlines():
+                line = raw.strip()
+                if line == "[dispatch]":
+                    section = "dispatch"
+                    continue
+                if line.startswith("["):
+                    section = None
+                    continue
+                if section == "dispatch" and "=" in line:
+                    key, _, val = line.partition("=")
+                    if key.strip() == "max_parallel":
+                        try:
+                            max_parallel = int(val.strip().strip('"').strip("'"))
+                        except ValueError:
+                            pass
         active = project.in_progress_count
         slots = max(0, max_parallel - active)
 
@@ -1797,8 +1731,7 @@ class OrchApp(App):
     def _on_dispatch_complete(
         self, project: Project, todo_text: str, results: dict
     ) -> None:
-        from .container import remove_worktree
-        from pathlib import Path
+        from .agent import remove_worktree
 
         # Mark done
         self._mark_todo_done(project, todo_text)
@@ -1868,7 +1801,7 @@ class OrchApp(App):
 
     def _handle_bridge_request(self, source_project: Project) -> None:
         """Handle a bridge_request file created by an agent."""
-        from .bridge_comm import (
+        from .comm import (
             parse_bridge_request,
             handle_bridge_request,
             MAX_BRIDGE_DEPTH,
@@ -1939,7 +1872,7 @@ class OrchApp(App):
         request,
         error: Exception,
     ) -> None:
-        from .bridge_comm import BridgeResponse, _deliver_response, _archive_request_file
+        from .comm import BridgeResponse, _deliver_response, _archive_request_file
 
         self.notify(
             f"Bridge failed: {request.summary[:40]} — {error}",

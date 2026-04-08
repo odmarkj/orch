@@ -4,17 +4,16 @@ orch CLI
   orch                              Launch TUI
   orch plan                         Generate and print day plan
   orch plan --json                  Output plan as JSON
-  orch logs [project]               Tail docker logs
+  orch logs [project]               Tail logs
   orch logs [project] -g error      Grep filter
-  orch logs [project] --list        Show discovered containers
   orch logs [project] --past        Read saved log files
   orch bridge                       Start mobile web bridge (stays running)
   orch stage <project> <stage>      Advance project to a new stage
-  orch container <project> up       Start devcontainer for project
-  orch container <project> down     Stop container
-  orch container <project> status   Check container status
-  orch container <project> exec     Exec into container running claude
-  orch container build-base         Build pre-cached base image with Claude Code
+  orch vm start                     Start the Lima VM
+  orch vm stop                      Stop the Lima VM
+  orch vm status                    Check VM status
+  orch vm ssh                       SSH into the VM
+  orch vm create                    Create the VM from template
   orch ignore <project>              Hide project from orch
   orch ignore <project> --undo      Un-hide project
   orch setup                        First-time setup
@@ -196,68 +195,39 @@ def cmd_stage(argv: list[str]) -> None:
     print(f"  Ledger entries: {len(lc.ledger)}")
 
 
-def cmd_container(argv: list[str]) -> None:
-    from .container import ensure_running, stop, is_running, exec_cmd
+def cmd_vm(argv: list[str]) -> None:
+    from .vm import vm_status, vm_start, vm_stop, vm_create, vm_delete, VM_NAME
 
-    if len(argv) < 1:
-        print("Usage: orch container <project> [up|down|status|exec]")
-        print("       orch container build-base   Build pre-cached base image")
-        sys.exit(1)
+    action = argv[0] if argv else "status"
 
-    # Handle build-base before project lookup (no project needed)
-    if argv[0] == "build-base":
-        from .container import build_base_image, CLAUDE_CODE_VERSION, ORCH_BASE_IMAGE
-        print(f"  Building {ORCH_BASE_IMAGE} with Claude Code v{CLAUDE_CODE_VERSION}…")
-        try:
-            tag = build_base_image()
-            print(f"  Done. Image: {tag}")
-            print(f"  All new containers will use this pre-built image.")
-        except RuntimeError as e:
-            print(f"Error: {e}", file=sys.stderr)
-            sys.exit(1)
-        return
+    if action == "start":
+        print(f"  Starting VM '{VM_NAME}'…")
+        vm_start()
+        print(f"  VM running.")
 
-    project_name = argv[0]
-    action = argv[1] if len(argv) > 1 else "up"
-    project = _find_project(project_name)
-
-    if action == "up":
-        try:
-            cid = ensure_running(project)
-            print(f"  Container running: {cid[:12]}")
-            print(f"  Exec:  docker exec -it {cid[:12]} bash")
-            print(f"  Claude: {exec_cmd(project)}")
-        except RuntimeError as e:
-            print(f"Error: {e}", file=sys.stderr)
-            sys.exit(1)
-
-    elif action == "down":
-        stop(project)
-        print(f"  Container stopped for {project.name}")
+    elif action == "stop":
+        vm_stop()
+        print(f"  VM stopped.")
 
     elif action == "status":
-        cid = is_running(project)
-        if cid:
-            print(f"  {project.name}: running ({cid[:12]})")
-        else:
-            print(f"  {project.name}: not running")
+        status = vm_status()
+        print(f"  VM '{VM_NAME}': {status}")
 
-    elif action == "exec":
-        cid = is_running(project)
-        if not cid:
-            try:
-                cid = ensure_running(project)
-            except RuntimeError as e:
-                print(f"Error: {e}", file=sys.stderr)
-                sys.exit(1)
+    elif action == "create":
+        print(f"  Creating VM '{VM_NAME}' from template…")
+        vm_create()
+        print(f"  VM created. Start with: orch vm start")
+
+    elif action == "delete":
+        vm_delete()
+        print(f"  VM deleted.")
+
+    elif action == "ssh":
         import os
-        os.execvp("docker", [
-            "docker", "exec", "-it", cid,
-            "claude", "--dangerously-skip-permissions",
-        ])
+        os.execvp("limactl", ["limactl", "shell", VM_NAME])
 
     else:
-        print(f"Unknown action '{action}'. Use: up, down, status, exec")
+        print(f"Unknown action '{action}'. Use: start, stop, status, create, delete, ssh")
         sys.exit(1)
 
 
@@ -294,10 +264,32 @@ def cmd_ignore(argv: list[str]) -> None:
         print(f"  Or edit: {project_path}/.orch/project.toml → set ignored = false")
 
 
+def _ensure_vm() -> None:
+    """Check VM state before launching the TUI. Start if stopped, exit if not created."""
+    import shutil
+    if not shutil.which("limactl"):
+        print("Lima is not installed. Run: brew install lima && orch setup")
+        sys.exit(1)
+
+    from .vm import vm_status
+
+    status = vm_status()
+    if status == "NotCreated":
+        print("VM not found. Run: orch setup")
+        sys.exit(1)
+
+    if status != "Running":
+        print("  Starting VM…", flush=True)
+        from .vm import vm_start
+        vm_start()
+        print("  VM running.")
+
+
 def main() -> None:
     argv = sys.argv[1:]
 
     if not argv:
+        _ensure_vm()
         from .app import OrchApp
         OrchApp().run()
         return
@@ -312,8 +304,8 @@ def main() -> None:
         cmd_bridge(argv[1:])
     elif sub in ("stage",):
         cmd_stage(argv[1:])
-    elif sub in ("container", "c"):
-        cmd_container(argv[1:])
+    elif sub in ("vm",):
+        cmd_vm(argv[1:])
     elif sub in ("ignore",):
         cmd_ignore(argv[1:])
     elif sub in ("setup",):

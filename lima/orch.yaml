@@ -1,0 +1,131 @@
+# Lima VM template for orch — single VM for all Claude Code sessions.
+#
+# Usage:
+#   limactl create --name orch lima/orch.yaml
+#   limactl start orch
+#   limactl shell orch
+#
+# Requirements: Lima >= 1.0, macOS with Apple Virtualization.framework
+
+vmType: vz
+cpus: 8
+memory: "24GiB"
+disk: "100GiB"
+
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img"
+    arch: "x86_64"
+
+# virtiofs mounts — same paths as host, no translation needed
+mounts:
+  - location: "~/Apps"
+    writable: true
+  - location: "~/.claude"
+    writable: true
+  - location: "~/.claude.json"
+    writable: true
+  - location: "~/.ssh"
+    writable: false
+  - location: "~/.orch"
+    writable: true
+
+mountType: virtiofs
+
+ssh:
+  forwardAgent: true
+
+# Auto-forward dev server and service ports
+portForwards:
+  - guestPortRange: [3000, 9999]
+    hostIP: "127.0.0.1"
+  - guestPort: 5900
+    hostIP: "127.0.0.1"
+  - guestPort: 6443
+    hostIP: "127.0.0.1"
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux
+
+      export DEBIAN_FRONTEND=noninteractive
+
+      # ── Core tools ──
+      apt-get update
+      apt-get install -y \
+        git curl wget build-essential tmux xclip jq unzip \
+        ca-certificates gnupg lsb-release software-properties-common
+
+      # ── Node.js 22 (for Claude Code) ──
+      curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+      apt-get install -y nodejs
+
+      # ── Claude Code ──
+      npm install -g @anthropic-ai/claude-code
+
+      # ── direnv ──
+      apt-get install -y direnv
+
+      # ── Docker Engine ──
+      install -m 0755 -d /etc/apt/keyrings
+      curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+      chmod a+r /etc/apt/keyrings/docker.asc
+      echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo "$VERSION_CODENAME") stable" \
+        | tee /etc/apt/sources.list.d/docker.list > /dev/null
+      apt-get update
+      apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+      # ── gh CLI ──
+      curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+      chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+      echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+      apt-get update
+      apt-get install -y gh
+
+      # ── k3s ──
+      curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--write-kubeconfig-mode 644" sh -
+
+      # ── VNC (optional GUI) ──
+      apt-get install -y tigervnc-standalone-server || true
+
+  - mode: user
+    script: |
+      #!/bin/bash
+      set -eux
+
+      # ── mise (manages Python, Node, Go, etc. per-project) ──
+      curl https://mise.run | sh
+      echo 'eval "$($HOME/.local/bin/mise activate bash)"' >> ~/.bashrc
+
+      # ── direnv hook ──
+      echo 'eval "$(direnv hook bash)"' >> ~/.bashrc
+
+      # ── Claude config dir (use host-mounted .claude so JSONL files are visible to host) ──
+      echo 'export CLAUDE_CONFIG_DIR=/Users/joshuaodmark/.claude' >> ~/.bashrc
+
+      # ── Docker group ──
+      sudo usermod -aG docker "$USER"
+
+      # ── Git defaults ──
+      git config --global init.defaultBranch main
+      git config --global pull.rebase false
+
+      # ── tmux config for orch sessions ──
+      cat > ~/.tmux.conf << 'TMUX'
+      set -g mouse on
+      set -g history-limit 50000
+      set -g default-terminal "xterm-256color"
+      set -ga terminal-overrides ",xterm-256color:RGB"
+      set -g allow-passthrough on
+      set -g set-clipboard on
+      set -g status-right "#S"
+      TMUX
+
+      # ── kubeconfig ──
+      mkdir -p ~/.kube
+      echo 'export KUBECONFIG=/etc/rancher/k3s/k3s.yaml' >> ~/.bashrc

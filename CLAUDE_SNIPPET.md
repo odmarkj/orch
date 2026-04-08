@@ -37,13 +37,12 @@ show live status, fire notifications, and track progress — zero LLM calls.
 
 ## Reference projects
 
-When containers start, orch automatically writes a user-level `~/.claude/CLAUDE.md`
-inside the container that lists all reference projects available under the
-configured `reference_dirs`. This lets Claude know where to look when you say
-things like "look at how project X does it" or "reuse the parser from Y".
+All projects under `~/Apps/` are accessible at their original paths inside the
+Lima VM. This lets Claude look at other projects when you say things like
+"look at how project X does it" or "reuse the parser from Y".
 
-Reference projects are mounted **read-only** — Claude will copy code into the
-current workspace rather than modifying the originals.
+Use `--allowedDirectories` to control write access — reference projects are
+readable but writes are scoped to the current project.
 
 ## Cross-project bridge
 
@@ -74,7 +73,7 @@ orch manages, you can request a bridge by writing `.claude/bridge_request`:
 
 After writing the request, continue your current work. The orchestrator will
 handle routing — it spawns a subagent on a worktree of the target project inside
-its container with read-only access to your project for context.
+the VM with read-only access to your project for context.
 
 Check `.claude/bridge_responses/` for results. Each response is a JSON file with
 `status`, `result`, and optionally `pr_url`.
@@ -85,7 +84,7 @@ request. Do not send bridge requests if depth would exceed 2.
 
 The bridge works by:
 1. Claude writes `.claude/bridge_request` → orch watchdog picks it up
-2. Orch creates a worktree on the target project and starts its container
-3. A subagent runs inside the container with full context from both projects
+2. Orch creates a worktree on the target project
+3. A subagent runs inside the VM with full context from both projects
 4. Results are delivered back to `.claude/bridge_responses/<id>.json`
 5. The worktree is cleaned up automatically

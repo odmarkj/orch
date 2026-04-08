@@ -6,11 +6,12 @@ What this does:
   1. Copies profiles/orch-iterm2-profile.json into iTerm2's DynamicProfiles/
      (iTerm2 picks it up instantly, no restart needed)
   2. Verifies macOS notification support (built-in osascript)
-  3. Creates ~/.orch/config.toml with defaults if it doesn't exist
-  4. Prints the CLAUDE.md snippet to add to each project
+  3. Checks for Lima and offers to install it
+  4. Creates the Lima VM if it doesn't exist
+  5. Creates ~/.orch/config.toml with defaults if it doesn't exist
+  6. Prints the CLAUDE.md snippet to add to each project
 """
 
-import json
 import os
 import shutil
 import subprocess
@@ -33,7 +34,7 @@ def step(n, total, msg):
 
 
 def install_iterm_profile():
-    step(1, 5, "Installing iTerm2 Dynamic Profile")
+    step(1, 6, "Installing iTerm2 Dynamic Profile")
 
     if not ITERM_DYNAMIC_PROFILES.parent.parent.exists():
         print("  ✗ iTerm2 not found at ~/Library/Application Support/iTerm2")
@@ -43,33 +44,38 @@ def install_iterm_profile():
     ITERM_DYNAMIC_PROFILES.mkdir(parents=True, exist_ok=True)
     dest = ITERM_DYNAMIC_PROFILES / "orch-iterm2-profile.json"
 
-    # Remove old file (symlink or copy) — keeping a .bak causes duplicate GUID errors
     if dest.exists() or dest.is_symlink():
         dest.unlink()
-    # Also clean up any stale backup
     bak = dest.with_suffix(".json.bak")
     if bak.exists():
         bak.unlink()
 
-    # Copy instead of symlink — iTerm2 does not follow symlinks in DynamicProfiles
     shutil.copy2(PROFILE_SRC, dest)
     print(f"  ✓ Installed: {PROFILE_SRC.name}")
     print(f"    → {dest}")
-    print()
-    print("  The profile is now live in iTerm2. Open Preferences → Profiles")
-    print("  to verify 'orch' appears. To customize, edit the source file at")
-    print(f"  {PROFILE_SRC} and re-run: orch setup")
     return True
 
 
-def _brew_install(package: str, description: str) -> bool:
-    """Offer to install a Homebrew package. Returns True if installed."""
-    if shutil.which(package):
-        print(f"  ✓ {package} already installed")
+def check_notifications():
+    step(2, 6, "Checking notifications")
+    print("  ✓ Using built-in macOS notifications (osascript)")
+    print("    Ensure Focus / Do Not Disturb is off to receive notifications.")
+
+
+def check_lima():
+    step(3, 6, "Checking Lima")
+
+    if shutil.which("limactl"):
+        result = subprocess.run(
+            ["limactl", "--version"],
+            capture_output=True, text=True,
+        )
+        version = result.stdout.strip() if result.returncode == 0 else "unknown"
+        print(f"  ✓ Lima {version}")
         return True
 
-    print(f"  ✗ {package} not found")
-    print(f"    {description}")
+    print("  ✗ Lima not found")
+    print("    Lima provides a lightweight Linux VM for running Claude sessions.")
 
     try:
         answer = input("  Install now via Homebrew? [Y/n] ").strip().lower()
@@ -77,69 +83,83 @@ def _brew_install(package: str, description: str) -> bool:
         answer = "n"
 
     if answer in ("", "y", "yes"):
-        result = subprocess.run(["brew", "install", package])
+        result = subprocess.run(["brew", "install", "lima"])
         if result.returncode == 0:
             print("  ✓ Installed")
             return True
         else:
-            print(f"  ✗ Install failed — run: brew install {package}")
+            print("  ✗ Install failed — run: brew install lima")
             return False
     else:
-        print("  Skipped")
+        print("  Skipped — run: brew install lima")
         return False
 
 
-def check_notifications():
-    step(2, 5, "Checking notifications")
-    print("  ✓ Using built-in macOS notifications (osascript)")
-    print("    Ensure Focus / Do Not Disturb is off to receive notifications.")
+def create_vm():
+    step(4, 6, "Creating Lima VM")
 
+    from .vm import vm_status, vm_create, LIMA_YAML
 
-def check_devcontainer_cli():
-    step(3, 5, "Checking devcontainer CLI")
-
-    if shutil.which("devcontainer"):
-        print("  ✓ devcontainer CLI already installed")
+    status = vm_status()
+    if status != "NotCreated":
+        print(f"  ✓ VM already exists (status: {status})")
+        if status == "Stopped":
+            try:
+                answer = input("  Start VM now? [Y/n] ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                answer = "n"
+            if answer in ("", "y", "yes"):
+                from .vm import vm_start
+                print("  Starting VM…")
+                vm_start()
+                print("  ✓ VM running")
         return
 
-    print("  ✗ devcontainer CLI not found")
-    print("    This enables full devcontainer feature support (Python, Node, etc).")
-    print("    Without it, orch falls back to raw docker with manual Claude install.")
+    print(f"  Creating VM from {LIMA_YAML}…")
+    print("  This downloads an Ubuntu image and installs tools (5-10 minutes).")
 
     try:
-        answer = input("  Install now via npm? [Y/n] ").strip().lower()
+        answer = input("  Create VM now? [Y/n] ").strip().lower()
     except (EOFError, KeyboardInterrupt):
         answer = "n"
 
     if answer in ("", "y", "yes"):
-        result = subprocess.run(["npm", "install", "-g", "@devcontainers/cli"])
+        try:
+            vm_create()
+            print("  ✓ VM created")
+            print("  Start with: orch vm start")
+        except subprocess.CalledProcessError as e:
+            print(f"  ✗ VM creation failed: {e}")
+    else:
+        print("  Skipped — create later with: orch vm create")
+
+
+def check_gh_cli():
+    step(5, 6, "Checking GitHub CLI")
+
+    if shutil.which("gh"):
+        print("  ✓ gh CLI installed")
+        return True
+
+    print("  ✗ gh CLI not found")
+    print("    Required for auto-dispatch PR creation and code review comments.")
+
+    try:
+        answer = input("  Install now via Homebrew? [Y/n] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        answer = "n"
+
+    if answer in ("", "y", "yes"):
+        result = subprocess.run(["brew", "install", "gh"])
         if result.returncode == 0:
             print("  ✓ Installed")
+            return True
         else:
-            print("  ✗ Install failed — run: npm install -g @devcontainers/cli")
+            print("  ✗ Install failed — run: brew install gh")
+            return False
     else:
-        print("  Skipped — orch will use raw docker (containers still work)")
-
-
-def check_docker():
-    step(4, 5, "Checking Docker")
-
-    if not shutil.which("docker"):
-        print("  ✗ Docker not found")
-        print("    Docker is required for containerized Claude sessions.")
-        print("    Install Docker Desktop from https://docker.com")
-        return
-
-    result = subprocess.run(
-        ["docker", "info", "--format", "{{.ServerVersion}}"],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode == 0:
-        print(f"  ✓ Docker {result.stdout.strip()}")
-    else:
-        print("  ✗ Docker is installed but not running")
-        print("    Start Docker Desktop and re-run setup")
+        print("  Skipped — run: brew install gh")
+        return False
 
 
 def _prompt_sites_root() -> str:
@@ -159,46 +179,11 @@ def _prompt_sites_root() -> str:
 
 
 def create_config():
-    step(5, 5, "Creating ~/.orch/config.toml")
+    step(6, 6, "Creating ~/.orch/config.toml")
     ORCH_CONFIG_DIR.mkdir(exist_ok=True)
 
     if CONFIG_FILE.exists():
-        # Check if [container] section is missing and append it
-        existing = CONFIG_FILE.read_text()
-        if "[container]" not in existing:
-            container_section = """
-[container]
-# Enable containerized Claude sessions (requires Docker)
-enabled = true
-
-# Base devcontainer image (used when project has no .devcontainer/)
-image = "mcr.microsoft.com/devcontainers/base:ubuntu"
-
-# Memory limit per container
-memory = "12g"
-
-# Env vars to pass from host into containers (comma-separated)
-passthrough_env = "ANTHROPIC_API_KEY,CLOUDFLARE_API_TOKEN,CLOUDFLARE_ACCOUNT_ID"
-
-# Use devcontainer CLI if available (falls back to raw docker if false or missing)
-prefer_devcontainer_cli = true
-"""
-            CONFIG_FILE.write_text(existing.rstrip() + "\n" + container_section)
-            print(f"  ✓ Added [container] section to {CONFIG_FILE}")
-            existing = CONFIG_FILE.read_text()
-
-        # Check if [dispatch] section is missing and append it
-        if "[dispatch]" not in existing:
-            dispatch_section = """
-[dispatch]
-# Maximum number of Claude instances to run in parallel per project
-# Each dispatched todo gets its own git worktree
-max_parallel = 3
-"""
-            CONFIG_FILE.write_text(existing.rstrip() + "\n" + dispatch_section)
-            print(f"  ✓ Added [dispatch] section to {CONFIG_FILE}")
-        else:
-            print(f"  ✓ Already exists at {CONFIG_FILE}")
+        print(f"  ✓ Already exists at {CONFIG_FILE}")
         return
 
     sites_root = _prompt_sites_root()
@@ -209,51 +194,39 @@ max_parallel = 3
 
 [iterm]
 # Name of the iTerm2 profile to use for orch sessions.
-# Must match the "Name" field in profiles/orch-iterm2-profile.json
 profile = "orch"
 
 # Whether all orch sessions live in a single dedicated window.
-# true  → one "orch sessions" window, all projects as tabs
-# false → new tab in whatever iTerm2 window is frontmost
 dedicated_window = true
 
-# Title of the dedicated orch window (used to find/create it)
+# Title of the dedicated orch window
 window_title = "orch sessions"
 
 [notifications]
-# macOS notification sound. Set to "" to disable sound.
-# Standard names: Glass, Blow, Bottle, Frog, Funk, Hero, Morse, Ping, Pop,
-#                 Purr, Sosumi, Submarine, Tink
+# macOS notification sounds. Set to "" to disable.
 sound_input_needed = "Glass"
 sound_resumed = "Pop"
-
-# Show a "Claude resumed" notification when input has been given
 notify_on_resume = true
 
 [projects]
 # Root directory to scan for projects (must contain .claude/ to be registered)
 sites_root = "{sites_root}"
 
-[container]
-# Enable containerized Claude sessions (requires Docker)
-enabled = true
-
-# Base devcontainer image (used when project has no .devcontainer/)
-image = "mcr.microsoft.com/devcontainers/base:ubuntu"
-
-# Memory limit per container
-memory = "12g"
-
-# Env vars to pass from host into containers (comma-separated)
-passthrough_env = "ANTHROPIC_API_KEY,CLOUDFLARE_API_TOKEN,CLOUDFLARE_ACCOUNT_ID"
-
-# Use devcontainer CLI if available (falls back to raw docker if false or missing)
-prefer_devcontainer_cli = true
+[vm]
+# Lima VM name (matches lima/orch.yaml template)
+name = "orch"
 
 [dispatch]
 # Maximum number of Claude instances to run in parallel per project
-# Each dispatched todo gets its own git worktree
 max_parallel = 3
+
+[bridge]
+# Mobile web bridge port
+port = 7777
+
+[planner]
+# Model used for day planning
+model = "claude-sonnet-4-20250514"
 """
     CONFIG_FILE.write_text(config)
     print(f"  ✓ Created {CONFIG_FILE}")
@@ -279,16 +252,17 @@ def main():
     print("  orch setup")
     hr("═")
 
-    install_iterm_profile()       # 1/5
-    check_notifications()          # 2/5
-    check_devcontainer_cli()      # 3/5
-    check_docker()                # 4/5
-    create_config()               # 5/5
+    install_iterm_profile()       # 1/6
+    check_notifications()          # 2/6
+    check_lima()                   # 3/6
+    create_vm()                    # 4/6
+    check_gh_cli()                 # 5/6
+    create_config()                # 6/6
     print_claude_snippet()
 
     print()
     hr()
-    print("  Setup complete. Run: orch")
+    print("  Setup complete. Run: orch vm start && orch")
     hr()
 
 

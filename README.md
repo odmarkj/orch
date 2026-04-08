@@ -8,7 +8,7 @@
 
 <p align="center">
   <a href="https://github.com/odmarkj/orch/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
-  <img src="https://img.shields.io/badge/version-0.1.0-green.svg" alt="Version: 0.1.0">
+  <img src="https://img.shields.io/badge/version-0.2.0-green.svg" alt="Version: 0.2.0">
   <img src="https://img.shields.io/badge/python-%3E%3D3.11-brightgreen.svg" alt="Python: >=3.11">
   <img src="https://img.shields.io/badge/platform-macOS-lightgrey.svg" alt="Platform: macOS">
   <a href="TODO-buymeacoffee-url"><img src="https://img.shields.io/badge/Buy%20Me%20A%20Coffee-donate-yellow.svg?logo=buy-me-a-coffee&logoColor=white" alt="Buy Me A Coffee"></a>
@@ -22,6 +22,7 @@
   <a href="#cli-commands">CLI Commands</a> &bull;
   <a href="#interface-shortcuts">Interface Shortcuts</a> &bull;
   <a href="#getting-started">Getting Started</a> &bull;
+  <a href="#billing--subscription-usage">Billing</a> &bull;
   <a href="#contributing">Contributing</a>
 </p>
 
@@ -39,8 +40,6 @@ Claude Code changed the game — you can move faster than ever. But now the bott
 - **Nothing tells you what matters.** Ten projects, ten TODO lists, ten different levels of "almost shipped." You pick whatever feels urgent, not what actually moves the needle. Three projects sit in MVP purgatory for weeks.
 - **Local iteration has no structure.** You test by hand, eyeball the output, push when it looks right. There's no feedback loop between "Claude wrote code" and "this actually works" that doesn't involve you sitting there watching.
 
-Tools like [Composio](https://github.com/ComposioHQ/agent-orchestrator) solve this for teams — they dispatch agents across a CI pipeline with GitHub PR review workflows baked in. That's great if you have the infrastructure and the people to run it. But if you're the whole team, you need something different. You need the dev server running, the tests passing locally, the iteration happening in front of you, and the production-ready code going out as a PR when it's actually ready.
-
 ### Where orch fits
 
 Orch is the ops layer for the person who is the team. It doesn't assume you have CI. It doesn't assume someone else reviews your PRs. It gives you a single terminal where every project is visible, every Claude session is tracked, and the work that matters floats to the top.
@@ -48,7 +47,7 @@ Orch is the ops layer for the person who is the team. It doesn't assume you have
 | Your day without orch | Your day with orch |
 |-------------|-----------|
 | Open five terminal tabs, `cd` into each project, try to remember where you left off | Open orch. Every project is there. Status dots show what's running, what's waiting, what's idle. |
-| Claude asks permission 20 times during a refactor. You babysit the tab. | Claude runs in an isolated container with full permissions. You check back when it's done. |
+| Claude asks permission 20 times during a refactor. You babysit the tab. | Claude runs in an isolated VM session with full permissions. You check back when it's done. |
 | A Claude session needs input. You don't notice for 40 minutes. | macOS notification fires. iTerm2 tab opens with the session resumed. You answer, move on. |
 | You start the day staring at ten projects. Pick one based on gut feeling. | `orch plan` reads every project's stage, stall score, pending todos, and tells you the three that matter today. |
 | A project sits in "almost done" for three weeks because nothing reminds you. | Stall detection flags it. Launch debt score rises. The day planner keeps surfacing it until you ship or kill it. |
@@ -64,14 +63,15 @@ git clone https://github.com/odmarkj/orch.git
 cd orch
 pip install -e . --break-system-packages
 
-# First-time setup (iTerm2 profile, Docker checks)
+# First-time setup (iTerm2 profile, Lima VM, tools)
 orch setup
 
-# Launch
+# Start the VM and launch
+orch vm start
 orch
 ```
 
-That's it. Orch auto-discovers any project under `~/Sites/` with a `.git/` directory. No registration, no config files per project — just code.
+That's it. Orch auto-discovers any project under `~/Apps/` (or your configured root) with a `.git/` directory. No registration, no config files per project — just code.
 
 ---
 
@@ -85,41 +85,29 @@ Each project's Claude session writes a one-line status to `.claude/status` after
 
 When Claude needs input, it writes to `.claude/waiting_for_input`. Orch fires a macOS notification and opens an iTerm2 tab with the session already resumed. You answer, Claude continues, the file is deleted, the dot goes green.
 
-### Container isolation
+### VM execution environment
 
-When you select a project, orch automatically starts a Docker container using either `devcontainer up` (preferred) or a raw `docker run` fallback. Inside the container, Claude runs with `--dangerously-skip-permissions` and a `settings.local.json` that allows all tools. This means fully autonomous operation — no permission prompts interrupting multi-step tasks.
+> **Migration note (v0.3):** Orch originally used per-project Docker containers
+> for isolation. This was replaced with a single Lima VM for simplicity,
+> efficiency, and speed — session start dropped from minutes (container build)
+> to sub-second (tmux attach), and CPU/memory overhead dropped dramatically
+> since there's only one VM instead of N containers. The mount namespace
+> sandbox (`unshare --mount`) provides equivalent write isolation without
+> container boundaries.
 
-Containers persist across project switches. Orch only removes them when you explicitly ask.
+When you select a project, orch connects to a single Lima VM running Ubuntu with Apple's Virtualization.framework and virtiofs mounts. Your `~/Apps` directory is mounted at the same path inside the VM, so all file paths resolve identically — no path translation, no mount hacks.
 
-**Environment variables** — orch automatically passes all host environment variables into containers, minus a sensible blocklist (HOME, PATH, SHELL, etc.). If orch isn't launched from an interactive shell, it also parses `export VAR=VALUE` lines from `~/.zshrc` and `~/.bashrc` so API tokens and credentials are available. To customize which vars are blocked, set `blocked_env` in `~/.orch/config.toml`.
+Inside the VM, Claude runs with `--dangerously-skip-permissions` in a sandboxed mount namespace — `~/Apps` is read-only except for the current project directory. This means fully autonomous operation within a project — no permission prompts interrupting multi-step tasks — while preventing cross-project writes.
 
-### Screenshot support
+Each session runs inside a **systemd scope**, so when a session ends (or you close the iTerm2 window), every process it spawned — background servers, dev watchers, build tools — is automatically cleaned up. No orphaned processes accumulating in the long-running VM.
 
-Dragging macOS screenshots directly into a Claude container session works out of the box. Take a screenshot with `Cmd+Shift+4`, drag the thumbnail from the corner of your screen into the iTerm tab, and Claude can read the image.
+Per-project environment isolation is handled by **direnv** (environment variables) and **mise** (Python/Node/Go toolchain versions). No containers to start up, rebuild, or configure per project.
 
-This is non-trivial because macOS stores in-flight screenshot thumbnails in a SIP-protected temp directory (`/var/folders/.../TemporaryItems/`) that Docker's VM cannot access. Orch works around this with a two-part proxy:
-
-1. A **UserPromptSubmit hook** inside the container detects screenshot temp paths in your prompt and writes a copy request to `.claude/` (which is bind-mounted to the host)
-2. The **orch host process** watches for these requests, copies the file into the container via `docker cp` (the host process runs as the user and has SIP access), and signals completion before Claude tries to read the file
-
-The result is the same drag-and-drop workflow you'd use with Claude on the host — no extra steps, no clipboard workarounds, no changed screenshot settings.
+**Environment variables** — each project can have a `.envrc` file loaded by direnv. A parent `.envrc` in `~/Apps/` can hold shared credentials (API tokens, etc.) inherited by all projects.
 
 ### Reference projects
 
-If you have code in other projects that Claude should be able to look at — a parser you've already built, an auth pattern you like, a design system — you can mount those directories into every container as read-only reference sites.
-
-Set `reference_dirs` in `~/.orch/config.toml`:
-
-```toml
-[container]
-reference_dirs = "/Users/you/Apps"
-```
-
-When a container starts, orch:
-1. Mounts each reference directory read-only at its original host path (enforced by Docker — not just an instruction)
-2. Scans the directories for projects and writes a user-level `~/.claude/CLAUDE.md` inside the container listing every available reference project and its path
-
-This means you can tell Claude "look at how project-x handles rate limiting" or "reuse the email template from project-y" and it already knows where to find them. No paths to remember — just project names.
+All projects under `~/Apps/` are accessible at their original paths inside the VM. You can tell Claude "look at how project-x handles rate limiting" and it already knows where to find them — no special configuration needed.
 
 ### Auto-dispatch with parallel worktrees
 
@@ -127,14 +115,12 @@ When auto-dispatch is enabled (`g` in the TUI), orch automatically picks up pend
 
 The full pipeline for each dispatched todo:
 
-1. **Worktree created** — a new branch `auto/<slug>-<random>` is checked out in `../.orch-worktrees/` (automatically added to `.gitignore`)
+1. **Worktree created** — a new branch `auto/<slug>-<random>` is checked out in `../.orch-worktrees/`
 2. **Claude works the task** — runs autonomously in the worktree with `--dangerously-skip-permissions`
 3. **Code review** (optional) — a second Claude instance reviews the diff for bugs, security issues, and quality
 4. **Commit & push** — changes are committed and pushed to the branch with retry backoff
 5. **PR created** — a pull request is opened via `gh` CLI with the task description and review findings
-6. **Cleanup** — worktree is removed, local branch is deleted (remote branch preserved on the PR), todo is marked `[x]`, next pending todo fills the slot
-
-`.orch-worktrees` is automatically added to the project's `.gitignore` on first dispatch to keep temporary worktrees out of version control. Local branches are cleaned up after a successful push to avoid clutter — the work lives on in the remote branch and PR.
+6. **Cleanup** — worktree is removed, local branch is deleted, todo is marked `[x]`, next pending todo fills the slot
 
 This means you can add 10 todos to a project, press `g`, and walk away. Orch will churn through them 3 at a time, each producing a PR ready for merge.
 
@@ -148,12 +134,7 @@ name = "my-project"
 code_review = true
 ```
 
-When enabled, after Claude finishes a task but before the commit and PR, a separate Claude instance reviews the diff. The review is:
-- Saved to `.claude/last_review.md` in the worktree
-- Included in the PR body under a "Code Review" section
-- Posted as a comment on the PR
-
-Code review is **off by default** and configured per project.
+When enabled, after Claude finishes a task but before the commit and PR, a separate Claude instance reviews the diff. The review is included in the PR body and posted as a comment.
 
 ### Project lifecycle
 
@@ -170,49 +151,25 @@ The ledger is append-only — every transition is dated and noted. Orch uses thi
 ## Architecture
 
 ```
-~/Sites/
-  project-a/.claude/status          ──┐
-  project-b/.claude/status          ──┤
-  project-c/.claude/waiting_for_input ┤
-                                      │
-                              [Watchdog Observer]
-                                      │
-                                      v
-                              ┌───────────────┐
-                              │   Orch TUI     │
-                              │   (Textual)    │
-                              │                │
-                              │  Project List  │
-                              │  Status Dots   │
-                              │  TODO Preview  │
-                              └───────┬───────┘
-                                      │
-               ┌──────────────┬───────┼──────────┬────────────┐
-               │              │       │          │            │
-               v              v       v          v            v
-       ┌──────────┐  ┌──────────┐ ┌────────┐ ┌────────┐ ┌────────┐
-       │ Container │  │  iTerm2  │ │ Bridge │ │ Auto-  │ │  Code  │
-       │ Manager   │  │  Integ.  │ │ :7777  │ │Dispatch│ │ Review │
-       │           │  │          │ │        │ │        │ │        │
-       │devcontainer│ │ Tab mgmt │ │Mobile  │ │Worktree│ │ Claude │
-       │ or docker │  │ Notifs   │ │REST API│ │Parallel│ │  Diff  │
-       └──────────┘  └──────────┘ └────────┘ └───┬────┘ └────────┘
-               │                                  │
-               v                                  v
-       ┌──────────────┐                 ┌──────────────────┐
-       │   Claude      │                 │  Worktree 1..N    │
-       │ (in container)│                 │  Claude per task   │
-       │ --dangerously-│                 │  commit → push     │
-       │ skip-perms    │                 │  → PR via gh       │
-       └──────────────┘                 └──────────────────┘
+Host (macOS)                          Lima VM (Ubuntu)
+┌──────────────────┐                  ┌──────────────────────────┐
+│ orch TUI (app.py)│──── SSH ────────▶│ tmux sessions per agent  │
+│ watchdog on       │                  │ direnv + mise per project│
+│ ~/Apps/*/.claude/ │◀── virtiofs ───▶│ ~/Apps/* (same paths)    │
+│                   │                  │ claude CLI (global)      │
+│ iTerm2 tabs       │                  │ docker engine            │
+│ (SSH into VM)     │                  │ k3s                      │
+│                   │                  │ VNC server               │
+└──────────────────┘                  └──────────────────────────┘
 ```
 
 ### Key design decisions
 
-- **Filesystem events over polling** — Watchdog monitors `.claude/` directories for instant status updates with zero CPU overhead.
-- **Container-first execution** — Claude runs in isolated Docker containers so `--dangerously-skip-permissions` is safe. No permission prompts, no friction.
+- **Filesystem events over polling** — Watchdog monitors `.claude/` directories for instant status updates with zero CPU overhead. virtiofs propagates events natively without Docker Desktop's filesystem overhead.
+- **Single VM execution** — All Claude sessions run inside one Lima VM with virtiofs mounts at host paths. No containers to build, start, or manage per project. Session start is sub-second (tmux attach) vs. minutes for container builds.
+- **Per-project isolation via direnv + mise** — Environment variables and toolchain versions are isolated per project without container boundaries. `--add-dir` prevents cross-project writes.
 - **No dependencies beyond the stdlib** — The TOML parser and Anthropic API client are hand-rolled. Only `textual` (TUI) and `watchdog` (file events) are external.
-- **iTerm2 via AppleScript** — Tab management uses native macOS automation. Dedicated orch window, session resume by TTY handle, no stale tabs.
+- **iTerm2 via SSH + tmux** — Sessions connect to the VM via `limactl shell` with tmux for persistence. Clipboard, images, and paste all work natively — no container boundary to cross.
 - **Append-only ledger** — Project lifecycle transitions are never edited, only appended. Full audit trail for stall detection and planning.
 
 ---
@@ -225,16 +182,15 @@ orch plan                           # Generate AI day plan
 orch plan --json                    # Day plan as JSON
 orch stage <project> <stage>        # Advance project lifecycle stage
 orch stage <project> <stage> note   # With a note in the ledger
-orch logs <project>                 # Tail docker logs for project
+orch logs <project>                 # Show recent session output
 orch logs <project> -g error        # Grep filter
-orch logs <project> --list          # Show discovered containers
 orch logs <project> --past          # Read saved log files
 orch bridge                         # Start mobile web bridge (Ctrl-C to stop)
-orch container build-base            # Pre-build base image with Claude Code
-orch container <project> up         # Start devcontainer for project
-orch container <project> down       # Stop container
-orch container <project> status     # Check container status
-orch container <project> exec       # Exec into container running Claude
+orch vm start                       # Start the Lima VM
+orch vm stop                        # Stop the Lima VM
+orch vm status                      # Check VM status
+orch vm ssh                         # SSH into the VM
+orch vm create                      # Create VM from template
 orch ignore <project>               # Hide project from orch
 orch ignore <project> --undo        # Un-hide project
 orch setup                          # First-time setup
@@ -255,23 +211,22 @@ Requires `ANTHROPIC_API_KEY` in your environment or iTerm2 profile.
 | Key | Action |
 |-----|--------|
 | `j` / `k` or arrows | Navigate project list |
-| `Enter` | Select project (auto-starts container) |
-| `t` | Send a task to Claude in container |
+| `Enter` | Select project |
+| `t` | Send a task to Claude in VM |
 | `a` | Add a todo to TODOS.md |
 | `g` | Toggle auto-dispatch (parallel worktrees) |
 | `e` | Open iTerm2 tab with Claude (host) |
-| `c` | Open iTerm2 tab with Claude (container) |
-| `x` | Open shell in container |
-| `dd` | Stop and remove container |
-| `R` | Rebuild container from scratch |
-| `l` | Tail docker logs in iTerm2 tab |
+| `c` | Open iTerm2 window with Claude (VM session) |
+| `x` | Open VM shell at project directory |
+| `dd` | Stop agent session |
+| `l` | View session logs |
 | `p` | Generate day plan in iTerm2 tab |
 | `b` | Toggle mobile web bridge on/off |
 | `s` | Set project stage (`stage` or `stage: note`) |
 | `i` | Ignore/hide selected project from orch |
-| `r` | Rescan `~/Sites` for new/removed projects |
+| `r` | Rescan projects directory |
+| `o` | Edit ~/.orch/config.toml |
 | `q` | Quit |
-| `?` | Toggle keybinding help pane |
 | `Escape` | Cancel input |
 
 ### TODOS.md format
@@ -306,18 +261,15 @@ pip install -e . --break-system-packages
 
 ```bash
 orch setup
-
-# Recommended: pre-build the base image with Claude Code installed
-orch container build-base
 ```
 
-`build-base` creates a local `orch-base:latest` Docker image with Claude Code pre-installed. This is optional — containers will still work without it — but it significantly speeds up container startup since Claude Code doesn't need to be installed from scratch each time.
-
 `orch setup` will:
-1. Symlink the iTerm2 dynamic profile
-2. Verify macOS notification support (built-in, no extra install needed)
-3. Check for Docker and `devcontainer` CLI
-4. Create `~/.orch/config.toml` with default settings
+1. Install the iTerm2 dynamic profile
+2. Verify macOS notification support
+3. Check for Lima and offer to install via Homebrew
+4. Create the Lima VM (downloads Ubuntu, installs tools — 5-10 minutes)
+5. Check for the GitHub CLI (`gh`)
+6. Create `~/.orch/config.toml` with default settings
 
 ### Enable live status in your projects
 
@@ -342,15 +294,9 @@ sound_input_needed = "Glass"
 sound_resumed = "Pop"
 notify_on_resume = true
 
-[container]
-enabled = true
-image = "mcr.microsoft.com/devcontainers/base:ubuntu"
-memory = "12g"
-prefer_devcontainer_cli = true
-# Comma-separated host directories to mount read-only as reference projects
-reference_dirs = "/Users/you/Apps,/Users/you/OtherProjects"
-# Comma-separated env vars to block from containers (sensible defaults built in)
-# blocked_env = "HOME,USER,SHELL,PATH,LANG,..."
+[vm]
+# Lima VM name (matches lima/orch.yaml template)
+name = "orch"
 
 [dispatch]
 # Max Claude instances running in parallel per project (each gets a worktree)
@@ -373,6 +319,34 @@ name = "my-project"
 
 # Enable automatic code review on dispatched tasks (off by default)
 code_review = true
+
+[hooks]
+# Run when the first session starts for this project
+on_first_session = "sudo systemctl start docker"
+# Run when the last session ends
+on_last_session = "sudo systemctl stop docker"
+```
+
+Hooks run inside the VM at the project directory. Use them to start/stop services that a project needs (databases, k3s, Docker, etc.) so they only run on demand instead of consuming resources permanently.
+
+### Per-project toolchain (optional)
+
+Use mise for per-project Python/Node/Go versions:
+
+```toml
+# .mise.toml in project root
+[tools]
+python = "3.12"
+node = "22"
+```
+
+Use direnv for per-project environment variables:
+
+```bash
+# .envrc in project root
+source_up_if_exists   # inherit parent .envrc
+use mise              # activate mise-managed toolchain
+export MY_API_KEY="..."
 ```
 
 ### Mobile access
@@ -383,31 +357,56 @@ Full TUI works on iPad via SSH. `orch plan` and `orch stage` work well on phone.
 
 | File | Purpose |
 |------|---------|
-| `~/Sites/<project>/.claude/status` | One-line live status, written by Claude |
-| `~/Sites/<project>/.claude/waiting_for_input` | Claude's question; triggers notification + iTerm2 tab |
-| `~/Sites/<project>/.claude/pending_task` | Task queued from orch, read by Claude |
-| `~/Sites/<project>/.claude/sessions.json` | `{"active": "<session-id>"}` for `--resume` |
-| `~/Sites/<project>/.claude/auto_dispatch` | Auto-dispatch enabled flag (existence = on) |
-| `~/Sites/<project>/.claude/active_todo` | Currently dispatched todo text |
-| `~/Sites/<project>/.claude/last_review.md` | Most recent code review output |
-| `~/Sites/<project>/TODOS.md` | Project todo list |
-| `~/Sites/<project>/.orch/project.toml` | Lifecycle stage, ledger, and per-project config |
-| `~/Sites/.orch-worktrees/` | Temporary worktrees for parallel dispatch |
+| `~/Apps/<project>/.claude/status` | One-line live status, written by Claude |
+| `~/Apps/<project>/.claude/waiting_for_input` | Claude's question; triggers notification + iTerm2 tab |
+| `~/Apps/<project>/.claude/pending_task` | Task queued from orch, read by Claude |
+| `~/Apps/<project>/.claude/sessions.json` | `{"active": "<session-id>"}` for `--resume` |
+| `~/Apps/<project>/.claude/auto_dispatch` | Auto-dispatch enabled flag (existence = on) |
+| `~/Apps/<project>/.claude/active_todo` | Currently dispatched todo text |
+| `~/Apps/<project>/.claude/last_review.md` | Most recent code review output |
+| `~/Apps/<project>/TODOS.md` | Project todo list |
+| `~/Apps/<project>/.orch/project.toml` | Lifecycle stage, ledger, and per-project config |
+| `~/Apps/.orch-worktrees/` | Temporary worktrees for parallel dispatch |
 | `~/.orch/config.toml` | Orch configuration |
-| `~/.orch/logs/<project>/` | Docker log files (1000 line rotation) |
+| `~/.orch/logs/<project>/` | Session log files |
+
+---
+
+## VM Capabilities
+
+The Lima VM provides a full Linux environment with:
+
+- **Docker Engine** — run `docker compose up` for multi-service stacks
+- **k3s** — native Kubernetes cluster for testing full applications
+- **VNC** — attach a display at `localhost:5900` for GUI debugging
+- **Port forwarding** — dev server ports (3000-9999) auto-forward to host
+- **SSH agent** — GitHub auth passes through automatically
+- **Wrangler** — run local Cloudflare Workers dev servers
+
+---
+
+## Billing & Subscription Usage
+
+Orch is **not** a third-party Claude client. It launches the official `claude` CLI binary — Anthropic's own Claude Code — as a subprocess for every session, both interactive and headless. Orch never implements its own API client or authentication layer; it simply orchestrates the first-party tool you already have installed.
+
+This matters because Anthropic's [billing policy](https://support.anthropic.com/en/articles/11145840-how-does-usage-based-billing-work-for-the-claude-max-plan) distinguishes between:
+
+- **First-party tools** (Claude Code, Claude chat, Claude Cowork) — usage counts against your subscription.
+- **Third-party harnesses** (tools that connect to your Claude account via their own API client) — usage draws from extra usage credits, not your subscription.
+
+Since orch launches `claude` directly, all usage is attributed to Claude Code and counts as normal subscription usage. No extra usage charges apply.
 
 ---
 
 ## System Requirements
 
 - **Python** >= 3.11
-- **macOS** (iTerm2 integration uses AppleScript)
-- **Docker** (for container isolation)
+- **macOS** (iTerm2 integration uses AppleScript, Lima uses Apple Virtualization.framework)
+- **Lima** (`brew install lima`) — lightweight Linux VM
 - **iTerm2** (for tab management and notifications)
 - **macOS notifications** — uses built-in `osascript`; ensure Focus/Do Not Disturb is off
 
 Optional:
-- **devcontainer CLI** (`npm install -g @devcontainers/cli`) — preferred container strategy
 - **GitHub CLI** (`brew install gh`) — enables auto-dispatch PR creation and code review comments
 - **Cloudflare Tunnel** — for mobile access outside your home network
 
@@ -439,15 +438,19 @@ orch/
 │   ├── __init__.py
 │   ├── __main__.py        # CLI entry point and subcommand routing
 │   ├── app.py             # Textual TUI application
+│   ├── agent.py           # Agent session management (tmux, worktrees, dispatch)
 │   ├── bridge.py          # Mobile web bridge (HTTP server + REST API)
-│   ├── container.py       # Docker container lifecycle management
-│   ├── discovery.py       # Auto-discovery of projects in ~/Sites
+│   ├── comm.py            # Cross-project agent communication protocol
+│   ├── discovery.py       # Auto-discovery of projects in ~/Apps
 │   ├── iterm.py           # iTerm2 tab management and notifications
 │   ├── lifecycle.py       # Project stages, ledger, stall detection
-│   ├── logs.py            # Docker log streaming and rotation
+│   ├── logs.py            # Session log capture and rotation
 │   ├── models.py          # Project and Session data models
 │   ├── planner.py         # AI day planner (Claude API)
-│   └── setup.py           # First-time setup wizard
+│   ├── setup.py           # First-time setup wizard
+│   └── vm.py              # Lima VM lifecycle management
+├── lima/
+│   └── orch.yaml          # Lima VM template (Ubuntu, virtiofs, provisioning)
 ├── profiles/
 │   └── orch-iterm2-profile.json  # iTerm2 dynamic profile
 ├── CLAUDE_SNIPPET.md      # Status integration snippet for projects
