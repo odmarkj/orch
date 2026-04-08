@@ -1906,6 +1906,57 @@ class OrchApp(App):
         except Exception:
             pass
 
+    def action_quit(self) -> None:
+        """Override quit to prompt about active sessions."""
+        from .agent import list_sessions, kill_session
+
+        sessions = list_sessions()
+        if not sessions:
+            self.exit()
+            return
+
+        count = len(sessions)
+        names = ", ".join(s["project"] for s in sessions)
+        self.notify(
+            f"{count} active session(s): {names}",
+            title="Kill sessions? (y = kill & quit, n = quit, Esc = cancel)",
+            timeout=30,
+        )
+        self._pending_quit_sessions = sessions
+        self.set_timer(0.1, lambda: self._install_quit_keybindings())
+
+    def _install_quit_keybindings(self) -> None:
+        """Temporarily listen for y/n/Esc after quit prompt."""
+        self._quit_key_handler_active = True
+
+    def on_key(self, event) -> None:
+        if not getattr(self, "_quit_key_handler_active", False):
+            return
+        key = event.key
+        if key == "y":
+            self._quit_key_handler_active = False
+            from .agent import kill_session
+            for s in self._pending_quit_sessions:
+                # Find matching project to call kill_session
+                for p in self.projects:
+                    if p.name == s["project"]:
+                        kill_session(p)
+                        break
+            self.notify("Sessions killed.", timeout=2)
+            self.set_timer(0.3, lambda: self.exit())
+            event.prevent_default()
+            event.stop()
+        elif key == "n":
+            self._quit_key_handler_active = False
+            self.exit()
+            event.prevent_default()
+            event.stop()
+        elif key == "escape":
+            self._quit_key_handler_active = False
+            self.notify("Quit cancelled.", timeout=2)
+            event.prevent_default()
+            event.stop()
+
     def on_unmount(self) -> None:
         # Stop dispatch timers
         for timer in self._dispatch_timers.values():

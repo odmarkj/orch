@@ -106,7 +106,9 @@ provision:
       echo 'eval "$(direnv hook bash)"' >> ~/.bashrc
 
       # ── Claude config dir (use host-mounted .claude so JSONL files are visible to host) ──
-      echo 'export CLAUDE_CONFIG_DIR=/Users/joshuaodmark/.claude' >> ~/.bashrc
+      # Must go in .bash_env (sourced from .profile) not .bashrc, because
+      # .bashrc has an interactive-only guard that blocks non-interactive shells.
+      echo 'export CLAUDE_CONFIG_DIR=/Users/joshuaodmark/.claude' >> ~/.bash_env
 
       # ── Docker group ──
       sudo usermod -aG docker "$USER"
