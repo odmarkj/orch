@@ -338,7 +338,7 @@ def _open_log_tab(project: Project) -> None:
     Open an iTerm2 tab running `orch logs <project>`.
     Reuses an existing log tab for this project if one is open.
     """
-    from .iterm import _load_config, _bring_tab_to_front, _run_iterm_script, _iterm_badge_cmd
+    from .iterm import _load_config, _tab_exists, _bring_tab_to_front, _run_iterm_script, _iterm_badge_cmd
 
     handle_file = project.claude_dir / "iterm_log_handle"
 
@@ -347,8 +347,12 @@ def _open_log_tab(project: Project) -> None:
 
     if handle_file.exists():
         tty = handle_file.read_text().strip()
-        if tty and _bring_tab_to_front(tty, expected_name=tab_name):
+        alive = _tab_exists(tty) if tty else False
+        if alive is True:
+            _bring_tab_to_front(tty)
             return
+        if alive is None:
+            return  # Check failed — keep handle, don't open duplicate
         handle_file.unlink(missing_ok=True)
 
     cfg          = _load_config()
@@ -398,7 +402,6 @@ def _build_iterm_tab_script(*, profile: str, dedicated: bool, window_title: str,
     if dedicated:
         return f"""
         tell application "iTerm2"
-            activate
             set orchWindow to missing value
             set isNewWindow to false
             set foundOrch to false
@@ -446,7 +449,6 @@ def _build_iterm_tab_script(*, profile: str, dedicated: bool, window_title: str,
     else:
         return f"""
         tell application "iTerm2"
-            activate
             set isNewWindow to false
             if (count of windows) is 0 then
                 try
@@ -770,10 +772,21 @@ class OrchApp(App):
         self._observer = Observer()
         watched = set()
         for p in self.projects:
-            target = str(p.path)
-            if target not in watched:
-                self._observer.schedule(handler, target, recursive=True)
-                watched.add(target)
+            # Only watch .claude/ dir (not the entire project tree).
+            # Watching whole project roots with recursive=True causes massive
+            # CPU usage because Docker virtiofs propagates every container
+            # file change to macOS FSEvents.
+            claude_dir = p.claude_dir
+            claude_dir.mkdir(parents=True, exist_ok=True)
+            claude_str = str(claude_dir)
+            if claude_str not in watched:
+                self._observer.schedule(handler, claude_str, recursive=False)
+                watched.add(claude_str)
+            # Also watch TODOS.md parent (project root) non-recursively
+            project_str = str(p.path)
+            if project_str not in watched:
+                self._observer.schedule(handler, project_str, recursive=False)
+                watched.add(project_str)
             # Watch JSONL session directories for this project
             for jdir in p.jsonl_dirs:
                 jdir_str = str(jdir)
@@ -836,10 +849,8 @@ class OrchApp(App):
                 question = changed.read_text().strip()
                 def _handle_input(p=project, q=question):
                     notify_input_needed(p, q)
-                    if container_is_running(p):
-                        exec_claude_in_iterm(p)
-                    # No fallback to host — notification is enough.
-                    # User can open a host session manually via keybinding.
+                    # Don't auto-open iTerm tabs — just notify.
+                    # User can open a session manually via keybinding.
 
                 self.run_worker(_handle_input, thread=True)
                 self._refresh_project_item(project)
@@ -891,8 +902,11 @@ class OrchApp(App):
         if changed.name in ("iterm_handle", "iterm_container_handle", "iterm_container_shell_handle", "iterm_log_handle"):
             return
 
-        # ── Auto-dispatch files: skip refresh loop ────────────────────────────
-        if changed.name in ("active_todo", "auto_dispatch"):
+        # ── Auto-dispatch / status files: skip refresh loop ───────────────────
+        # "status" is written by _write_status which already refreshes the UI;
+        # letting it re-enter here causes a feedback loop (JSONL → status write
+        # → file change → dispatch check → more timers).
+        if changed.name in ("active_todo", "auto_dispatch", "status"):
             return
 
         # ── General file change: status, todos, etc. ──────────────────────────
@@ -931,6 +945,8 @@ class OrchApp(App):
 
         Uses the waiting_for_input file as a dedup gate: only writes it if
         it doesn't already exist, so duplicate notifications are impossible.
+        Also derives a live status string and writes it to .claude/status
+        so the StatusPane always reflects what Claude is doing.
         """
         jsonl_path = Path(path)
         # Map JSONL directory back to project
@@ -947,12 +963,21 @@ class OrchApp(App):
         # (skip file-history-snapshot and progress noise)
         last_meaningful = None
         prev_assistant_text = None
+        last_tool_use = None
         for entry in reversed(entries):
             etype = entry.get("type")
             if etype in ("file-history-snapshot", "progress"):
                 continue
             if last_meaningful is None:
                 last_meaningful = entry
+            # Track last assistant entry with tool_use for status derivation
+            if etype == "assistant" and last_tool_use is None:
+                content = entry.get("message", {}).get("content", [])
+                if isinstance(content, list):
+                    for c in content:
+                        if isinstance(c, dict) and c.get("type") == "tool_use":
+                            last_tool_use = c.get("name", "")
+                            break
             # Also find the last assistant/text entry (may precede system entry)
             if (etype == "assistant" and prev_assistant_text is None):
                 content = entry.get("message", {}).get("content", [])
@@ -960,11 +985,9 @@ class OrchApp(App):
                     ctypes = [c.get("type") for c in content if isinstance(c, dict)]
                     if "text" in ctypes:
                         prev_assistant_text = entry
-                        break
                 elif isinstance(content, str):
                     prev_assistant_text = entry
-                    break
-            if last_meaningful and prev_assistant_text:
+            if last_meaningful and prev_assistant_text and last_tool_use is not None:
                 break
 
         if not last_meaningful:
@@ -973,6 +996,11 @@ class OrchApp(App):
         wfi = project.waiting_for_input_file
         etype = last_meaningful.get("type")
         subtype = last_meaningful.get("subtype", "")
+
+        # ── Derive live status from journal state ───────────────────────
+        status = self._derive_status(last_meaningful, last_tool_use)
+        if status:
+            self._write_status(project, status)
 
         # Turn complete: system/turn_duration follows assistant/text
         if etype == "system" and subtype == "turn_duration" and prev_assistant_text:
@@ -1008,6 +1036,76 @@ class OrchApp(App):
                     wfi.unlink()
                 except FileNotFoundError:
                     pass
+
+    # Tool name → human-readable action
+    _TOOL_LABELS = {
+        "Read":         "Reading files",
+        "Edit":         "Editing code",
+        "Write":        "Writing files",
+        "Bash":         "Running commands",
+        "Grep":         "Searching code",
+        "Glob":         "Finding files",
+        "Agent":        "Running subagent",
+        "WebFetch":     "Fetching web content",
+        "WebSearch":    "Searching the web",
+        "NotebookEdit": "Editing notebook",
+        "TodoWrite":    "Updating tasks",
+        "TaskCreate":   "Creating tasks",
+        "TaskUpdate":   "Updating tasks",
+    }
+
+    def _derive_status(self, last_entry: dict, last_tool: str | None) -> str:
+        """Derive a human-readable status string from the latest journal entry."""
+        etype = last_entry.get("type")
+        subtype = last_entry.get("subtype", "")
+
+        if etype == "system" and subtype == "turn_duration":
+            return "Waiting for input"
+
+        if etype == "system" and subtype == "stop_hook_summary":
+            return "Waiting for input"
+
+        if etype == "user":
+            return "Working"
+
+        if etype == "assistant":
+            content = last_entry.get("message", {}).get("content", [])
+            if isinstance(content, list):
+                # Check for tool_use in this entry
+                for c in content:
+                    if isinstance(c, dict) and c.get("type") == "tool_use":
+                        tool = c.get("name", "")
+                        return self._TOOL_LABELS.get(tool, f"Using {tool}")
+                # Check for thinking
+                for c in content:
+                    if isinstance(c, dict) and c.get("type") == "thinking":
+                        return "Thinking"
+                # Text-only assistant message
+                return "Responding"
+
+            # If we have a recent tool from a prior assistant entry
+            if last_tool:
+                return self._TOOL_LABELS.get(last_tool, f"Using {last_tool}")
+
+            return "Working"
+
+        return ""
+
+    def _write_status(self, project: Project, status: str) -> None:
+        """Write status to .claude/status and refresh the UI if it changed."""
+        status_file = project.status_file
+        try:
+            existing = status_file.read_text().strip()
+        except FileNotFoundError:
+            existing = ""
+        if existing == status:
+            return
+        status_file.parent.mkdir(parents=True, exist_ok=True)
+        status_file.write_text(status)
+        # Refresh the status pane from the main thread
+        self.call_from_thread(self._refresh_project_item, project)
+        if self.selected_project == project:
+            self.call_from_thread(self._refresh_panes)
 
     def _project_for_path(self, path: Path) -> Project | None:
         """Find the project that owns this path."""

@@ -142,11 +142,15 @@ def open_input_tab(project: Project) -> None:
     handle_file = project.claude_dir / "iterm_handle"
     project_name  = project.name
 
-    # Re-focus existing tab if the handle is still alive
+    # Focus existing tab if still alive — don't open duplicates
     if handle_file.exists():
         existing_tty = handle_file.read_text().strip()
-        if existing_tty and _bring_tab_to_front(existing_tty, expected_name=project_name):
+        alive = _tab_exists(existing_tty) if existing_tty else False
+        if alive is True:
+            _bring_tab_to_front(existing_tty)
             return
+        if alive is None:
+            return  # Check failed (e.g. problematic iTerm session) — keep handle, don't open duplicate
         # Handle is stale (tab was closed manually) — clean it up
         handle_file.unlink(missing_ok=True)
 
@@ -164,7 +168,6 @@ def open_input_tab(project: Project) -> None:
     if dedicated:
         script = f"""
         tell application "iTerm2"
-            activate
             set orchWindow to missing value
             set isNewWindow to false
             set foundOrch to false
@@ -216,7 +219,6 @@ def open_input_tab(project: Project) -> None:
     else:
         script = f"""
         tell application "iTerm2"
-            activate
             set isNewWindow to false
             if (count of windows) is 0 then
                 try
@@ -250,33 +252,83 @@ def open_input_tab(project: Project) -> None:
         handle_file.write_text(tty)
 
 
+def _tab_exists(tty: str) -> bool | None:
+    """
+    Check whether an iTerm2 session with the given tty still exists.
+    Does NOT activate or focus anything — purely a liveness check.
+
+    Returns True/False on success, or None if the check itself failed
+    (e.g. a stale/SSH session caused an AppleScript error).  Callers
+    should treat None as "unknown — don't delete the handle".
+    """
+    script = f"""
+    set found to false
+    tell application "iTerm2"
+        repeat with aWindow in windows
+            try
+                repeat with aTab in tabs of aWindow
+                    repeat with aSession in sessions of aTab
+                        try
+                            if tty of aSession is "{tty}" then
+                                set found to true
+                                exit repeat
+                            end if
+                        on error
+                            -- Session property access failed (SSH, stale, etc.) — skip
+                        end try
+                    end repeat
+                    if found then exit repeat
+                end repeat
+            on error
+                -- Window/tab reference went stale; skip this window
+            end try
+            if found then exit repeat
+        end repeat
+    end tell
+    return found
+    """
+    result = subprocess.run(
+        ["osascript", "-e", script],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None  # Script failed — don't assume tab is gone
+    return result.stdout.strip().lower() == "true"
+
+
 def _bring_tab_to_front(tty: str, expected_name: str | None = None) -> bool:
     """
     Focus the iTerm2 tab whose session matches tty.
     Returns True if found, False if the tab no longer exists.
 
-    If expected_name is given, the session's name must also contain it.
-    This prevents TTY-reuse collisions where the OS recycles a /dev/ttysXXX
-    and a stale handle accidentally matches a different project's tab.
+    Activates iTerm2 and selects the window/tab so the user sees it.
     """
-    if expected_name:
-        name_check = f'and name of aSession contains "{expected_name}"'
-    else:
-        name_check = ""
     script = f"""
     set found to false
     tell application "iTerm2"
         repeat with aWindow in windows
-            repeat with aTab in tabs of aWindow
-                repeat with aSession in sessions of aTab
-                    if tty of aSession is "{tty}" {name_check} then
-                        activate
-                        select aWindow
-                        tell aWindow to select aTab
-                        set found to true
-                    end if
+            try
+                repeat with aTab in tabs of aWindow
+                    repeat with aSession in sessions of aTab
+                        try
+                            if tty of aSession is "{tty}" then
+                                activate
+                                select aWindow
+                                tell aWindow to select aTab
+                                set found to true
+                                exit repeat
+                            end if
+                        on error
+                            -- Session property access failed — skip
+                        end try
+                    end repeat
+                    if found then exit repeat
                 end repeat
-            end repeat
+            on error
+                -- Window/tab reference went stale — skip
+            end try
+            if found then exit repeat
         end repeat
     end tell
     return found
@@ -305,7 +357,8 @@ def clear_stale_handle(project: Project) -> None:
         if not handle_file.exists():
             continue
         tty = handle_file.read_text().strip()
-        if not tty or not _bring_tab_to_front(tty):
+        alive = _tab_exists(tty) if tty else False
+        if alive is False:  # Confirmed gone — safe to remove (skip on None/error)
             handle_file.unlink(missing_ok=True)
 
 

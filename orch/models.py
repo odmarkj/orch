@@ -104,7 +104,8 @@ class Project:
 
     @property
     def has_devcontainer(self) -> bool:
-        return (self.path / ".devcontainer" / "devcontainer.json").is_file()
+        dc_dir = self.path / ".devcontainer"
+        return (dc_dir / "devcontainer.json").is_file() or (dc_dir / "orch" / "devcontainer.json").is_file()
 
     # ── Auto-dispatch properties ─────────────────────────────────────────────
 

@@ -663,6 +663,58 @@ def clear_stale_container(project: "Project") -> None:
 
 # ── Devcontainer CLI strategy ────────────────────────────────────────────────
 
+def _prepare_container_user_settings() -> Path | None:
+    """Filter host user-level settings.local.json for container use.
+
+    The host's ~/.claude/settings.local.json is inherited via bind mount,
+    but hooks referencing host-only paths (e.g. .curated-context) fail
+    inside containers.  Create a filtered copy at ~/.orch/ and return its
+    path so it can be shadow-mounted over the original.
+    """
+    host_settings = Path.home() / ".claude" / "settings.local.json"
+    if not host_settings.exists():
+        return None
+    try:
+        data = json.loads(host_settings.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    hooks = data.get("hooks", {})
+    if not hooks:
+        return None
+
+    # Signatures of host-only hooks that won't work in containers
+    _HOST_ONLY = (".curated-context",)
+
+    filtered_hooks: dict = {}
+    changed = False
+    for event, groups in hooks.items():
+        filtered_groups = []
+        for group in groups:
+            kept = [
+                h for h in group.get("hooks", [])
+                if not any(sig in h.get("command", "") for sig in _HOST_ONLY)
+            ]
+            if len(kept) != len(group.get("hooks", [])):
+                changed = True
+            if kept:
+                filtered_groups.append({**group, "hooks": kept})
+        if filtered_groups:
+            filtered_hooks[event] = filtered_groups
+
+    if not changed:
+        return None  # nothing to filter
+
+    filtered = {k: v for k, v in data.items() if k != "hooks"}
+    if filtered_hooks:
+        filtered["hooks"] = filtered_hooks
+
+    out_dir = Path.home() / ".orch"
+    out_dir.mkdir(exist_ok=True)
+    out = out_dir / "container-user-settings.json"
+    out.write_text(json.dumps(filtered, indent=2) + "\n")
+    return out
+
+
 def _mount_target(mount_str: str) -> str | None:
     """Extract the target path from a devcontainer mount string."""
     for part in mount_str.split(","):
@@ -674,36 +726,47 @@ def _mount_target(mount_str: str) -> str | None:
 
 def _prepare_devcontainer_config(project: "Project") -> Path:
     """
-    Prepare a devcontainer.json for the project, ready for `devcontainer up`.
+    Prepare a merged devcontainer config for the project.
 
     If the project has an existing .devcontainer/devcontainer.json, orch
     reads it and merges in its requirements (Claude config mount, env vars,
-    reference dirs).  The user's original config is backed up to
-    devcontainer.base.json so orch can re-merge from scratch each time
-    (picking up config changes like new reference_dirs).
+    reference dirs).  The merged result is written to
+    .devcontainer/devcontainer.orch.json — the user's devcontainer.json
+    is NEVER modified by orch.
 
-    If no project config exists, generates one from orch's template.
+    If no project config exists, generates one from orch's template
+    directly into devcontainer.orch.json.
 
-    In both cases the final config is written to the project's
-    .devcontainer/devcontainer.json — devcontainer CLI reliably reads
-    from there regardless of --config flags.
+    The devcontainer CLI is pointed at the .orch.json file via --config.
 
-    Returns the path to the config file.
+    Returns the path to the merged config file.
     """
     dc_dir = project.path / ".devcontainer"
     dc_json = dc_dir / "devcontainer.json"
+    orch_dir = dc_dir / "orch"
+    dc_orch = orch_dir / "devcontainer.json"
     dc_base = dc_dir / "devcontainer.base.json"
     cfg = _load_container_config()
 
-    if dc_base.exists() or dc_json.exists():
-        # ── Merge mode ──────────────────────────────────────────────
-        # Read from the base (user's original) if available,
-        # otherwise from the current devcontainer.json and save a backup.
-        if dc_base.exists():
-            config = json.loads(dc_base.read_text())
+    # ── Migration: undo the old base.json convention ────────────
+    # Previously orch copied devcontainer.json -> devcontainer.base.json
+    # and overwrote devcontainer.json with its merged output.  Restore
+    # the user's original if it was backed up.
+    if dc_base.exists():
+        if dc_json.exists():
+            # devcontainer.json is orch's merged output — replace with
+            # the user's original from base.
+            dc_json.write_text(dc_base.read_text())
         else:
-            config = json.loads(dc_json.read_text())
-            dc_base.write_text(json.dumps(config, indent=2) + "\n")
+            # No devcontainer.json at all — restore from base.
+            dc_base.rename(dc_json)
+        if dc_base.exists():
+            dc_base.unlink()
+
+    if dc_json.exists():
+        # ── Merge mode ──────────────────────────────────────────────
+        # Always read the user's devcontainer.json as the source of truth.
+        config = json.loads(dc_json.read_text())
 
         # Upgrade to pre-built image if using the default base image
         if config.get("image") == DEFAULT_IMAGE:
@@ -782,6 +845,20 @@ def _prepare_devcontainer_config(project: "Project") -> Path:
         if not has_claude_mount:
             merged_mounts.insert(0, claude_mount)
 
+        # Shadow user-level settings.local.json to filter out host-only hooks
+        # (e.g. curated-context) that fail inside containers.
+        filtered_settings = _prepare_container_user_settings()
+        if filtered_settings:
+            settings_target = f"{CONTAINER_HOME}/.claude/settings.local.json"
+            # Remove any existing shadow mount for this file
+            merged_mounts = [
+                m for m in merged_mounts
+                if _mount_target(m) != settings_target
+            ]
+            merged_mounts.append(
+                f"source={filtered_settings},target={settings_target},type=bind"
+            )
+
         # Forward host SSH agent into the container
         ssh = _ssh_agent_mount()
         if ssh:
@@ -832,11 +909,13 @@ def _prepare_devcontainer_config(project: "Project") -> Path:
                 config["postCreateCommand"] = " && ".join(parts)
         # If it's a list/object form, leave it alone — those are complex
 
-        dc_json.write_text(json.dumps(config, indent=2) + "\n")
-        return dc_json
+        orch_dir.mkdir(exist_ok=True)
+        dc_orch.write_text(json.dumps(config, indent=2) + "\n")
+        return dc_orch
 
     # ── Generate mode: no existing config ────────────────────────
     dc_dir.mkdir(exist_ok=True)
+    orch_dir.mkdir(exist_ok=True)
 
     config = dict(DEVCONTAINER_TEMPLATE)
     config["name"] = f"orch — {project.name}"
@@ -859,6 +938,13 @@ def _prepare_devcontainer_config(project: "Project") -> Path:
     if claude_json_file.exists():
         config["mounts"].append(
             f"source={claude_json_file},target={CONTAINER_HOME}/.claude.json,type=bind"
+        )
+
+    # Shadow user-level settings.local.json to filter out host-only hooks
+    filtered_settings = _prepare_container_user_settings()
+    if filtered_settings:
+        config["mounts"].append(
+            f"source={filtered_settings},target={CONTAINER_HOME}/.claude/settings.local.json,type=bind"
         )
 
     # Mount Wrangler config so Cloudflare CLI auth persists
@@ -887,15 +973,15 @@ def _prepare_devcontainer_config(project: "Project") -> Path:
             f"source={host},target={target},type=bind,readonly"
         )
 
-    dc_json.write_text(json.dumps(config, indent=2) + "\n")
-    return dc_json
+    dc_orch.write_text(json.dumps(config, indent=2) + "\n")
+    return dc_orch
 
 
 def _devcontainer_up(project: "Project") -> str:
     """Use devcontainer CLI to start container. Returns container ID."""
-    _prepare_devcontainer_config(project)
+    config_path = _prepare_devcontainer_config(project)
 
-    # Env vars are already in containerEnv within the devcontainer.json
+    # Env vars are already in containerEnv within the devcontainer.orch.json
     # written by _prepare_devcontainer_config — no need for --remote-env.
     env_args: list[str] = []
 
@@ -909,6 +995,7 @@ def _devcontainer_up(project: "Project") -> str:
     cmd = [
         "devcontainer", "up",
         "--workspace-folder", str(project.path),
+        "--config", str(config_path),
     ] + env_args
 
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
@@ -1665,143 +1752,53 @@ def exec_cmd(project: "Project") -> str:
 
 def exec_claude_in_iterm(project: "Project", with_shell: bool = False) -> None:
     """
-    Spin up a container (if needed) and open an iTerm2 tab running claude
-    inside it with full permissions.
+    Spin up a container (if needed) and open a NEW iTerm2 window with claude
+    running inside it.  Every invocation creates a fresh window — pressing
+    "c" multiple times gives multiple independent sessions.
 
     If with_shell is True, also opens a second tab with a plain bash shell
-    in the same window (single AppleScript call to guarantee same window).
+    in the same window.
     """
-    from .iterm import _load_config, _bring_tab_to_front
-
-    # Check existing Claude tab
-    tab_name = f"{project.name} (container)"
-    handle_file = project.claude_dir / "iterm_container_handle"
-    claude_exists = False
-    if handle_file.exists():
-        tty = handle_file.read_text().strip()
-        if tty and _bring_tab_to_front(tty, expected_name=tab_name):
-            claude_exists = True
-        else:
-            handle_file.unlink(missing_ok=True)
-
-    # Check existing shell tab
-    shell_exists = False
-    shell_tab_name = f"{project.name} (shell)"
-    shell_handle_file = project.claude_dir / "iterm_container_shell_handle"
-    if with_shell and shell_handle_file.exists():
-        tty = shell_handle_file.read_text().strip()
-        if tty and _bring_tab_to_front(tty, expected_name=shell_tab_name):
-            shell_exists = True
-        else:
-            shell_handle_file.unlink(missing_ok=True)
-
-    # Nothing to open
-    if claude_exists and (not with_shell or shell_exists):
-        return
+    from .iterm import _load_config, _applescript_quote, _run_iterm_script
 
     # Ensure container is running
     cid = ensure_running(project)
     _ensure_credentials_injected(cid)
     workdir = _container_workdir(cid, project)
 
-    need_claude = not claude_exists
-    need_shell = with_shell and not shell_exists
-
     cfg = _load_config()
     profile = cfg["iterm"].get("profile", "orch")
-    dedicated = cfg["iterm"].get("dedicated_window", True)
 
-    # Build commands — prepend iTerm2 badge escape sequence so the project
-    # name is always visible as a watermark, even if Claude changes the title
-    from .iterm import _applescript_quote
+    tab_name = f"{project.name} (container)"
     badge = _iterm_badge_cmd(project.name)
-    if need_claude:
-        args = _build_claude_args(project)
-        tenv = _terminal_env_flags()
-        claude_cmd = _applescript_quote(
-            f"{badge} && docker exec -it {tenv} -u {CONTAINER_USER} -w {workdir} {cid} claude {args}"
-        )
-    if need_shell:
+    args = _build_claude_args(project)
+    tenv = _terminal_env_flags()
+    claude_cmd = _applescript_quote(
+        f"{badge} && docker exec -it {tenv} -u {CONTAINER_USER} -w {workdir} {cid} claude {args}"
+    )
+
+    if with_shell:
+        shell_tab_name = f"{project.name} (shell)"
         shell_cmd = _applescript_quote(
             f"{badge} && docker exec -it -u {CONTAINER_USER} -w {workdir} {cid} bash"
         )
-
-    # ── Single-tab case (no shell, or shell already open) ────────────────
-    if need_claude and not need_shell:
-        script = _build_single_tab_script(
-            profile=profile, dedicated=dedicated,
-            tab_name=tab_name, cmd=claude_cmd,
-            badge=project.name,
-        )
-        from .iterm import _run_iterm_script
-        tty = _run_iterm_script(script)
-        if tty:
-            handle_file.write_text(tty)
-        return
-
-    if not need_claude and need_shell:
-        script = _build_single_tab_script(
-            profile=profile, dedicated=dedicated,
-            tab_name=shell_tab_name, cmd=shell_cmd,
-            badge=project.name,
-        )
-        from .iterm import _run_iterm_script
-        tty = _run_iterm_script(script)
-        if tty:
-            shell_handle_file.write_text(tty)
-        return
-
-    # ── Both tabs needed — single AppleScript, one window ────────────────
-    if dedicated:
+        # New window with Claude tab + shell tab
         script = f"""
         tell application "iTerm2"
-            activate
-            set orchWindow to missing value
-            set isNewWindow to false
-            set foundOrch to false
-            repeat with w in windows
-                if not foundOrch then
-                    try
-                        repeat with aTab in tabs of w
-                            if not foundOrch then
-                                repeat with aSession in sessions of aTab
-                                    if profile name of aSession is "{profile}" then
-                                        set orchWindow to w
-                                        set foundOrch to true
-                                        exit repeat
-                                    end if
-                                end repeat
-                            end if
-                        end repeat
-                    on error
-                        -- Window/tab reference went stale; skip it
-                    end try
-                end if
-            end repeat
-            if orchWindow is missing value then
-                try
-                    set orchWindow to (create window with profile "{profile}")
-                on error
-                    set orchWindow to (create window with default profile)
-                end try
-                set isNewWindow to true
-            end if
-            tell orchWindow
-                -- Claude tab (reuses the initial session if new window)
-                if not isNewWindow then
-                    try
-                        create tab with profile "{profile}"
-                    on error
-                        create tab with default profile
-                    end try
-                end if
+            try
+                set newWindow to (create window with profile "{profile}")
+            on error
+                set newWindow to (create window with default profile)
+            end try
+            tell newWindow
+                -- Claude tab (the initial session in the new window)
                 tell current session
                     set name to "{tab_name}"
                     set badge to "{project.name}"
                     write text {claude_cmd}
                     set claudeTty to tty
                 end tell
-                -- Shell tab (always a new tab)
+                -- Shell tab
                 try
                     create tab with profile "{profile}"
                 on error
@@ -1811,78 +1808,45 @@ def exec_claude_in_iterm(project: "Project", with_shell: bool = False) -> None:
                     set name to "{shell_tab_name}"
                     set badge to "{project.name}"
                     write text {shell_cmd}
-                    set shellTty to tty
                 end tell
                 -- Switch focus back to Claude tab
                 repeat with aTab in tabs
-                    repeat with aSession in sessions of aTab
-                        if tty of aSession is claudeTty then
-                            select aTab
-                        end if
-                    end repeat
+                    try
+                        repeat with aSession in sessions of aTab
+                            try
+                                if tty of aSession is claudeTty then
+                                    select aTab
+                                    exit repeat
+                                end if
+                            on error
+                            end try
+                        end repeat
+                    on error
+                    end try
                 end repeat
             end tell
-            return claudeTty & linefeed & shellTty
         end tell
         """
     else:
+        # New window with just a Claude tab
         script = f"""
         tell application "iTerm2"
-            activate
-            set isNewWindow to false
-            if (count of windows) is 0 then
-                try
-                    create window with profile "{profile}"
-                on error
-                    create window with default profile
-                end try
-                set isNewWindow to true
-            end if
-            tell current window
-                if not isNewWindow then
-                    try
-                        create tab with profile "{profile}"
-                    on error
-                        create tab with default profile
-                    end try
-                end if
+            try
+                set newWindow to (create window with profile "{profile}")
+            on error
+                set newWindow to (create window with default profile)
+            end try
+            tell newWindow
                 tell current session
                     set name to "{tab_name}"
                     set badge to "{project.name}"
                     write text {claude_cmd}
-                    set claudeTty to tty
                 end tell
-                try
-                    create tab with profile "{profile}"
-                on error
-                    create tab with default profile
-                end try
-                tell current session
-                    set name to "{shell_tab_name}"
-                    set badge to "{project.name}"
-                    write text {shell_cmd}
-                    set shellTty to tty
-                end tell
-                repeat with aTab in tabs
-                    repeat with aSession in sessions of aTab
-                        if tty of aSession is claudeTty then
-                            select aTab
-                        end if
-                    end repeat
-                end repeat
             end tell
-            return claudeTty & linefeed & shellTty
         end tell
         """
 
-    from .iterm import _run_iterm_script
-    result = _run_iterm_script(script)
-    if result:
-        parts = result.split("\n")
-        if len(parts) >= 1 and parts[0]:
-            handle_file.write_text(parts[0])
-        if len(parts) >= 2 and parts[1]:
-            shell_handle_file.write_text(parts[1])
+    _run_iterm_script(script)
 
 
 def _build_single_tab_script(*, profile: str, dedicated: bool,
@@ -1896,7 +1860,6 @@ def _build_single_tab_script(*, profile: str, dedicated: bool,
     if dedicated:
         return f"""
         tell application "iTerm2"
-            activate
             set orchWindow to missing value
             set isNewWindow to false
             set foundOrch to false
@@ -1948,7 +1911,6 @@ def _build_single_tab_script(*, profile: str, dedicated: bool,
     else:
         return f"""
         tell application "iTerm2"
-            activate
             set isNewWindow to false
             if (count of windows) is 0 then
                 try
@@ -1983,15 +1945,19 @@ def exec_shell_in_iterm(project: "Project") -> None:
     Open an iTerm2 tab with a plain bash shell inside the project's container.
     Ensures the container is running first.
     """
-    from .iterm import _load_config, _bring_tab_to_front
+    from .iterm import _load_config, _tab_exists, _bring_tab_to_front
 
-    # Reuse existing shell tab if open
+    # Reuse existing shell tab if open — focus it instead of opening a duplicate
     tab_name = f"{project.name} (shell)"
     handle_file = project.claude_dir / "iterm_container_shell_handle"
     if handle_file.exists():
         tty = handle_file.read_text().strip()
-        if tty and _bring_tab_to_front(tty, expected_name=tab_name):
+        alive = _tab_exists(tty) if tty else False
+        if alive is True:
+            _bring_tab_to_front(tty)
             return
+        if alive is None:
+            return  # Check failed — keep handle, don't open duplicate
         handle_file.unlink(missing_ok=True)
 
     # Ensure container is running
@@ -2011,7 +1977,6 @@ def exec_shell_in_iterm(project: "Project") -> None:
     if dedicated:
         script = f"""
         tell application "iTerm2"
-            activate
             set orchWindow to missing value
             set isNewWindow to false
             set foundOrch to false
@@ -2059,7 +2024,6 @@ def exec_shell_in_iterm(project: "Project") -> None:
     else:
         script = f"""
         tell application "iTerm2"
-            activate
             set isNewWindow to false
             if (count of windows) is 0 then
                 try
@@ -2123,7 +2087,6 @@ def _send_task_to_container(project: "Project", task: str) -> None:
     if dedicated:
         script = f"""
         tell application "iTerm2"
-            activate
             set orchWindow to missing value
             set isNewWindow to false
             set foundOrch to false
@@ -2168,7 +2131,6 @@ def _send_task_to_container(project: "Project", task: str) -> None:
     else:
         script = f"""
         tell application "iTerm2"
-            activate
             set isNewWindow to false
             if (count of windows) is 0 then
                 try
