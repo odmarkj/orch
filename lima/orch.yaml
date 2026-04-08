@@ -57,7 +57,7 @@ provision:
       apt-get update
       apt-get install -y \
         git curl wget build-essential tmux xclip jq unzip \
-        ca-certificates gnupg lsb-release software-properties-common
+        ca-certificates gnupg lsb-release software-properties-common unzip
 
       # ── Node.js 22 (for Claude Code) ──
       curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
@@ -104,6 +104,11 @@ provision:
 
       # ── direnv hook ──
       echo 'eval "$(direnv hook bash)"' >> ~/.bashrc
+
+      # ── Bun runtime (required by claude-mem plugin) ──
+      curl -fsSL https://bun.sh/install | bash
+      echo 'export BUN_INSTALL="$HOME/.bun"' >> ~/.bash_env
+      echo 'export PATH="$BUN_INSTALL/bin:$PATH"' >> ~/.bash_env
 
       # ── Claude config dir (use host-mounted .claude so JSONL files are visible to host) ──
       # Must go in .bash_env (sourced from .profile) not .bashrc, because

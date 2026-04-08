@@ -733,6 +733,12 @@ class OrchApp(App):
                     fire_first_session_hook(p)
                 elif was and not now:
                     fire_last_session_hook(p)
+                    # Clear stale status/state so the pane doesn't show old state
+                    try:
+                        p.status_file.unlink(missing_ok=True)
+                        p.waiting_for_input_file.unlink(missing_ok=True)
+                    except OSError:
+                        pass
             self._session_cache[p.name] = now
 
         if changed:

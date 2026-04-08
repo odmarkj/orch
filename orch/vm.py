@@ -99,22 +99,26 @@ def vm_exec(
     )
 
 
-def vm_ssh_cmd(cwd: str | Path | None = None, extra_cmd: str = "") -> str:
-    """Build an SSH command string for use in iTerm2 tabs.
+SSH_CONFIG = Path.home() / ".lima" / VM_NAME / "ssh.config"
 
-    Returns a command like: ssh -t lima-orch "cd /path && cmd"
-    This uses Lima's built-in SSH config.
+
+def vm_ssh_cmd(cwd: str | Path | None = None, extra_cmd: str = "") -> str:
+    """Build an SSH command string for interactive use in iTerm2 tabs.
+
+    Uses ssh -t with Lima's SSH config to force PTY allocation so that
+    terminal resize (SIGWINCH) propagates correctly to tmux/claude.
+    Skips login shell (-l) to avoid profile scripts that produce noisy
+    output; sources ~/.bash_env directly for needed env vars.
     """
-    inner_parts = []
+    ssh_base = f"ssh -t -F {shlex.quote(str(SSH_CONFIG))} lima-{VM_NAME}"
+    inner_parts = ["[ -f ~/.bash_env ] && . ~/.bash_env"]
     if cwd:
         inner_parts.append(f"cd {shlex.quote(str(cwd))}")
     if extra_cmd:
         inner_parts.append(extra_cmd)
 
-    if inner_parts:
-        inner = " && ".join(inner_parts)
-        return f"limactl shell {VM_NAME} -- bash -lc {shlex.quote(inner)}"
-    return f"limactl shell {VM_NAME}"
+    inner = " && ".join(inner_parts)
+    return f"{ssh_base} {shlex.quote(inner)}"
 
 
 def vm_ensure_running() -> None:
@@ -158,11 +162,16 @@ def sandbox_cmd(cmd: str, writable_dirs: list[str], *, scope: str | None = None)
         parts.append(f"mount --bind {qd} {qd}")
         parts.append(f"mount -o remount,bind,rw {qd}")
 
-    # Drop privileges with login shell so .profile loads env vars
+    # Drop privileges WITHOUT -l (login) flag.  su -l calls setsid()
+    # which creates a new session, detaching the child from the PTY's
+    # foreground process group — that breaks SIGWINCH delivery so
+    # terminal resize never reaches Claude.  Instead we source
+    # ~/.bash_env manually to pick up env vars (CLAUDE_CONFIG_DIR, etc.).
+    # su without -l still sets HOME, so ~ expands correctly.
     user = "$(logname 2>/dev/null || echo $SUDO_USER)"
     parts.append(
-        f"su -l -s /bin/bash {user} -c "
-        f"{shlex.quote(f'export SSH_AUTH_SOCK=$ORCH_SSH_SOCK; export TERM=$ORCH_TERM; export COLORTERM=truecolor; {cmd}')}"
+        f"su -s /bin/bash {user} -c "
+        f"{shlex.quote(f'[ -f ~/.bash_env ] && . ~/.bash_env; export SSH_AUTH_SOCK=$ORCH_SSH_SOCK; export TERM=$ORCH_TERM; export COLORTERM=truecolor; {cmd}')}"
     )
 
     inner = " && ".join(parts)

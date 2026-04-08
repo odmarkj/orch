@@ -159,7 +159,7 @@ class Project:
         the host-style encoding.
         """
         base = Path.home() / ".claude" / "projects"
-        host_dir = base / str(self.path).replace("/", "-").lstrip("-")
+        host_dir = base / str(self.path).replace("/", "-")
         dirs = []
         if host_dir.is_dir():
             dirs.append(host_dir)

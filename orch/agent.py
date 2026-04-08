@@ -23,17 +23,32 @@ if TYPE_CHECKING:
     from .models import Project
 
 
-# ── tmux session management ──────────────────────────────────────────────────
+# ── session management ───────────────────────────────────────────────────────
+
 
 def session_name(project: "Project") -> str:
-    """Canonical tmux session name for a project."""
+    """Canonical session/scope name for a project."""
     return f"orch-{project.name}"
 
 
 def session_exists(project: "Project") -> bool:
-    """Check if a tmux session exists for this project."""
+    """Check if a session is running for this project.
+
+    Checks PID file first (interactive SSH sessions), then
+    falls back to tmux (headless/dispatch sessions).
+    """
+    name = session_name(project)
+    # Check PID file (interactive sessions via SSH)
+    pid_file = f"/tmp/{name}.pid"
     result = vm_exec(
-        f"tmux has-session -t {shlex.quote(session_name(project))} 2>/dev/null",
+        f"[ -f {shlex.quote(pid_file)} ] && kill -0 $(cat {shlex.quote(pid_file)}) 2>/dev/null",
+        timeout=5,
+    )
+    if result.returncode == 0:
+        return True
+    # Fall back to tmux (headless sessions)
+    result = vm_exec(
+        f"tmux has-session -t {shlex.quote(name)} 2>/dev/null",
         timeout=10,
     )
     return result.returncode == 0
@@ -78,41 +93,26 @@ def start_session(project: "Project") -> str:
 
 
 def _kill_session_tree(name: str) -> None:
-    """Kill a tmux session and everything it spawned.
+    """Kill a session and everything it spawned.
 
-    The primary mechanism is stopping the systemd scope that sandbox_cmd()
-    creates — this kills every process in the scope, even daemonized ones.
-    The pane-PID cleanup is a fallback for sessions started before scopes
-    were introduced or if the scope somehow fails.
+    For interactive sessions: kill the process from the PID file and clean up.
+    For headless sessions: stop the systemd scope and/or tmux session.
     """
-    # 1. Stop the systemd scope — kills everything the session spawned
+    pid_file = f"/tmp/{name}.pid"
+    # 1. Kill interactive session via PID file
+    vm_exec(
+        f"[ -f {shlex.quote(pid_file)} ] && "
+        f"kill -TERM $(cat {shlex.quote(pid_file)}) 2>/dev/null; "
+        f"rm -f {shlex.quote(pid_file)}",
+        timeout=5,
+    )
+    # 2. Stop systemd scope (headless sessions)
     vm_exec(
         f"sudo systemctl stop {shlex.quote(name)}.scope 2>/dev/null",
         timeout=10,
     )
-
-    # 2. Get pane PIDs before destroying the tmux session (fallback)
-    result = vm_exec(
-        f"tmux list-panes -t {shlex.quote(name)} -F '#{{pane_pid}}' 2>/dev/null",
-        timeout=5,
-    )
-    pane_pids = []
-    if result.returncode == 0 and result.stdout.strip():
-        pane_pids = result.stdout.strip().splitlines()
-
-    # 3. Kill the tmux session
+    # 3. Kill any tmux session (headless/legacy)
     vm_exec(f"tmux kill-session -t {shlex.quote(name)} 2>/dev/null", timeout=10)
-
-    # 4. Kill any surviving processes from the pane tree (fallback)
-    for pid in pane_pids:
-        pid = pid.strip()
-        if pid.isdigit():
-            vm_exec(
-                f"sudo kill -- -$(ps -o pgid= -p {pid} | tr -d ' ') 2>/dev/null; "
-                f"sudo pkill -TERM -P {pid} 2>/dev/null; "
-                f"sudo kill -TERM {pid} 2>/dev/null",
-                timeout=5,
-            )
 
 
 def kill_session(project: "Project") -> bool:
@@ -131,27 +131,73 @@ def kill_session(project: "Project") -> bool:
 
 
 def list_sessions() -> list[dict]:
-    """List all orch tmux sessions inside the VM.
+    """List all orch sessions inside the VM.
 
-    Returns a list of dicts with 'name', 'created', 'attached' keys.
+    Checks both systemd scopes (interactive) and tmux sessions (headless).
+    Returns a list of dicts with 'name', 'project', 'created', 'attached' keys.
     """
+    seen: set[str] = set()
+    sessions: list[dict] = []
+
+    # Check PID files for interactive sessions.
+    # A session is "attached" if its process still has a controlling TTY
+    # (meaning the SSH connection is alive).  No TTY = SSH dropped.
+    result = vm_exec(
+        "ls /tmp/orch-*.pid 2>/dev/null",
+        timeout=5,
+    )
+    if result.returncode == 0:
+        for pid_path in result.stdout.strip().splitlines():
+            pid_path = pid_path.strip()
+            if not pid_path:
+                continue
+            # Extract name from /tmp/orch-{project}.pid
+            fname = pid_path.rsplit("/", 1)[-1]  # orch-project.pid
+            name = fname.removesuffix(".pid")     # orch-project
+            if not name.startswith("orch-"):
+                continue
+            # Check if PID is alive and has a TTY
+            pid_result = vm_exec(
+                f"cat {shlex.quote(pid_path)} 2>/dev/null",
+                timeout=5,
+            )
+            pid = pid_result.stdout.strip() if pid_result.returncode == 0 else ""
+            if not pid or not pid.isdigit():
+                continue
+            alive = vm_exec(f"kill -0 {pid} 2>/dev/null", timeout=5)
+            if alive.returncode != 0:
+                # Stale PID file — clean up
+                vm_exec(f"rm -f {shlex.quote(pid_path)} 2>/dev/null", timeout=5)
+                continue
+            # Check TTY to determine attached state
+            tty_result = vm_exec(f"ps -o tty= -p {pid} 2>/dev/null", timeout=5)
+            tty = tty_result.stdout.strip() if tty_result.returncode == 0 else ""
+            attached = bool(tty) and tty != "?"
+            seen.add(name)
+            sessions.append({
+                "name": name,
+                "project": name.removeprefix("orch-"),
+                "created": "",
+                "attached": attached,
+            })
+
+    # Also check tmux sessions (headless/dispatch)
     result = vm_exec(
         "tmux list-sessions -F '#{session_name}|#{session_created}|#{session_attached}' 2>/dev/null",
         timeout=10,
     )
-    if result.returncode != 0:
-        return []
+    if result.returncode == 0:
+        for line in result.stdout.strip().splitlines():
+            parts = line.split("|")
+            if len(parts) >= 3 and parts[0].startswith("orch-"):
+                if parts[0] not in seen:
+                    sessions.append({
+                        "name": parts[0],
+                        "project": parts[0].removeprefix("orch-"),
+                        "created": parts[1],
+                        "attached": parts[2] != "0",
+                    })
 
-    sessions = []
-    for line in result.stdout.strip().splitlines():
-        parts = line.split("|")
-        if len(parts) >= 3 and parts[0].startswith("orch-"):
-            sessions.append({
-                "name": parts[0],
-                "project": parts[0].removeprefix("orch-"),
-                "created": parts[1],
-                "attached": parts[2] != "0",
-            })
     return sessions
 
 

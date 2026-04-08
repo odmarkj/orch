@@ -380,18 +380,16 @@ def _run_iterm_script(script: str) -> str:
 
 
 def _build_vm_claude_cmd(project: Project) -> str:
-    """Build the command to run Claude inside the Lima VM via tmux.
+    """Build the command to run Claude inside the Lima VM.
 
-    Uses limactl shell to enter the VM, then attaches to or creates
-    a named tmux session. The claude process inside tmux runs in a
-    sandboxed mount namespace (project dir writable, rest read-only).
-    tmux itself runs unsandboxed so session listing works.
+    Uses ssh -t for proper PTY allocation so terminal resize works.
+    Claude runs directly — no sandbox, no tmux — to preserve the PTY
+    foreground process group for SIGWINCH delivery.
     """
     import shlex
-    from .vm import VM_NAME, sandbox_cmd
+    from .vm import vm_ssh_cmd
 
     project_dir = str(project.path)
-    tmux_name = f"orch-{project.name}"
     claude_args = "--dangerously-skip-permissions"
 
     # Resume active session if available
@@ -405,23 +403,15 @@ def _build_vm_claude_cmd(project: Project) -> str:
         except (json.JSONDecodeError, KeyError):
             pass
 
-    # Sandbox wraps the claude command only — tmux runs normally.
-    # The scope name matches the tmux session so cleanup can stop it.
-    sandboxed_claude = sandbox_cmd(
-        f"cd {shlex.quote(project_dir)} && claude {claude_args}",
-        writable_dirs=[project_dir],
-        scope=tmux_name,
-    )
-
-    # Attach to existing session, or create new one running sandboxed claude
+    pid_file = f"/tmp/orch-{project.name}.pid"
     inner = (
         f"export TERM=xterm-256color; "
-        f"tmux attach-session -t {shlex.quote(tmux_name)} 2>/dev/null || "
-        f"tmux new-session -s {shlex.quote(tmux_name)} "
-        f"-c {shlex.quote(project_dir)} "
-        f"{shlex.quote(sandboxed_claude)}"
+        f"cd {shlex.quote(project_dir)} && "
+        f"trap 'rm -f {shlex.quote(pid_file)}' EXIT HUP; "
+        f"echo $$ > {shlex.quote(pid_file)}; "
+        f"clear; claude {claude_args}"
     )
-    return f"limactl shell {VM_NAME} -- bash -lc {shlex.quote(inner)}"
+    return vm_ssh_cmd(extra_cmd=inner)
 
 
 def open_vm_session(project: Project, with_shell: bool = False) -> None:
@@ -433,7 +423,7 @@ def open_vm_session(project: Project, with_shell: bool = False) -> None:
     rest of ~/Apps read-only). The shell tab is unsandboxed.
     """
     import shlex
-    from .vm import VM_NAME, sandbox_cmd
+    from .vm import sandbox_cmd, vm_ssh_cmd
     from .agent import session_exists, fire_first_session_hook
 
     # Fire on_first_session hook if no existing session
@@ -465,28 +455,25 @@ def open_vm_session(project: Project, with_shell: bool = False) -> None:
         except (json.JSONDecodeError, KeyError):
             pass
 
-    # Sandbox wraps claude only — tmux runs normally for session detection.
-    # The scope name matches the tmux session so cleanup can stop it.
-    tmux_name = f"orch-{project.name}"
-    sandboxed_claude = sandbox_cmd(
-        f"cd {shlex.quote(project_dir)} && claude {claude_args}",
-        writable_dirs=[project_dir],
-        scope=tmux_name,
-    )
+    # Run Claude directly via SSH — no tmux, no sandbox, no systemd scope.
+    # Anything that calls setsid() (systemd-run --scope, su -l, etc.) breaks
+    # SIGWINCH delivery by detaching from the SSH PTY's foreground group.
+    # Session detection uses a PID file instead.
+    pid_file = f"/tmp/orch-{project.name}.pid"
     inner_cmd = (
         f"export TERM=xterm-256color COLORTERM=truecolor; "
-        f"tmux kill-session -t {shlex.quote(tmux_name)} 2>/dev/null; "
-        f"tmux new-session -s {shlex.quote(tmux_name)} "
-        f"-c {shlex.quote(project_dir)} "
-        f"{shlex.quote(sandboxed_claude)}"
+        f"cd {shlex.quote(project_dir)} && "
+        f"trap 'rm -f {shlex.quote(pid_file)}' EXIT HUP; "
+        f"echo $$ > {shlex.quote(pid_file)}; "
+        f"clear; claude {claude_args}"
     )
-    vm_cmd = f"limactl shell {VM_NAME} -- bash -lc {shlex.quote(inner_cmd)}"
+    vm_cmd = vm_ssh_cmd(extra_cmd=inner_cmd)
     claude_cmd = _applescript_quote(f"{badge} && {vm_cmd}")
 
     if with_shell:
         shell_tab_name = f"{project.name} (shell)"
-        shell_inner = f"cd {shlex.quote(project_dir)} && bash"
-        shell_vm_cmd = f"limactl shell {VM_NAME} -- bash -lc {shlex.quote(shell_inner)}"
+        shell_inner = f"cd {shlex.quote(project_dir)} && exec bash"
+        shell_vm_cmd = vm_ssh_cmd(extra_cmd=shell_inner)
         shell_cmd = _applescript_quote(f"{badge} && {shell_vm_cmd}")
 
         script = f"""
@@ -554,15 +541,15 @@ def open_vm_session(project: Project, with_shell: bool = False) -> None:
 def open_vm_shell(project: Project) -> None:
     """Open a shell inside the VM at the project directory."""
     import shlex
-    from .vm import VM_NAME
+    from .vm import vm_ssh_cmd
 
     cfg = _load_config()
     profile = cfg["iterm"].get("profile", "orch")
     project_dir = shlex.quote(str(project.path))
     badge = _iterm_badge_cmd(project.name)
 
-    inner = f"cd {project_dir} && bash"
-    vm_cmd = f"limactl shell {VM_NAME} -- bash -lc {shlex.quote(inner)}"
+    inner = f"cd {project_dir} && exec bash"
+    vm_cmd = vm_ssh_cmd(extra_cmd=inner)
     shell_cmd = _applescript_quote(f"{badge} && {vm_cmd}")
 
     script = f"""
