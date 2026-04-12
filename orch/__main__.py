@@ -14,6 +14,7 @@ orch CLI
   orch vm status                    Check VM status
   orch vm ssh                       SSH into the VM
   orch vm create                    Create the VM from template
+  orch init [dir]                   Bootstrap project for Claude Code
   orch ignore <project>              Hide project from orch
   orch ignore <project> --undo      Un-hide project
   orch setup                        First-time setup
@@ -306,6 +307,9 @@ def main() -> None:
         cmd_stage(argv[1:])
     elif sub in ("vm",):
         cmd_vm(argv[1:])
+    elif sub in ("init",):
+        from .init import cmd_init
+        cmd_init(argv[1:])
     elif sub in ("ignore",):
         cmd_ignore(argv[1:])
     elif sub in ("setup",):

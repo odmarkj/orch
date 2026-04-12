@@ -22,5 +22,18 @@ pyvenv.cfg
 # Generated devcontainer config (orch creates these dynamically)
 .devcontainer/
 
-# Orch local lifecycle (per-project, committed individually)
-# .orch/ is committed — it holds project.toml
+# Orch session state (ephemeral, not committed)
+.orch/status
+.orch/waiting_for_input
+.orch/pending_task
+.orch/active_todo
+.orch/auto_dispatch
+.orch/sessions.json
+.orch/iterm_handle
+.orch/iterm_log_handle
+.orch/bridge_request
+.orch/bridge_responses/
+.orch/bridge_requests/
+.orch/_bridge_depth
+.orch/bridge_result
+.orch/last_review.md

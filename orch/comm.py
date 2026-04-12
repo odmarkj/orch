@@ -54,7 +54,7 @@ CLARIFICATION_MARKER = "[NEEDS_CLARIFICATION]"
 # ── Parsing ──────────────────────────────────────────────────────────────────
 
 def parse_bridge_request(project: "Project") -> BridgeRequest | None:
-    """Read and validate ``.claude/bridge_request``. Returns None if invalid."""
+    """Read and validate ``.orch/bridge_request``. Returns None if invalid."""
     req_file = project.bridge_request_file
     if not req_file.exists():
         return None
@@ -117,19 +117,19 @@ def _build_bridge_prompt(request: BridgeRequest) -> str:
         "fix": [
             "- Make the requested code changes in this project",
             "- Save all changes. Do not commit or push.",
-            "- Write a brief summary of what you changed to .claude/bridge_result",
+            "- Write a brief summary of what you changed to .orch/bridge_result",
         ],
         "review": [
             "- Review the relevant code and provide feedback",
-            "- Write your review to .claude/bridge_result",
+            "- Write your review to .orch/bridge_result",
         ],
         "query": [
             "- Answer the question based on this project's code",
-            "- Write your answer to .claude/bridge_result",
+            "- Write your answer to .orch/bridge_result",
         ],
         "inform": [
             "- Read and acknowledge the information provided",
-            "- If any action is warranted, note it in .claude/bridge_result",
+            "- If any action is warranted, note it in .orch/bridge_result",
         ],
     }
 
@@ -193,7 +193,7 @@ def handle_bridge_request(
         vm_ensure_running()
 
         # Write bridge depth
-        depth_dir = worktree_path / ".claude"
+        depth_dir = worktree_path / ".orch"
         depth_dir.mkdir(parents=True, exist_ok=True)
         (depth_dir / "_bridge_depth").write_text(str(request.depth + 1))
 
@@ -224,7 +224,7 @@ def handle_bridge_request(
                 output = result.stdout.strip()
 
         # Read bridge_result file
-        result_file = worktree_path / ".claude" / "bridge_result"
+        result_file = worktree_path / ".orch" / "bridge_result"
         result_text = ""
         if result_file.exists():
             result_text = result_file.read_text().strip()
@@ -314,7 +314,7 @@ def _run_clarification(request: BridgeRequest, question: str) -> str:
 
 def _deliver_response(request: BridgeRequest, response: BridgeResponse) -> None:
     """Write response JSON to the source project's bridge_responses/."""
-    source_dir = request.source_path / ".claude" / "bridge_responses"
+    source_dir = request.source_path / ".orch" / "bridge_responses"
     source_dir.mkdir(parents=True, exist_ok=True)
     out = {
         "id": response.id, "source": response.source,
@@ -334,9 +334,9 @@ def _deliver_response(request: BridgeRequest, response: BridgeResponse) -> None:
 
 def _archive_request_file(request: BridgeRequest) -> None:
     """Move bridge_request to bridge_requests/<id>.json for audit."""
-    req_file = request.source_path / ".claude" / "bridge_request"
+    req_file = request.source_path / ".orch" / "bridge_request"
     if not req_file.exists():
         return
-    archive_dir = request.source_path / ".claude" / "bridge_requests"
+    archive_dir = request.source_path / ".orch" / "bridge_requests"
     archive_dir.mkdir(parents=True, exist_ok=True)
     req_file.rename(archive_dir / f"{request.id}.json")

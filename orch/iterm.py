@@ -3,7 +3,7 @@ iTerm2 integration and macOS notifications.
 
 Design contract:
   - Orch ONLY opens iTerm2 tabs, never closes them.
-  - Manual close by the user is always clean — the stale .claude/iterm_handle
+  - Manual close by the user is always clean — the stale .orch/iterm_handle
     file is silently ignored on next open.
   - When Claude resumes (deletes waiting_for_input), orch updates the dot.
     That's it. No tab management.
@@ -16,10 +16,25 @@ from __future__ import annotations
 
 import base64
 import json
+import shlex
 import subprocess
 from pathlib import Path
 
 from .models import Project
+
+
+# ── Orch system prompt file (injected via --append-system-prompt-file) ───────
+
+_ORCH_PROMPT_FILE = Path.home() / ".orch" / "system-prompt.md"
+
+
+def _orch_prompt_arg() -> str:
+    """Return the --append-system-prompt-file flag pointing to the orch prompt.
+
+    The file lives in ~/.orch/ which is mounted read-write inside the VM at
+    the same host path, so Claude can read it from either side.
+    """
+    return f"--append-system-prompt-file {shlex.quote(str(_ORCH_PROMPT_FILE))}"
 
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -140,7 +155,7 @@ def open_input_tab(project: Project) -> None:
     - Re-focuses an existing tab if one is already open for this project.
     - Never closes tabs — user owns that.
     """
-    handle_file = project.claude_dir / "iterm_handle"
+    handle_file = project.orch_dir / "iterm_handle"
     project_name  = project.name
 
     # Focus existing tab if still alive — don't open duplicates
@@ -351,7 +366,7 @@ def clear_stale_handle(project: Project) -> None:
         "iterm_log_handle",
     ]
     for name in handle_names:
-        handle_file = project.claude_dir / name
+        handle_file = project.orch_dir / name
         if not handle_file.exists():
             continue
         tty = handle_file.read_text().strip()
@@ -393,7 +408,7 @@ def _build_vm_claude_cmd(project: Project) -> str:
     claude_args = "--dangerously-skip-permissions"
 
     # Resume active session if available
-    sessions_file = project.claude_dir / "sessions.json"
+    sessions_file = project.orch_dir / "sessions.json"
     if sessions_file.exists():
         try:
             data = json.loads(sessions_file.read_text())
@@ -409,7 +424,7 @@ def _build_vm_claude_cmd(project: Project) -> str:
         f"cd {shlex.quote(project_dir)} && "
         f"trap 'rm -f {shlex.quote(pid_file)}' EXIT HUP; "
         f"echo $$ > {shlex.quote(pid_file)}; "
-        f"clear; claude {claude_args}"
+        f"clear; claude {claude_args} {_orch_prompt_arg()}"
     )
     return vm_ssh_cmd(extra_cmd=inner)
 
@@ -445,7 +460,7 @@ def open_vm_session(project: Project, with_shell: bool = False) -> None:
     claude_args = "--dangerously-skip-permissions"
 
     # Resume session if available
-    sessions_file = project.claude_dir / "sessions.json"
+    sessions_file = project.orch_dir / "sessions.json"
     if sessions_file.exists():
         try:
             data = json.loads(sessions_file.read_text())
@@ -465,7 +480,7 @@ def open_vm_session(project: Project, with_shell: bool = False) -> None:
         f"cd {shlex.quote(project_dir)} && "
         f"trap 'rm -f {shlex.quote(pid_file)}' EXIT HUP; "
         f"echo $$ > {shlex.quote(pid_file)}; "
-        f"clear; claude {claude_args}"
+        f"clear; claude {claude_args} {_orch_prompt_arg()}"
     )
     vm_cmd = vm_ssh_cmd(extra_cmd=inner_cmd)
     claude_cmd = _applescript_quote(f"{badge} && {vm_cmd}")

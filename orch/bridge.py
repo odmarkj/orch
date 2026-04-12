@@ -609,7 +609,7 @@ class OrchHandler(BaseHTTPRequestHandler):
             if not p or not task:
                 self._send_text("Missing project or task", 400)
                 return
-            pending = p.claude_dir / "pending_task"
+            pending = p.orch_dir / "pending_task"
             pending.write_text(task)
             self._send_json({"ok": True})
 

@@ -82,17 +82,28 @@ def vm_exec(
     timeout: int = 120,
     capture: bool = True,
 ) -> subprocess.CompletedProcess:
-    """Run a command inside the VM via limactl shell.
+    """Run a command inside the VM via direct SSH.
+
+    Uses the same SSH config as vm_ssh_cmd() to avoid limactl's stale
+    control-socket issues.  Sources ~/.bash_env (lightweight) instead of
+    a full login shell to keep execution fast.
 
     If *cwd* is given, the command runs in that directory.
     """
+    inner_parts = ["[ -f ~/.bash_env ] && . ~/.bash_env"]
     if cwd:
-        shell_cmd = f"cd {shlex.quote(str(cwd))} && {cmd}"
-    else:
-        shell_cmd = cmd
+        inner_parts.append(f"cd {shlex.quote(str(cwd))}")
+    inner_parts.append(cmd)
+    shell_cmd = " && ".join(inner_parts)
 
     return subprocess.run(
-        ["limactl", "shell", VM_NAME, "bash", "-lc", shell_cmd],
+        [
+            "ssh", "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=5",
+            "-F", str(SSH_CONFIG),
+            f"lima-{VM_NAME}",
+            shell_cmd,
+        ],
         capture_output=capture,
         text=True,
         timeout=timeout,
@@ -214,7 +225,13 @@ def vm_exec_sandboxed(
     sandboxed = sandbox_cmd(full_cmd, writable_dirs)
 
     return subprocess.run(
-        ["limactl", "shell", VM_NAME, "bash", "-lc", sandboxed],
+        [
+            "ssh", "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=5",
+            "-F", str(SSH_CONFIG),
+            f"lima-{VM_NAME}",
+            f"[ -f ~/.bash_env ] && . ~/.bash_env && {sandboxed}",
+        ],
         capture_output=capture,
         text=True,
         timeout=timeout,

@@ -64,7 +64,7 @@ def get_watch_paths(projects: list[Project]) -> list[Path]:
     """All paths the file watcher should monitor."""
     paths = []
     for p in projects:
-        paths.append(p.claude_dir)
+        paths.append(p.orch_dir)
         if p.todos_file.exists():
             paths.append(p.todos_file)
     return paths

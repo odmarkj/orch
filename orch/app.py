@@ -82,15 +82,14 @@ SESSION_ICON_OFF = "[dim]□[/]"
 
 
 class StatusFileHandler(FileSystemEventHandler):
-    """Watchdog handler — only fires for .claude/ files and TODOS.md."""
+    """Watchdog handler — only fires for .orch/ files and TODOS.md."""
 
     def __init__(self, callback: Callable[[str], None]):
         self._cb = callback
 
     @staticmethod
     def _relevant(path: str) -> bool:
-        """Only care about .claude/ contents and TODOS.md — ignore everything else."""
-        return "/.claude/" in path or path.endswith("/TODOS.md")
+        return "/.orch/" in path or path.endswith("/TODOS.md")
 
     def on_modified(self, event):
         if not event.is_directory and self._relevant(event.src_path):
@@ -236,7 +235,7 @@ class StatusPane(Static):
             self.update("[dim]No project selected[/]")
             return
 
-        # Status from .claude/status (written by JSONL journal handler or Claude)
+        # Status from .orch/status (written by JSONL journal handler or Claude)
         status = project.current_status
         indicator = project.status_indicator
         if status:
@@ -334,7 +333,7 @@ def _open_log_tab(project: Project) -> None:
     """
     from .iterm import _load_config, _tab_exists, _bring_tab_to_front, _run_iterm_script, _iterm_badge_cmd
 
-    handle_file = project.claude_dir / "iterm_log_handle"
+    handle_file = project.orch_dir / "iterm_log_handle"
 
     tab_name     = f"{project.name} logs"
     badge        = _iterm_badge_cmd(project.name)
@@ -823,16 +822,16 @@ class OrchApp(App):
         self._observer = Observer()
         watched = set()
         for p in self.projects:
-            # Only watch .claude/ dir (not the entire project tree).
+            # Only watch .orch/ dir (not the entire project tree).
             # Watching whole project roots with recursive=True causes massive
-            # CPU usage because Docker virtiofs propagates every container
-            # file change to macOS FSEvents.
-            claude_dir = p.claude_dir
-            claude_dir.mkdir(parents=True, exist_ok=True)
-            claude_str = str(claude_dir)
-            if claude_str not in watched:
-                self._observer.schedule(handler, claude_str, recursive=False)
-                watched.add(claude_str)
+            # CPU usage because virtiofs propagates every VM file change to
+            # macOS FSEvents.
+            orch_dir = p.orch_dir
+            orch_dir.mkdir(parents=True, exist_ok=True)
+            orch_str = str(orch_dir)
+            if orch_str not in watched:
+                self._observer.schedule(handler, orch_str, recursive=False)
+                watched.add(orch_str)
             # Also watch TODOS.md parent (project root) non-recursively
             project_str = str(p.path)
             if project_str not in watched:
@@ -866,7 +865,7 @@ class OrchApp(App):
             # watchdog may fire create+modify events for each write.  Without
             # a guard, rapid events can open duplicate iTerm windows.
             if p.name == "waiting_for_input" and p.exists():
-                proj_key = str(p.parent.parent)  # .claude -> project root
+                proj_key = str(p.parent.parent)  # .orch -> project root
                 now = time.monotonic()
                 with self._debounce_lock:
                     last = self._wfi_last_fired.get(proj_key, 0.0)
@@ -975,7 +974,7 @@ class OrchApp(App):
 
         Uses the waiting_for_input file as a dedup gate: only writes it if
         it doesn't already exist, so duplicate notifications are impossible.
-        Also derives a live status string and writes it to .claude/status
+        Also derives a live status string and writes it to .orch/status
         so the StatusPane always reflects what Claude is doing.
         """
         jsonl_path = Path(path)
@@ -1047,7 +1046,7 @@ class OrchApp(App):
                     text = " ".join(parts).strip()[-300:]
                 elif isinstance(content, str):
                     text = content.strip()[-300:]
-                # Ensure .claude/ dir exists and write the gate file.
+                # Ensure .orch/ dir exists and write the gate file.
                 # The existing StatusFileHandler watchdog will detect the
                 # creation and fire _handle_file_change → notify_input_needed.
                 wfi.parent.mkdir(parents=True, exist_ok=True)
@@ -1159,7 +1158,7 @@ class OrchApp(App):
         return ""
 
     def _write_status(self, project: Project, status: str) -> None:
-        """Write status to .claude/status and refresh the UI if it changed."""
+        """Write status to .orch/status and refresh the UI if it changed."""
         status_file = project.status_file
         try:
             existing = status_file.read_text().strip()
@@ -1299,7 +1298,7 @@ class OrchApp(App):
         if not p:
             self.notify("No project selected", severity="warning")
             return
-        p.claude_dir.mkdir(parents=True, exist_ok=True)
+        p.orch_dir.mkdir(parents=True, exist_ok=True)
         if p.auto_dispatch_enabled:
             p.auto_dispatch_file.unlink(missing_ok=True)
             # Cancel any pending dispatch timer
@@ -1721,7 +1720,7 @@ class OrchApp(App):
         new_content = content.replace(target, f"- [~] {todo_text}", 1)
         project.todos_file.write_text(new_content)
 
-        project.claude_dir.mkdir(parents=True, exist_ok=True)
+        project.orch_dir.mkdir(parents=True, exist_ok=True)
         project.active_todo_file.write_text(todo_text)
         return True
 

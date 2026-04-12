@@ -19,3 +19,6 @@ orch-setup = "orch.setup:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["orch*"]
+
+[tool.setuptools.package-data]
+orch = ["templates/**/*"]

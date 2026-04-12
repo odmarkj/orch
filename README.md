@@ -81,9 +81,9 @@ Everything runs on your machine. No cloud services, no CI dependency, no team in
 
 ### Live status monitoring
 
-Each project's Claude session writes a one-line status to `.claude/status` after every response. Orch watches these files via filesystem events — zero polling, instant updates. Status dots in the TUI show green (active), yellow (waiting for input), or dim (idle).
+Each project's Claude session writes a one-line status to `.orch/status` after every response. Orch watches these files via filesystem events — zero polling, instant updates. Status dots in the TUI show green (active), yellow (waiting for input), or dim (idle).
 
-When Claude needs input, it writes to `.claude/waiting_for_input`. Orch fires a macOS notification and opens an iTerm2 tab with the session already resumed. You answer, Claude continues, the file is deleted, the dot goes green.
+When Claude needs input, it writes to `.orch/waiting_for_input`. Orch fires a macOS notification and opens an iTerm2 tab with the session already resumed. You answer, Claude continues, the file is deleted, the dot goes green.
 
 ### VM execution environment
 
@@ -275,8 +275,8 @@ orch setup
 
 Add the contents of `CLAUDE_SNIPPET.md` to the `CLAUDE.md` of each project you want orch to track. This instructs Claude to:
 
-- Write a one-line status to `.claude/status` after every response
-- Write questions to `.claude/waiting_for_input` when it needs you
+- Write a one-line status to `.orch/status` after every response
+- Write questions to `.orch/waiting_for_input` when it needs you
 - Mark `TODOS.md` items as in-progress (`[~]`) and done (`[x]`)
 
 ### Configuration
@@ -357,13 +357,13 @@ Full TUI works on iPad via SSH. `orch plan` and `orch stage` work well on phone.
 
 | File | Purpose |
 |------|---------|
-| `~/Apps/<project>/.claude/status` | One-line live status, written by Claude |
-| `~/Apps/<project>/.claude/waiting_for_input` | Claude's question; triggers notification + iTerm2 tab |
-| `~/Apps/<project>/.claude/pending_task` | Task queued from orch, read by Claude |
-| `~/Apps/<project>/.claude/sessions.json` | `{"active": "<session-id>"}` for `--resume` |
-| `~/Apps/<project>/.claude/auto_dispatch` | Auto-dispatch enabled flag (existence = on) |
-| `~/Apps/<project>/.claude/active_todo` | Currently dispatched todo text |
-| `~/Apps/<project>/.claude/last_review.md` | Most recent code review output |
+| `~/Apps/<project>/.orch/status` | One-line live status, written by Claude |
+| `~/Apps/<project>/.orch/waiting_for_input` | Claude's question; triggers notification + iTerm2 tab |
+| `~/Apps/<project>/.orch/pending_task` | Task queued from orch, read by Claude |
+| `~/Apps/<project>/.orch/sessions.json` | `{"active": "<session-id>"}` for `--resume` |
+| `~/Apps/<project>/.orch/auto_dispatch` | Auto-dispatch enabled flag (existence = on) |
+| `~/Apps/<project>/.orch/active_todo` | Currently dispatched todo text |
+| `~/Apps/<project>/.orch/last_review.md` | Most recent code review output |
 | `~/Apps/<project>/TODOS.md` | Project todo list |
 | `~/Apps/<project>/.orch/project.toml` | Lifecycle stage, ledger, and per-project config |
 | `~/Apps/.orch-worktrees/` | Temporary worktrees for parallel dispatch |

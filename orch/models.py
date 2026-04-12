@@ -12,7 +12,7 @@ class Session:
 
     @property
     def status_file(self) -> Path:
-        return self.project_path / ".claude" / "status"
+        return self.project_path / ".orch" / "status"
 
     def refresh_status(self) -> bool:
         """Read status file. Returns True if status changed."""
@@ -42,12 +42,12 @@ class Project:
         return self.path / "TODOS.md"
 
     @property
-    def claude_dir(self) -> Path:
-        return self.path / ".claude"
+    def orch_dir(self) -> Path:
+        return self.path / ".orch"
 
     @property
     def status_file(self) -> Path:
-        return self.claude_dir / "status"
+        return self.orch_dir / "status"
 
     @property
     def current_status(self) -> str:
@@ -99,7 +99,7 @@ class Project:
 
     @property
     def active_todo_file(self) -> Path:
-        return self.claude_dir / "active_todo"
+        return self.orch_dir / "active_todo"
 
     @property
     def active_todo(self) -> str | None:
@@ -111,7 +111,7 @@ class Project:
 
     @property
     def auto_dispatch_file(self) -> Path:
-        return self.claude_dir / "auto_dispatch"
+        return self.orch_dir / "auto_dispatch"
 
     @property
     def auto_dispatch_enabled(self) -> bool:
@@ -167,7 +167,7 @@ class Project:
 
     @property
     def waiting_for_input_file(self) -> Path:
-        return self.claude_dir / "waiting_for_input"
+        return self.orch_dir / "waiting_for_input"
 
     # ── Per-project config ────────────────────────────────────────────────────
 
@@ -287,15 +287,15 @@ class Project:
 
     @property
     def bridge_request_file(self) -> Path:
-        return self.claude_dir / "bridge_request"
+        return self.orch_dir / "bridge_request"
 
     @property
     def bridge_responses_dir(self) -> Path:
-        return self.claude_dir / "bridge_responses"
+        return self.orch_dir / "bridge_responses"
 
     @property
     def bridge_requests_dir(self) -> Path:
-        return self.claude_dir / "bridge_requests"
+        return self.orch_dir / "bridge_requests"
 
     @property
     def has_pending_bridge_request(self) -> bool:
@@ -304,7 +304,7 @@ class Project:
     @property
     def bridge_depth(self) -> int:
         """Current bridge depth (0 = not in a bridge context)."""
-        depth_file = self.claude_dir / "_bridge_depth"
+        depth_file = self.orch_dir / "_bridge_depth"
         try:
             return int(depth_file.read_text().strip())
         except (FileNotFoundError, ValueError):

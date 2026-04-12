@@ -47,7 +47,7 @@ class ProjectSnapshot:
     launch_debt:      int
     pending_todos:    int
     todo_sample:      list[str]     # first 5 pending items
-    claude_status:    str           # current .claude/status
+    claude_status:    str           # current .orch/status
     recent_commits:   list[str]     # last 3 git log lines
     avg_days_stage:   float | None
 

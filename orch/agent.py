@@ -516,7 +516,7 @@ def run_task_in_worktree(project: "Project", todo_text: str) -> dict:
             results["review"] = review
 
             if review:
-                review_file = worktree_path / ".claude" / "last_review.md"
+                review_file = worktree_path / ".orch" / "last_review.md"
                 review_file.parent.mkdir(parents=True, exist_ok=True)
                 review_file.write_text(review)
 
@@ -564,7 +564,7 @@ def _build_claude_cmd(project: "Project") -> str:
     base = "claude --dangerously-skip-permissions"
 
     # Resume active session if available
-    sessions_file = project.claude_dir / "sessions.json"
+    sessions_file = project.orch_dir / "sessions.json"
     if sessions_file.exists():
         try:
             data = json.loads(sessions_file.read_text())
