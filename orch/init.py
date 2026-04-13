@@ -195,6 +195,11 @@ work. Load files loosely by topic area:
 Do not keyword-match specific sections. Match the *category* of the work to the
 *topic* of the file. Read the full file when the topic is relevant. These are
 guidance documents that inform your decisions \u2014 a compass, not a manual.
+
+IMPORTANT: Reference files describe patterns from other projects. Do NOT create
+new files, commands, hooks, or skills based on reference content unless the user
+explicitly asks you to. Use the content to inform decisions, not to generate
+project scaffolding unprompted.
 """
     claude_md.write_text(content)
     _ok("CLAUDE.md created")

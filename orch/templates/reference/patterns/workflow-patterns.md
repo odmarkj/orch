@@ -85,6 +85,10 @@ Hooks activate commands at lifecycle points in Claude's agentic loop.
 
 ## Slash Commands
 
+NOTE: These are reference patterns from other projects. Do NOT create slash
+commands unless the user explicitly asks for one. Reading this file is for
+understanding what exists in the ecosystem, not for creating new commands.
+
 Slash commands are markdown files in `.claude/commands/` that define reusable prompts.
 
 ### File Structure
