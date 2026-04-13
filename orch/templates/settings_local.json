@@ -36,7 +36,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"$CLAUDE_PROJECT_DIR/.curated-context/hooks/capture.js\"",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/.curated-context/hooks/capture.js\" && node \"$CLAUDE_PROJECT_DIR/.curated-context/hooks/capture.js\" || true",
             "timeout": 5000
           }
         ]
@@ -47,7 +47,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node \"$CLAUDE_PROJECT_DIR/.curated-context/hooks/process.js\"",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/.curated-context/hooks/process.js\" && node \"$CLAUDE_PROJECT_DIR/.curated-context/hooks/process.js\" || true",
             "timeout": 5000
           }
         ]
