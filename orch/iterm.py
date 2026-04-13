@@ -445,6 +445,10 @@ def open_vm_session(project: Project, with_shell: bool = False) -> None:
     if not session_exists(project):
         fire_first_session_hook(project)
 
+    # Update stack detection if stale (cheap, local-only)
+    from .agent import _maybe_update_stack_detection
+    _maybe_update_stack_detection(project)
+
     # Clear stale status from previous sessions
     try:
         project.status_file.write_text("Starting session")

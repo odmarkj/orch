@@ -255,6 +255,7 @@ def _generate_sibling_summaries(target: Path, exclude_name: str) -> None:
     from .discovery import discover_projects
     from .lifecycle import load
     from .models import Project
+    from .stack import detect_stack, stack_label
 
     projects = discover_projects()
 
@@ -265,32 +266,8 @@ def _generate_sibling_summaries(target: Path, exclude_name: str) -> None:
 
         lc = load(p)
 
-        # Detect tech stack from file markers
-        stack_parts = []
-        if (p.path / "package.json").is_file():
-            try:
-                pkg = json.loads((p.path / "package.json").read_text())
-                deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
-                if "next" in deps:
-                    stack_parts.append("Next.js")
-                elif "react" in deps:
-                    stack_parts.append("React")
-                elif "vue" in deps:
-                    stack_parts.append("Vue")
-                if "typescript" in deps:
-                    stack_parts.append("TypeScript")
-                if not stack_parts:
-                    stack_parts.append("Node.js")
-            except (json.JSONDecodeError, OSError):
-                stack_parts.append("Node.js")
-        if (p.path / "pyproject.toml").is_file():
-            stack_parts.append("Python")
-        if (p.path / "Cargo.toml").is_file():
-            stack_parts.append("Rust")
-        if (p.path / "go.mod").is_file():
-            stack_parts.append("Go")
-
-        stack = ", ".join(stack_parts) if stack_parts else "unknown"
+        result = detect_stack(p.path)
+        stack = stack_label(result["tags"])
 
         # Get purpose from description or first meaningful line of CLAUDE.md
         purpose = lc.description

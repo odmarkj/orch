@@ -71,6 +71,9 @@ def start_session(project: "Project") -> str:
     # First session → fire hook before creating
     fire_first_session_hook(project)
 
+    # Update stack detection if stale (cheap, local-only)
+    _maybe_update_stack_detection(project)
+
     claude_cmd = _build_claude_cmd(project)
     project_dir = str(project.path)
 
@@ -228,6 +231,41 @@ def fire_last_session_hook(project: "Project") -> None:
     hook = project.on_last_session_hook
     if hook:
         run_session_hook(project, hook)
+
+
+def _maybe_update_stack_detection(project: "Project") -> None:
+    """Write .claude-docs/project-stack.md if missing or stale (>24h).
+
+    This is a cheap local-only operation (file reads), safe to run on
+    every session start. It tells Claude which best-practices files to
+    prioritize based on the project's detected tech stack.
+    """
+    import os
+    from datetime import datetime, timedelta
+
+    stack_file = project.path / ".claude-docs" / "project-stack.md"
+    docs_dir = project.path / ".claude-docs"
+
+    # Skip if .claude-docs/ doesn't exist (project not init'd with orch)
+    if not docs_dir.is_dir():
+        return
+
+    # Only regenerate if missing or older than 24 hours
+    if stack_file.exists():
+        try:
+            mtime = datetime.fromtimestamp(os.path.getmtime(stack_file))
+            if datetime.now() - mtime < timedelta(hours=24):
+                return
+        except OSError:
+            pass
+
+    try:
+        from .stack import generate_project_stack_md
+        content = generate_project_stack_md(project.path)
+        if content:
+            stack_file.write_text(content)
+    except Exception:
+        pass  # Never let detection failure block a session
 
 
 # ── Headless Claude execution ────────────────────────────────────────────────
