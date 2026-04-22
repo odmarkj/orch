@@ -635,6 +635,9 @@ class OrchApp(App):
         self._debounce_delay: float = 0.3  # seconds
         self._wfi_last_fired: dict[str, float] = {}  # per-project cooldown for waiting_for_input
         self._wfi_cooldown: float = 3.0  # seconds — suppress duplicate iTerm opens
+        # Bridge request tracking: project names currently being processed
+        self._active_bridges: set[str] = set()
+        self._active_bridges_lock = threading.Lock()
         # JSONL journal watcher state
         self._journal_debounce_timers: dict[str, threading.Timer] = {}
         self._journal_debounce_delay: float = 0.5  # seconds — short debounce for live status
@@ -677,10 +680,19 @@ class OrchApp(App):
             self.query_one("#project-list", ListView).focus()
         # Check if we should start in mobile mode
         self._check_mobile(self.size.width)
-        # Refresh session state periodically (every 5 seconds)
-        self.set_interval(5.0, self._refresh_session_cache)
+        # Refresh session state periodically. Each refresh fires `vm_exec ls`
+        # plus one `_kill_session_tree` (3 vm_exec calls) per detached session;
+        # at 5s this generated a steady drip of fresh SSH connections that
+        # contended with interactive claude sessions for VM IO. 15s is plenty
+        # responsive for the sidebar — watchdog handles real-time updates.
+        self.set_interval(15.0, self._refresh_session_cache)
         # Initial session cache population
         self.run_worker(self._do_refresh_session_cache, thread=True)
+        # Scan for queued bridge requests left over from before startup
+        # (FSEvents from VM-side virtiofs writes are unreliable). Also poll
+        # periodically as a belt over the watchdog suspenders.
+        self._scan_pending_bridges()
+        self.set_interval(25.0, self._scan_pending_bridges)
 
     def _refresh_session_cache(self) -> None:
         """Trigger a background refresh of session state via tmux capture."""
@@ -1804,8 +1816,35 @@ class OrchApp(App):
 
     # ── Bridge handlers ────────────────────────────────────────────────────
 
+    def _scan_pending_bridges(self) -> None:
+        """Scan all projects for queued or stale-in-flight bridge requests.
+
+        Runs on startup and periodically (every 25s) to catch requests the
+        watchdog missed — most often because the write came from the VM via
+        virtiofs, which doesn't reliably fire macOS FSEvents.
+
+        Skips projects with a bridge already in flight (tracked in-memory)
+        so the periodic poll doesn't resurrect a ``.processing`` file that
+        an active worker is handling.
+        """
+        for p in self.projects:
+            with self._active_bridges_lock:
+                if p.name in self._active_bridges:
+                    continue
+            if p.bridge_request_file.exists() or p.bridge_processing_file.exists():
+                self._handle_bridge_request(p)
+
     def _handle_bridge_request(self, source_project: Project) -> None:
-        """Handle a bridge_request file created by an agent."""
+        """Handle a bridge_request file created by an agent.
+
+        First atomically claims the request by renaming
+        ``bridge_request`` → ``bridge_request.processing``. This makes
+        duplicate watchdog fires (and periodic-poll double-detections) safe:
+        the loser of the rename race gets FileNotFoundError and returns.
+
+        If a stale ``.processing`` file exists from a crashed prior run and
+        no fresh request is present, we reprocess the stale one.
+        """
         from .comm import (
             parse_bridge_request,
             handle_bridge_request,
@@ -1813,15 +1852,48 @@ class OrchApp(App):
             BridgeResponse,
             _deliver_response,
             _archive_request_file,
+            log_bridge,
         )
+
+        # Skip if a worker is already processing this project's request.
+        # Guards against duplicate watchdog fires and periodic-poll overlap.
+        with self._active_bridges_lock:
+            if source_project.name in self._active_bridges:
+                return
+
+        orch_dir = source_project.orch_dir
+        req_path = orch_dir / "bridge_request"
+        proc_path = orch_dir / "bridge_request.processing"
+
+        if req_path.exists():
+            try:
+                req_path.rename(proc_path)
+                log_bridge(f"CLAIM {source_project.name} (rename → .processing)")
+            except FileNotFoundError:
+                return
+            except OSError as e:
+                log_bridge(f"CLAIM_ERROR {source_project.name}: {e!r}")
+                self.notify(
+                    f"Bridge: claim failed for {source_project.name}: {e}",
+                    severity="error",
+                )
+                return
+        elif not proc_path.exists():
+            return
+        else:
+            log_bridge(f"REPROCESS {source_project.name} (stale .processing found)")
 
         request = parse_bridge_request(source_project)
         if not request:
+            log_bridge(f"INVALID {source_project.name} (parse failed)")
             self.notify(
                 f"Bridge: invalid request from {source_project.name}",
                 severity="warning",
             )
             return
+
+        with self._active_bridges_lock:
+            self._active_bridges.add(source_project.name)
 
         # Depth limit
         if request.depth > MAX_BRIDGE_DEPTH:
@@ -1864,6 +1936,8 @@ class OrchApp(App):
         request,
         response,
     ) -> None:
+        with self._active_bridges_lock:
+            self._active_bridges.discard(source.name)
         status_icon = "✓" if response.status == "completed" else "✗"
         truncated = request.summary[:40] + ("…" if len(request.summary) > 40 else "")
         msg = f"Bridge {status_icon}: {truncated} → {response.status}"
@@ -1879,6 +1953,8 @@ class OrchApp(App):
     ) -> None:
         from .comm import BridgeResponse, _deliver_response, _archive_request_file
 
+        with self._active_bridges_lock:
+            self._active_bridges.discard(source.name)
         self.notify(
             f"Bridge failed: {request.summary[:40]} — {error}",
             severity="error",

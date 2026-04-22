@@ -11,11 +11,28 @@ import json
 import random
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .models import Project
+
+
+# ── Logging ──────────────────────────────────────────────────────────────────
+
+_BRIDGE_LOG = Path.home() / ".orch" / "logs" / "bridge.log"
+
+
+def log_bridge(message: str) -> None:
+    """Append a timestamped line to ~/.orch/logs/bridge.log. Best-effort."""
+    try:
+        _BRIDGE_LOG.parent.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().isoformat(timespec="seconds")
+        with _BRIDGE_LOG.open("a") as f:
+            f.write(f"{ts} {message}\n")
+    except OSError:
+        pass
 
 
 # ── Data structures ──────────────────────────────────────────────────────────
@@ -54,8 +71,16 @@ CLARIFICATION_MARKER = "[NEEDS_CLARIFICATION]"
 # ── Parsing ──────────────────────────────────────────────────────────────────
 
 def parse_bridge_request(project: "Project") -> BridgeRequest | None:
-    """Read and validate ``.orch/bridge_request``. Returns None if invalid."""
-    req_file = project.bridge_request_file
+    """Read and validate the claimed ``.orch/bridge_request.processing`` file.
+
+    The TUI atomically renames ``bridge_request`` → ``bridge_request.processing``
+    as the first step of handling to claim the request and prevent duplicate
+    fires from rapid watchdog events. Falls back to ``bridge_request`` if the
+    processing file is absent (e.g. tests or direct invocation).
+    """
+    req_file = project.bridge_processing_file
+    if not req_file.exists():
+        req_file = project.bridge_request_file
     if not req_file.exists():
         return None
 
@@ -164,6 +189,11 @@ def handle_bridge_request(
     )
     from .vm import vm_ensure_running
 
+    log_bridge(
+        f"START id={request.id} {request.source_project} → {request.target} "
+        f"intent={request.intent} summary={request.summary[:60]!r}"
+    )
+
     # 1. Find target
     target = None
     for p in all_projects:
@@ -172,6 +202,7 @@ def handle_bridge_request(
             break
 
     if target is None:
+        log_bridge(f"FAIL  id={request.id} target project '{request.target}' not found")
         resp = BridgeResponse(
             id=request.id, source=request.source_project,
             target=request.target, intent=request.intent,
@@ -271,6 +302,7 @@ def handle_bridge_request(
         )
 
     except Exception as exc:
+        log_bridge(f"FAIL  id={request.id} exception: {exc!r}")
         resp = BridgeResponse(
             id=request.id, source=request.source_project,
             target=request.target, intent=request.intent,
@@ -287,6 +319,10 @@ def handle_bridge_request(
 
     _deliver_response(request, resp)
     _archive_request_file(request)
+    log_bridge(
+        f"END   id={request.id} status={resp.status} "
+        f"pr={resp.pr_url or '-'} branch={resp.branch or '-'}"
+    )
     return resp
 
 
@@ -333,10 +369,17 @@ def _deliver_response(request: BridgeRequest, response: BridgeResponse) -> None:
 
 
 def _archive_request_file(request: BridgeRequest) -> None:
-    """Move bridge_request to bridge_requests/<id>.json for audit."""
-    req_file = request.source_path / ".orch" / "bridge_request"
+    """Move the claimed request file to bridge_requests/<id>.json for audit.
+
+    Prefers ``bridge_request.processing`` (the claim marker); falls back to
+    ``bridge_request`` for compatibility.
+    """
+    orch_dir = request.source_path / ".orch"
+    req_file = orch_dir / "bridge_request.processing"
+    if not req_file.exists():
+        req_file = orch_dir / "bridge_request"
     if not req_file.exists():
         return
-    archive_dir = request.source_path / ".orch" / "bridge_requests"
+    archive_dir = orch_dir / "bridge_requests"
     archive_dir.mkdir(parents=True, exist_ok=True)
     req_file.rename(archive_dir / f"{request.id}.json")

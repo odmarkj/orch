@@ -1,3 +1,5 @@
 Create a bridge between two claude sessions in different projects, so that they can talk to each other through orch.
 
 Here is more information on this feature: https://claude.ai/chat/b1ecba76-4178-46ad-a9b7-a29e461459dd
+
+- [ ] Replace file-based bridge signaling with host-side IPC so agents don't rely on FSEvents at all. Today the TUI relies on watchdog + a 25s poll + an atomic claim-rename to work around virtiofs → macOS FSEvents dropping VM-originated create events. That's reliable enough, but has up to ~25s latency on the poll fallback and a layer of complexity (claim-rename, active-bridge set, stale `.processing` recovery) that all exists only to paper over the FSEvents gap. A proper fix: expose an `orch bridge submit <file>` CLI (or a Unix socket) callable from inside the VM that directly notifies the TUI. Agents would write their request and then invoke the CLI; the TUI gets an immediate, reliable signal. Once in place, the poll/claim scaffolding can be removed (or kept as a fallback, see `project_virtiofs_fsevents_unreliable.md`).

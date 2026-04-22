@@ -290,6 +290,10 @@ class Project:
         return self.orch_dir / "bridge_request"
 
     @property
+    def bridge_processing_file(self) -> Path:
+        return self.orch_dir / "bridge_request.processing"
+
+    @property
     def bridge_responses_dir(self) -> Path:
         return self.orch_dir / "bridge_responses"
 
