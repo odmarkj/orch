@@ -24,12 +24,16 @@ mounts:
     writable: true
   - location: "~/.claude"
     writable: true
-  - location: "~/.claude.json"
-    writable: true
+  # Note: ~/.claude.json is a file, not a directory, so virtiofs can't mount it.
+  # The VM instead uses CLAUDE_CONFIG_DIR=/Users/joshuaodmark/.claude (set in
+  # provisioning below), which causes Claude Code to read/write
+  # ~/.claude/.claude.json instead — that IS mounted, so host and VM share state.
   - location: "~/.ssh"
     writable: false
   - location: "~/.orch"
     writable: true
+  - location: "~/Screenshots"
+    writable: false
 
 mountType: virtiofs
 
@@ -87,8 +91,21 @@ provision:
       apt-get update
       apt-get install -y gh
 
-      # ── k3s ──
+      # ── Shared native services (PostgreSQL 17 + pgvector, Redis) ──
+      # Delegated to an idempotent script so it can be re-run against
+      # existing VMs (new services added later won't require a VM rebuild).
+      bash /Users/joshuaodmark/Apps/orch/lima/provision-services.sh
+
+      # ── k3s (provides kubectl as /usr/local/bin/kubectl symlink) ──
       curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--write-kubeconfig-mode 644" sh -
+
+      # ── Tailscale ──
+      curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg \
+        -o /usr/share/keyrings/tailscale-archive-keyring.gpg
+      curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.tailscale-keyring.list \
+        -o /etc/apt/sources.list.d/tailscale.list
+      apt-get update
+      apt-get install -y tailscale
 
       # ── VNC (optional GUI) ──
       apt-get install -y tigervnc-standalone-server || true

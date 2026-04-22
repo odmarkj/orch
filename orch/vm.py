@@ -100,6 +100,7 @@ def vm_exec(
         [
             "ssh", "-o", "BatchMode=yes",
             "-o", "ConnectTimeout=5",
+            *_MUX_OPTS,
             "-F", str(SSH_CONFIG),
             f"lima-{VM_NAME}",
             shell_cmd,
@@ -112,16 +113,40 @@ def vm_exec(
 
 SSH_CONFIG = Path.home() / ".lima" / VM_NAME / "ssh.config"
 
+# SSH multiplexing — short-lived vm_exec calls (the 15s session-cache poller
+# fires several per cycle) reuse a single TCP/SSH session rather than paying
+# the full handshake every time. Without this, the orch TUI generates a
+# steady stream of sshd-spawns inside the VM that compete with interactive
+# claude sessions for virtiofs/IO bandwidth and contribute to keystroke lag.
+_CONTROL_PATH = f"/tmp/orch-ssh-{VM_NAME}-%C"
+_MUX_OPTS = [
+    "-o", "ControlMaster=auto",
+    "-o", f"ControlPath={_CONTROL_PATH}",
+    "-o", "ControlPersist=10m",
+]
+
 
 def vm_ssh_cmd(cwd: str | Path | None = None, extra_cmd: str = "") -> str:
     """Build an SSH command string for interactive use in iTerm2 tabs.
 
     Uses ssh -t with Lima's SSH config to force PTY allocation so that
-    terminal resize (SIGWINCH) propagates correctly to tmux/claude.
+    terminal resize (SIGWINCH) propagates correctly to claude.
     Skips login shell (-l) to avoid profile scripts that produce noisy
     output; sources ~/.bash_env directly for needed env vars.
+
+    Interactive sessions intentionally do NOT use the ControlMaster mux —
+    multiplexing a long-lived PTY session through a shared control channel
+    can cause one tab's traffic (and SIGWINCH) to bleed into another. The
+    background vm_exec callers use the mux; the user-facing iTerm tab gets
+    its own dedicated connection.
     """
-    ssh_base = f"ssh -t -F {shlex.quote(str(SSH_CONFIG))} lima-{VM_NAME}"
+    # Force a dedicated connection (ControlMaster=no) so this PTY session
+    # never piggybacks on the background vm_exec multiplexer — sharing would
+    # let one tab's SIGWINCH or disconnect cascade into others.
+    ssh_base = (
+        f"ssh -t -o ControlMaster=no -o ControlPath=none "
+        f"-F {shlex.quote(str(SSH_CONFIG))} lima-{VM_NAME}"
+    )
     inner_parts = ["[ -f ~/.bash_env ] && . ~/.bash_env"]
     if cwd:
         inner_parts.append(f"cd {shlex.quote(str(cwd))}")
@@ -228,6 +253,7 @@ def vm_exec_sandboxed(
         [
             "ssh", "-o", "BatchMode=yes",
             "-o", "ConnectTimeout=5",
+            *_MUX_OPTS,
             "-F", str(SSH_CONFIG),
             f"lima-{VM_NAME}",
             f"[ -f ~/.bash_env ] && . ~/.bash_env && {sandboxed}",

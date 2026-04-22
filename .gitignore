@@ -37,3 +37,6 @@ pyvenv.cfg
 .orch/_bridge_depth
 .orch/bridge_result
 .orch/last_review.md
+
+# Database dumps (large, local only)
+data-dumps/
