@@ -191,6 +191,8 @@ orch vm stop                        # Stop the Lima VM
 orch vm status                      # Check VM status
 orch vm ssh                         # SSH into the VM
 orch vm create                      # Create VM from template
+orch init [dir]                     # Bootstrap a project for Claude + orch
+orch init --name NAME --stage mvp   # With options (see Bootstrapping below)
 orch ignore <project>               # Hide project from orch
 orch ignore <project> --undo        # Un-hide project
 orch setup                          # First-time setup
@@ -278,6 +280,42 @@ Add the contents of `CLAUDE_SNIPPET.md` to the `CLAUDE.md` of each project you w
 - Write a one-line status to `.orch/status` after every response
 - Write questions to `.orch/waiting_for_input` when it needs you
 - Mark `TODOS.md` items as in-progress (`[~]`) and done (`[x]`)
+
+### Bootstrapping a project with `orch init`
+
+`orch init` is a one-shot bootstrapper for a new (or existing) project directory. It drops in everything a Claude Code session and orch expect — a CLAUDE.md with the status/bridge protocol already written out, sensible `.claude/` settings, a reference library, lifecycle tracking, and a snapshot of your other orch-managed projects.
+
+```bash
+cd ~/Apps/my-new-project
+orch init --description "What this project does"
+
+# Or from anywhere, targeting a directory that may not exist yet:
+orch init ~/Apps/another-project --name another-project --stage idea
+```
+
+**What it creates** (all additive — existing files are never overwritten):
+
+| Path | Purpose |
+|------|---------|
+| `.git/` + `.gitignore` | Initialized with orch state files already ignored |
+| `CLAUDE.md` | Memory protocol, `.orch/status`/`waiting_for_input` integration, cross-project bridge docs, reference library usage |
+| `.claude/settings.local.json` | Default permissions tuned for orch's sandboxed VM |
+| `.claude/rules/cc-*.md` | Skeleton rule files Claude can flesh out as conventions emerge |
+| `.claude-docs/` | Reference library — patterns/guides from other projects to use as a compass (never a manual) |
+| `.claude-docs/sibling-projects.md` | Table of every other orch-managed project: name, stage, detected stack, purpose. Regenerated on each run |
+| `.orch/project.toml` | Lifecycle stage and ledger, ready for `orch stage` |
+
+**Options:**
+
+| Flag | Default | Effect |
+|------|---------|--------|
+| `dir` (positional) | `$PWD` | Target directory. Created if it doesn't exist. |
+| `--name NAME` | directory basename | Project name recorded in lifecycle and CLAUDE.md heading |
+| `--stage STAGE` | `building` | Initial stage (`idea`, `building`, `mvp`, `staging`, `live`, `maintaining`) |
+| `--description DESC` | empty | One-line description stored in project.toml and CLAUDE.md |
+| `--plugins` | off | Also runs `npx curated-context setup` and prompts for `claude-mem` if not already installed globally |
+
+Safe to re-run on an existing project — only missing files are added, and the sibling-projects table is refreshed.
 
 ### Configuration
 
