@@ -63,13 +63,6 @@ provision:
         git curl wget build-essential tmux xclip jq unzip \
         ca-certificates gnupg lsb-release software-properties-common unzip
 
-      # ── Node.js 22 (for Claude Code) ──
-      curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
-      apt-get install -y nodejs
-
-      # ── Claude Code ──
-      npm install -g @anthropic-ai/claude-code
-
       # ── direnv ──
       apt-get install -y direnv
 
@@ -127,10 +120,29 @@ provision:
       echo 'export BUN_INSTALL="$HOME/.bun"' >> ~/.bash_env
       echo 'export PATH="$BUN_INSTALL/bin:$PATH"' >> ~/.bash_env
 
+      # ── Claude Code (native installer; user-writable, supports auto-update) ──
+      # Installs to ~/.local/share/claude/versions/<ver> with ~/.local/bin/claude
+      # symlink. Self-updates without sudo. Do NOT install via npm-global —
+      # that lands at /usr/lib/node_modules and blocks auto-update.
+      curl -fsSL https://claude.ai/install.sh | bash
+      # Make the native install discoverable in orch sessions, which source only
+      # ~/.bash_env (not .profile/.bashrc). Without this PATH addition, orch
+      # sessions report "claude: not found" even though the binary exists.
+      echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bash_env
+
       # ── Claude config dir (use host-mounted .claude so JSONL files are visible to host) ──
       # Must go in .bash_env (sourced from .profile) not .bashrc, because
       # .bashrc has an interactive-only guard that blocks non-interactive shells.
       echo 'export CLAUDE_CONFIG_DIR=/Users/joshuaodmark/.claude' >> ~/.bash_env
+
+      # ── Claude Code OAuth credentials (Max-plan billed) ──
+      # VM Claude reads OAuth creds from $CLAUDE_CONFIG_DIR/.credentials.json
+      # (which is the host's ~/.claude/.credentials.json via virtiofs). Host
+      # macOS Claude transparently refreshes its token via Keychain every ~8h,
+      # which rotates the refresh_token server-side and leaves the file copy
+      # stale — breaking the next VM session that needs to refresh. To fix:
+      # run `orch credbroker install` on the host. That installs a launchd
+      # agent that mirrors Keychain → file whenever the host refreshes.
 
       # ── Docker group ──
       sudo usermod -aG docker "$USER"
