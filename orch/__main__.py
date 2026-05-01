@@ -14,6 +14,11 @@ orch CLI
   orch vm status                    Check VM status
   orch vm ssh                       SSH into the VM
   orch vm create                    Create the VM from template
+  orch credbroker status            Show launchd agent status
+  orch credbroker install           Install + load launchd agent
+  orch credbroker uninstall         Unload + remove launchd agent
+  orch credbroker run               Run broker loop in foreground (for launchd)
+  orch credbroker sync              One-shot sync (debug)
   orch init [dir]                   Bootstrap project for Claude Code
   orch ignore <project>              Hide project from orch
   orch ignore <project> --undo      Un-hide project
@@ -232,6 +237,31 @@ def cmd_vm(argv: list[str]) -> None:
         sys.exit(1)
 
 
+def cmd_credbroker(argv: list[str]) -> None:
+    from . import credbroker
+
+    action = argv[0] if argv else "status"
+    rest = argv[1:]
+
+    if action == "run":
+        sys.exit(credbroker.main(rest))
+    elif action == "install":
+        sys.exit(credbroker.install_launchd())
+    elif action == "uninstall":
+        sys.exit(credbroker.uninstall_launchd())
+    elif action == "status":
+        sys.exit(credbroker.status_launchd())
+    elif action == "sync":
+        sys.exit(credbroker.main(["--once"] + rest))
+    else:
+        print(
+            "Unknown action '"
+            + action
+            + "'. Use: run, install, uninstall, status, sync"
+        )
+        sys.exit(1)
+
+
 def cmd_ignore(argv: list[str]) -> None:
     from .lifecycle import ignore_project, unignore_project
 
@@ -312,6 +342,8 @@ def main() -> None:
         cmd_init(argv[1:])
     elif sub in ("ignore",):
         cmd_ignore(argv[1:])
+    elif sub in ("credbroker",):
+        cmd_credbroker(argv[1:])
     elif sub in ("setup",):
         from .setup import main as setup_main
         setup_main()
