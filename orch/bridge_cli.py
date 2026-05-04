@@ -118,6 +118,35 @@ def cmd_submit(args: argparse.Namespace) -> int:
     return 0
 
 
+def _render_event(e: dict, *, verbose: bool) -> None:
+    """Pretty-print one bridge event. Headless-output events get a summary
+    one-liner plus, on failure or --verbose, the captured stdout/stderr."""
+    ts = e["ts"]
+    name = e["event"]
+    detail = e.get("detail") or {}
+    if name == "headless_output" and isinstance(detail, dict):
+        rc = detail.get("returncode")
+        phase = detail.get("phase", "?")
+        timed_out = detail.get("timed_out")
+        stdout = detail.get("stdout") or ""
+        stderr = detail.get("stderr") or ""
+        size = f"stdout={len(stdout)}B stderr={len(stderr)}B"
+        flag = " TIMEOUT" if timed_out else (f" rc={rc}" if rc not in (0, None) else "")
+        print(f"  {ts}  {name} [{phase}{flag} {size}]")
+        failed = bool(timed_out) or (rc not in (0, None))
+        if failed or verbose:
+            if stderr.strip():
+                print("    stderr:")
+                for line in stderr.rstrip().splitlines():
+                    print(f"      {line}")
+            if stdout.strip() and (verbose or not stderr.strip()):
+                print("    stdout:")
+                for line in stdout.rstrip().splitlines():
+                    print(f"      {line}")
+        return
+    print(f"  {ts}  {name}{(' ' + json.dumps(detail)) if detail else ''}")
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     status, payload = _http("GET", f"/bridges/{args.id}")
     if status == 404:
@@ -149,7 +178,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         print()
         print("events:")
         for e in payload["events"]:
-            print(f"  {e['ts']}  {e['event']}{(' ' + json.dumps(e['detail'])) if e.get('detail') else ''}")
+            _render_event(e, verbose=args.verbose)
     if payload.get("result"):
         print()
         print("result:")
@@ -229,6 +258,10 @@ def _build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("status", help="show full record + event log")
     s.add_argument("id", help="bridge id")
     s.add_argument("--json", action="store_true")
+    s.add_argument(
+        "--verbose", "-v", action="store_true",
+        help="print full headless stdout/stderr for every turn, not just failures",
+    )
     s.set_defaults(func=cmd_status)
 
     s = sub.add_parser("list", help="list bridges, optionally filtered")

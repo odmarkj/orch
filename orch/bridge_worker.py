@@ -10,6 +10,7 @@ as transient vs permanent so the janitor can auto-retry the right ones.
 from __future__ import annotations
 
 import os
+import subprocess
 from pathlib import Path
 
 from . import state
@@ -18,6 +19,83 @@ from .models import Project
 
 
 CLARIFICATION_MARKER = "[NEEDS_CLARIFICATION]"
+
+# Cap per-stream byte length stored in the event log so a runaway Claude
+# can't bloat the SQLite DB. Tail-bias because errors are usually at the
+# bottom of stdout/stderr.
+_OUTPUT_TAIL_BYTES = 16_000
+
+
+def _tail(text: str | None, limit: int = _OUTPUT_TAIL_BYTES) -> str:
+    if not text:
+        return ""
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    return "…[truncated " + str(len(text) - limit) + " chars]…\n" + text[-limit:]
+
+
+def _record_headless_output(
+    bid: str,
+    phase: str,
+    *,
+    returncode: int | None,
+    stdout: str | None,
+    stderr: str | None,
+    timed_out: bool = False,
+) -> None:
+    """Persist captured headless output as a bridge_event so it survives the
+    worktree teardown. Always emitted — failure or success."""
+    state.add_event(bid, "headless_output", {
+        "phase": phase,
+        "returncode": returncode,
+        "timed_out": timed_out,
+        "stdout": _tail(stdout),
+        "stderr": _tail(stderr),
+    })
+
+
+def _run_headless_capture(
+    target: Project, prompt: str, *, bid: str, phase: str, **kwargs,
+) -> tuple[str, str]:
+    """Run a headless Claude turn, persisting both streams to the event log
+    regardless of outcome. Returns (stdout, stderr). Raises TransientBridgeError
+    on subprocess error, timeout, or non-zero exit; the failure path includes
+    the captured streams so callers don't need to unpack again."""
+    from .agent import run_headless
+
+    try:
+        result = run_headless(target, prompt, **kwargs)
+    except subprocess.TimeoutExpired as e:
+        # TimeoutExpired carries whatever streams were collected before the
+        # timeout fired. Capture them, log, then surface as transient.
+        out = e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
+        err = e.stderr.decode(errors="replace") if isinstance(e.stderr, bytes) else (e.stderr or "")
+        _record_headless_output(
+            bid, phase, returncode=None, stdout=out, stderr=err, timed_out=True,
+        )
+        raise TransientBridgeError(
+            f"headless {phase} timed out after {e.timeout}s"
+            + (f"; stderr tail: {_tail(err, 400)}" if err.strip() else "")
+        ) from e
+    except Exception as e:
+        _record_headless_output(
+            bid, phase, returncode=None, stdout=None, stderr=repr(e),
+        )
+        raise TransientBridgeError(f"headless {phase} errored: {e}") from e
+
+    out = result.stdout or ""
+    err = result.stderr or ""
+    _record_headless_output(
+        bid, phase, returncode=result.returncode, stdout=out, stderr=err,
+    )
+    if result.returncode != 0:
+        raise TransientBridgeError(
+            f"headless {phase} exited {result.returncode}"
+            + (f"; stderr tail: {_tail(err, 400)}" if err.strip() else "")
+            + (f"; stdout tail: {_tail(out, 400)}" if not err.strip() and out.strip() else "")
+        )
+    return out, err
 
 
 # ── Errors ─────────────────────────────────────────────────────────────────
@@ -136,16 +214,13 @@ def run_bridge(bridge: dict) -> None:
 
             prompt = _build_prompt(bridge)
             state.add_event(bid, "prompt_sent")
-            try:
-                result = run_headless(
-                    target, prompt, workdir=worktree_path,
-                    allowed_dirs=[str(worktree_path), bridge["source_path"]],
-                    timeout=600,
-                )
-            except Exception as e:
-                raise TransientBridgeError(f"headless run errored: {e}") from e
-
-            output = (result.stdout or "").strip()
+            stdout, _stderr = _run_headless_capture(
+                target, prompt, bid=bid, phase="initial",
+                workdir=worktree_path,
+                allowed_dirs=[str(worktree_path), bridge["source_path"]],
+                timeout=600,
+            )
+            output = stdout.strip()
 
             if CLARIFICATION_MARKER in output:
                 question = output.split(CLARIFICATION_MARKER, 1)[1].strip()
@@ -159,15 +234,11 @@ def run_bridge(bridge: dict) -> None:
                         f"**Answer**: {answer}\n\n"
                         f"Continue with your task now."
                     )
-                    try:
-                        result = run_headless(
-                            target, followup, workdir=worktree_path, timeout=600,
-                        )
-                    except Exception as e:
-                        raise TransientBridgeError(
-                            f"headless re-run after clarification errored: {e}"
-                        ) from e
-                    output = (result.stdout or "").strip()
+                    stdout, _stderr = _run_headless_capture(
+                        target, followup, bid=bid, phase="clarification",
+                        workdir=worktree_path, timeout=600,
+                    )
+                    output = stdout.strip()
 
             result_file = worktree_path / ".orch" / "bridge_result"
             result_text = ""
@@ -272,6 +343,13 @@ def _schedule_retry(bid: str, error: str) -> None:
 
 
 def _run_clarification(bridge: dict, question: str) -> str:
+    """Ask the source project for clarification. Best-effort: any failure
+    produces "(no answer)" rather than raising — the parent run can still
+    finish, just with less information.
+
+    Captures both streams to a `headless_output` event so a confused
+    clarification turn is debuggable after the fact.
+    """
     from .agent import run_headless
 
     prompt = (
@@ -285,10 +363,28 @@ def _run_clarification(bridge: dict, question: str) -> str:
     source = Project(path=Path(bridge["source_path"]))
     try:
         result = run_headless(source, prompt, timeout=120)
-        if result.returncode == 0:
-            return (result.stdout or "").strip() or "(no answer)"
-    except Exception:
-        pass
+    except subprocess.TimeoutExpired as e:
+        out = e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
+        err = e.stderr.decode(errors="replace") if isinstance(e.stderr, bytes) else (e.stderr or "")
+        _record_headless_output(
+            bridge["id"], "clarification_source",
+            returncode=None, stdout=out, stderr=err, timed_out=True,
+        )
+        return "(no answer)"
+    except Exception as e:
+        _record_headless_output(
+            bridge["id"], "clarification_source",
+            returncode=None, stdout=None, stderr=repr(e),
+        )
+        return "(no answer)"
+
+    _record_headless_output(
+        bridge["id"], "clarification_source",
+        returncode=result.returncode,
+        stdout=result.stdout, stderr=result.stderr,
+    )
+    if result.returncode == 0:
+        return (result.stdout or "").strip() or "(no answer)"
     return "(no answer)"
 
 
