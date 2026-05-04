@@ -7,7 +7,16 @@ orch CLI
   orch logs [project]               Tail logs
   orch logs [project] -g error      Grep filter
   orch logs [project] --past        Read saved log files
-  orch bridge                       Start mobile web bridge (stays running)
+  orch bridge submit ...            Submit a cross-project bridge request
+  orch bridge list [--source X]     List bridges (filterable by source/target/status)
+  orch bridge status <id>           Show full record + event log for a bridge
+  orch bridge cancel <id>           Cancel a pending or inflight bridge
+  orch bridge retry <id>            Resubmit a failed bridge as a new record
+  orch daemon run                   Run the daemon loop (foreground; for launchd)
+  orch daemon install               Install + load launchd plist
+  orch daemon uninstall             Unload + remove launchd plist
+  orch daemon status                Show launchd state + healthz probe
+  orch daemon start | stop          Kickstart / stop the launchd job
   orch stage <project> <stage>      Advance project to a new stage
   orch vm start                     Start the Lima VM
   orch vm stop                      Stop the Lima VM
@@ -18,7 +27,8 @@ orch CLI
   orch credbroker install           Install + load launchd agent
   orch credbroker uninstall         Unload + remove launchd agent
   orch credbroker run               Run broker loop in foreground (for launchd)
-  orch credbroker sync              One-shot sync (debug)
+  orch credbroker sync              One-shot Keychain→file mirror (debug)
+  orch credbroker refresh           Force-refresh OAuth tokens via /oauth/token
   orch init [dir]                   Bootstrap project for Claude Code
   orch ignore <project>              Hide project from orch
   orch ignore <project> --undo      Un-hide project
@@ -149,30 +159,13 @@ def cmd_logs(argv: list[str]) -> None:
 
 
 def cmd_bridge(argv: list[str]) -> None:
-    import time, signal
-    from .bridge import start_bridge
+    from . import bridge_cli
+    sys.exit(bridge_cli.main(argv))
 
-    try:
-        port = start_bridge()
-    except OSError as e:
-        print(f"Error starting bridge: {e}", file=sys.stderr)
-        sys.exit(1)
 
-    print(f"  orch bridge running on http://localhost:{port}")
-    print(f"  Open in browser or tunnel with:")
-    print(f"    cloudflared tunnel --url http://localhost:{port}")
-    print(f"  Press Ctrl-C to stop.\n")
-
-    def _stop(sig, frame):
-        from .bridge import stop_bridge
-        print("\n  Bridge stopped.")
-        stop_bridge()
-        sys.exit(0)
-
-    signal.signal(signal.SIGINT, _stop)
-
-    while True:
-        time.sleep(1)
+def cmd_daemon(argv: list[str]) -> None:
+    from . import daemon
+    sys.exit(daemon.main(argv))
 
 
 def cmd_stage(argv: list[str]) -> None:
@@ -253,11 +246,13 @@ def cmd_credbroker(argv: list[str]) -> None:
         sys.exit(credbroker.status_launchd())
     elif action == "sync":
         sys.exit(credbroker.main(["--once"] + rest))
+    elif action == "refresh":
+        sys.exit(credbroker.main(["--refresh"] + rest))
     else:
         print(
             "Unknown action '"
             + action
-            + "'. Use: run, install, uninstall, status, sync"
+            + "'. Use: run, install, uninstall, status, sync, refresh"
         )
         sys.exit(1)
 
@@ -344,6 +339,8 @@ def main() -> None:
         cmd_ignore(argv[1:])
     elif sub in ("credbroker",):
         cmd_credbroker(argv[1:])
+    elif sub in ("daemon",):
+        cmd_daemon(argv[1:])
     elif sub in ("setup",):
         from .setup import main as setup_main
         setup_main()

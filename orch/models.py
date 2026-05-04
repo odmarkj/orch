@@ -283,33 +283,3 @@ class Project:
             return val.lower() == "true"
         return default
 
-    # ── Bridge properties ────────────────────────────────────────────────
-
-    @property
-    def bridge_request_file(self) -> Path:
-        return self.orch_dir / "bridge_request"
-
-    @property
-    def bridge_processing_file(self) -> Path:
-        return self.orch_dir / "bridge_request.processing"
-
-    @property
-    def bridge_responses_dir(self) -> Path:
-        return self.orch_dir / "bridge_responses"
-
-    @property
-    def bridge_requests_dir(self) -> Path:
-        return self.orch_dir / "bridge_requests"
-
-    @property
-    def has_pending_bridge_request(self) -> bool:
-        return self.bridge_request_file.exists()
-
-    @property
-    def bridge_depth(self) -> int:
-        """Current bridge depth (0 = not in a bridge context)."""
-        depth_file = self.orch_dir / "_bridge_depth"
-        try:
-            return int(depth_file.read_text().strip())
-        except (FileNotFoundError, ValueError):
-            return 0

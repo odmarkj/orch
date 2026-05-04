@@ -418,12 +418,13 @@ def _build_vm_claude_cmd(project: Project) -> str:
         except (json.JSONDecodeError, KeyError):
             pass
 
-    pid_file = f"/tmp/orch-{project.name}.pid"
+    pid_prefix = f"/tmp/orch-{project.name}"
     inner = (
         f"export TERM=xterm-256color; "
         f"cd {shlex.quote(project_dir)} && "
-        f"trap 'rm -f {shlex.quote(pid_file)}' EXIT HUP; "
-        f"echo $$ > {shlex.quote(pid_file)}; "
+        f'PIDFILE={shlex.quote(pid_prefix)}-$$.pid; '
+        f'trap "rm -f $PIDFILE" EXIT HUP; '
+        f'echo $$ > "$PIDFILE"; '
         f"clear; claude {claude_args} {_orch_prompt_arg()}"
     )
     return vm_ssh_cmd(extra_cmd=inner)
@@ -478,12 +479,13 @@ def open_vm_session(project: Project, with_shell: bool = False) -> None:
     # Anything that calls setsid() (systemd-run --scope, su -l, etc.) breaks
     # SIGWINCH delivery by detaching from the SSH PTY's foreground group.
     # Session detection uses a PID file instead.
-    pid_file = f"/tmp/orch-{project.name}.pid"
+    pid_prefix = f"/tmp/orch-{project.name}"
     inner_cmd = (
         f"export TERM=xterm-256color COLORTERM=truecolor; "
         f"cd {shlex.quote(project_dir)} && "
-        f"trap 'rm -f {shlex.quote(pid_file)}' EXIT HUP; "
-        f"echo $$ > {shlex.quote(pid_file)}; "
+        f'PIDFILE={shlex.quote(pid_prefix)}-$$.pid; '
+        f'trap "rm -f $PIDFILE" EXIT HUP; '
+        f'echo $$ > "$PIDFILE"; '
         f"clear; claude {claude_args} {_orch_prompt_arg()}"
     )
     vm_cmd = vm_ssh_cmd(extra_cmd=inner_cmd)

@@ -613,6 +613,7 @@ class OrchApp(App):
         Binding("i", "ignore_project", "Ignore", show=True),
         Binding("g", "toggle_auto_dispatch", "Auto(g)", show=True),
         Binding("o", "edit_config", "Config", show=True),
+        Binding("R", "refresh_creds", "Reauth Claude", show=True),
         Binding("escape", "blur_input", "Cancel", show=False),
     ]
 
@@ -622,7 +623,6 @@ class OrchApp(App):
         super().__init__()
         self.projects: list[Project] = []
         self._observer: Observer | None = None
-        self._bridge_running = False
         self._input_mode: str = "task"  # "task" or "stage"
         self._d_pressed: bool = False
         self._d_timer: Timer | None = None
@@ -635,9 +635,7 @@ class OrchApp(App):
         self._debounce_delay: float = 0.3  # seconds
         self._wfi_last_fired: dict[str, float] = {}  # per-project cooldown for waiting_for_input
         self._wfi_cooldown: float = 3.0  # seconds — suppress duplicate iTerm opens
-        # Bridge request tracking: project names currently being processed
-        self._active_bridges: set[str] = set()
-        self._active_bridges_lock = threading.Lock()
+        self._daemon_was_down: bool = False
         # JSONL journal watcher state
         self._journal_debounce_timers: dict[str, threading.Timer] = {}
         self._journal_debounce_delay: float = 0.5  # seconds — short debounce for live status
@@ -662,7 +660,7 @@ class OrchApp(App):
                 yield Markdown("", id="todos-view")
         yield Static(
             "[dim]j/k[/] navigate  [dim]Enter[/] select  [dim]t[/]ask  [dim]a[/]dd todo  [dim]e[/]xec  [dim]c[/]laude  [dim]x[/] vm shell  [dim]dd[/] stop\n"
-            "[dim]l[/]ogs  [dim]p[/]lan  [dim]b[/]ridge  [dim]s[/]tage  [dim]i[/]gnore  [dim]g[/] auto  [dim]o[/] config  [dim]r[/]efresh  [dim]q[/]uit  [dim]Esc[/] cancel",
+            "[dim]l[/]ogs  [dim]p[/]lan  [dim]b[/]ridge  [dim]s[/]tage  [dim]i[/]gnore  [dim]g[/] auto  [dim]o[/] config  [dim]r[/]efresh  [dim]R[/] reauth  [dim]q[/]uit  [dim]Esc[/] cancel",
             id="help-bar",
             markup=True,
         )
@@ -688,11 +686,11 @@ class OrchApp(App):
         self.set_interval(15.0, self._refresh_session_cache)
         # Initial session cache population
         self.run_worker(self._do_refresh_session_cache, thread=True)
-        # Scan for queued bridge requests left over from before startup
-        # (FSEvents from VM-side virtiofs writes are unreliable). Also poll
-        # periodically as a belt over the watchdog suspenders.
-        self._scan_pending_bridges()
-        self.set_interval(25.0, self._scan_pending_bridges)
+        # Probe orch-daemon at startup and periodically. The daemon owns
+        # bridge dispatch — TUI is now a client, not a host. If it's down,
+        # surface a clear notification so the user can start it.
+        self.run_worker(self._probe_daemon, thread=True)
+        self.set_interval(60.0, lambda: self.run_worker(self._probe_daemon, thread=True))
 
     def _refresh_session_cache(self) -> None:
         """Trigger a background refresh of session state via tmux capture."""
@@ -933,13 +931,6 @@ class OrchApp(App):
                 self._refresh_project_item(project)
                 if self.selected_project == project:
                     self._refresh_panes()
-            return
-
-        # ── Bridge request: cross-project agent communication ─────────────────
-        if changed.name == "bridge_request" and changed.exists():
-            project = self._project_for_path(changed)
-            if project:
-                self._handle_bridge_request(project)
             return
 
         # ── iterm handles: no action needed ───────────────────────────────────
@@ -1266,6 +1257,32 @@ class OrchApp(App):
             self._refresh_panes()
         self.notify("Projects refreshed")
 
+    def action_refresh_creds(self) -> None:
+        """Force-refresh Claude OAuth tokens via /oauth/token (shift+R)."""
+        if self._input_focused: return
+
+        def _do_refresh():
+            try:
+                from .credbroker import refresh_now
+                new_oauth, kc_warn = refresh_now()
+                mins = (new_oauth["expiresAt"] - int(time.time() * 1000)) // 60000
+                msg = f"Creds refreshed (~{mins}m left)"
+                if kc_warn:
+                    self.call_from_thread(
+                        self.notify,
+                        f"{msg}; keychain not updated — host may need login",
+                        severity="warning",
+                    )
+                else:
+                    self.call_from_thread(self.notify, msg)
+            except Exception as e:
+                self.call_from_thread(
+                    self.notify, f"Refresh failed: {e}", severity="error", timeout=8.0,
+                )
+
+        self.notify("Refreshing creds…")
+        threading.Thread(target=_do_refresh, daemon=True).start()
+
     def action_focus_input_task(self) -> None:
         if self._input_focused: return
         self._input_mode = "task"
@@ -1494,20 +1511,81 @@ class OrchApp(App):
             self._refresh_panes()
 
     def action_toggle_bridge(self) -> None:
-        """Toggle the mobile web bridge on/off."""
+        """Show a snapshot of cross-project bridge state from the daemon.
+
+        Was the mobile-UI HTTP bridge toggle; that's gone. The 'b' key now
+        surfaces what the daemon knows: pending / inflight / recent bridges,
+        with a clear pointer to `orch bridge` for details.
+        """
         if self._input_focused: return
-        from .bridge import start_bridge, stop_bridge, bridge_running
-        if bridge_running():
-            stop_bridge()
-            self._bridge_running = False
-            self.notify("Bridge stopped")
+        self.run_worker(self._fetch_bridge_summary, thread=True)
+
+    def _probe_daemon(self) -> None:
+        """Background probe: notify (once) when daemon goes down or comes back."""
+        from .daemon import daemon_required
+        err = daemon_required()
+        prev = getattr(self, "_daemon_was_down", False)
+        if err:
+            self._daemon_was_down = True
+            if not prev:
+                self.call_from_thread(
+                    self.notify,
+                    "orch-daemon is not running — bridges won't dispatch. "
+                    "Start it with: orch daemon start",
+                    severity="error",
+                )
         else:
-            try:
-                port = start_bridge()
-                self._bridge_running = True
-                self.notify(f"Bridge running on http://localhost:{port}")
-            except OSError as e:
-                self.notify(f"Bridge failed: {e}", severity="error")
+            self._daemon_was_down = False
+            if prev:
+                self.call_from_thread(
+                    self.notify, "orch-daemon is back up.",
+                )
+
+    def _fetch_bridge_summary(self) -> None:
+        from .daemon import daemon_required
+        from .config import daemon_port
+        import urllib.request, urllib.error, json as _json
+
+        err = daemon_required()
+        if err:
+            self.call_from_thread(
+                self.notify, err.replace("\n", " · "), severity="error",
+            )
+            return
+
+        port = daemon_port()
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/bridges?limit=50", timeout=3,
+            ) as resp:
+                bridges = _json.loads(resp.read())
+        except (urllib.error.URLError, OSError) as e:
+            self.call_from_thread(
+                self.notify, f"Bridge query failed: {e}", severity="error",
+            )
+            return
+
+        pending = [b for b in bridges if b["status"] == "pending"]
+        inflight = [b for b in bridges if b["status"] == "inflight"]
+        failed = [b for b in bridges if b["status"] == "failed"]
+
+        lines = [f"Bridges — {len(bridges)} recent"]
+        lines.append(
+            f"  pending: {len(pending)}   inflight: {len(inflight)}   "
+            f"failed: {len(failed)}"
+        )
+        for b in inflight[:3]:
+            lines.append(
+                f"  → {b['source_project']} → {b['target_project']}: "
+                f"{b['summary'][:40]}"
+            )
+        for b in failed[:2]:
+            err_short = (b.get("error") or "")[:60]
+            lines.append(
+                f"  ✗ {b['source_project']} → {b['target_project']}: {err_short}"
+            )
+        lines.append("Run `orch bridge list` or `orch bridge status <id>`")
+        self.call_from_thread(self.notify, "\n".join(lines))
 
     def action_set_stage(self) -> None:
         """Prompt for a new stage via the input bar."""
@@ -1814,164 +1892,6 @@ class OrchApp(App):
         # Still try to dispatch remaining todos
         self._schedule_dispatch_check(project)
 
-    # ── Bridge handlers ────────────────────────────────────────────────────
-
-    def _scan_pending_bridges(self) -> None:
-        """Scan all projects for queued or stale-in-flight bridge requests.
-
-        Runs on startup and periodically (every 25s) to catch requests the
-        watchdog missed — most often because the write came from the VM via
-        virtiofs, which doesn't reliably fire macOS FSEvents.
-
-        Skips projects with a bridge already in flight (tracked in-memory)
-        so the periodic poll doesn't resurrect a ``.processing`` file that
-        an active worker is handling.
-        """
-        for p in self.projects:
-            with self._active_bridges_lock:
-                if p.name in self._active_bridges:
-                    continue
-            if p.bridge_request_file.exists() or p.bridge_processing_file.exists():
-                self._handle_bridge_request(p)
-
-    def _handle_bridge_request(self, source_project: Project) -> None:
-        """Handle a bridge_request file created by an agent.
-
-        First atomically claims the request by renaming
-        ``bridge_request`` → ``bridge_request.processing``. This makes
-        duplicate watchdog fires (and periodic-poll double-detections) safe:
-        the loser of the rename race gets FileNotFoundError and returns.
-
-        If a stale ``.processing`` file exists from a crashed prior run and
-        no fresh request is present, we reprocess the stale one.
-        """
-        from .comm import (
-            parse_bridge_request,
-            handle_bridge_request,
-            MAX_BRIDGE_DEPTH,
-            BridgeResponse,
-            _deliver_response,
-            _archive_request_file,
-            log_bridge,
-        )
-
-        # Skip if a worker is already processing this project's request.
-        # Guards against duplicate watchdog fires and periodic-poll overlap.
-        with self._active_bridges_lock:
-            if source_project.name in self._active_bridges:
-                return
-
-        orch_dir = source_project.orch_dir
-        req_path = orch_dir / "bridge_request"
-        proc_path = orch_dir / "bridge_request.processing"
-
-        if req_path.exists():
-            try:
-                req_path.rename(proc_path)
-                log_bridge(f"CLAIM {source_project.name} (rename → .processing)")
-            except FileNotFoundError:
-                return
-            except OSError as e:
-                log_bridge(f"CLAIM_ERROR {source_project.name}: {e!r}")
-                self.notify(
-                    f"Bridge: claim failed for {source_project.name}: {e}",
-                    severity="error",
-                )
-                return
-        elif not proc_path.exists():
-            return
-        else:
-            log_bridge(f"REPROCESS {source_project.name} (stale .processing found)")
-
-        request = parse_bridge_request(source_project)
-        if not request:
-            log_bridge(f"INVALID {source_project.name} (parse failed)")
-            self.notify(
-                f"Bridge: invalid request from {source_project.name}",
-                severity="warning",
-            )
-            return
-
-        with self._active_bridges_lock:
-            self._active_bridges.add(source_project.name)
-
-        # Depth limit
-        if request.depth > MAX_BRIDGE_DEPTH:
-            self.notify(
-                f"Bridge: {source_project.name} rejected (max depth exceeded)",
-                severity="warning",
-            )
-            resp = BridgeResponse(
-                id=request.id,
-                source=request.source_project,
-                target=request.target,
-                intent=request.intent,
-                summary=request.summary,
-                status="failed",
-                result="Max bridge depth exceeded.",
-            )
-            _deliver_response(request, resp)
-            _archive_request_file(request)
-            return
-
-        truncated = request.summary[:50] + ("…" if len(request.summary) > 50 else "")
-        self.notify(f"Bridge: {source_project.name} → {request.target}: {truncated}")
-
-        def _run(req=request):
-            try:
-                response = handle_bridge_request(req, self.projects)
-                self.call_from_thread(
-                    self._on_bridge_complete, source_project, req, response,
-                )
-            except Exception as e:
-                self.call_from_thread(
-                    self._on_bridge_failed, source_project, req, e,
-                )
-
-        self.run_worker(_run, thread=True)
-
-    def _on_bridge_complete(
-        self,
-        source: Project,
-        request,
-        response,
-    ) -> None:
-        with self._active_bridges_lock:
-            self._active_bridges.discard(source.name)
-        status_icon = "✓" if response.status == "completed" else "✗"
-        truncated = request.summary[:40] + ("…" if len(request.summary) > 40 else "")
-        msg = f"Bridge {status_icon}: {truncated} → {response.status}"
-        if response.pr_url:
-            msg += f" PR: {response.pr_url}"
-        self.notify(msg)
-
-    def _on_bridge_failed(
-        self,
-        source: Project,
-        request,
-        error: Exception,
-    ) -> None:
-        from .comm import BridgeResponse, _deliver_response, _archive_request_file
-
-        with self._active_bridges_lock:
-            self._active_bridges.discard(source.name)
-        self.notify(
-            f"Bridge failed: {request.summary[:40]} — {error}",
-            severity="error",
-        )
-        # Deliver a failed response so the source agent knows
-        resp = BridgeResponse(
-            id=request.id,
-            source=request.source_project,
-            target=request.target,
-            intent=request.intent,
-            summary=request.summary,
-            status="failed",
-            result=str(error),
-        )
-        _deliver_response(request, resp)
-        _archive_request_file(request)
-
     def _post_review_comment(self, pr_url: str, review: str) -> None:
         """Post a code review comment on the PR using gh CLI."""
         import subprocess, shutil
@@ -2051,7 +1971,3 @@ class OrchApp(App):
         if self._observer:
             self._observer.stop()
             self._observer.join()
-        # Stop bridge if running
-        if self._bridge_running:
-            from .bridge import stop_bridge
-            stop_bridge()

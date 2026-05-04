@@ -77,9 +77,7 @@ def _ensure_git(target: Path) -> None:
             "*.pyc\nvenv/\n.venv/\n\n"
             "# Orch state\n.orch/status\n.orch/waiting_for_input\n"
             ".orch/pending_task\n.orch/active_todo\n.orch/auto_dispatch\n"
-            ".orch/bridge_request\n.orch/bridge_responses/\n"
             ".orch/sessions.json\n.orch/iterm_handle\n.orch/iterm_log_handle\n"
-            ".orch/_bridge_depth\n"
         )
 
     _ok("Git repository initialized")
@@ -146,18 +144,30 @@ This tells the orchestrator you are idle and ready for the next task.
 ## Cross-project bridge
 
 All projects under `~/Apps/` are accessible read-only at their original paths
-inside the VM. When you need to make changes in another project that orch manages,
-you can request a bridge by writing `.orch/bridge_request`:
+inside the VM. When you need changes in another orch-managed project, submit
+a bridge request via the `orch bridge` CLI \u2014 it talks to the orch daemon,
+which atomically queues the request, runs a subagent on a worktree of the
+target project, and reports status back you can poll.
 
-```json
-{{
-  "target": "project-name",
-  "intent": "fix|review|query|inform",
-  "summary": "Brief one-line description",
-  "context": "Why you're reaching out, what you know, what you've found",
-  "request": "Specific ask \u2014 what should be done or answered",
-  "relevant_files": ["optional", "list of files in target project"]
-}}
+```bash
+orch bridge submit \\
+  --target project-name \\
+  --intent fix \\
+  --summary "Brief one-line description" \\
+  --context-file ./context.md \\
+  --request-file ./request.md \\
+  [--relevant-file path/to/file] [--relevant-file ...] \\
+  [--parent-id br_...]   # only when this is a sub-request of an existing bridge
+```
+
+The command returns immediately with a bridge id (`br_...`). Use it to check
+progress:
+
+```bash
+orch bridge status br_...   # full record + event log
+orch bridge list            # everything you've submitted
+orch bridge cancel br_...   # cancel pending or kill an inflight worker
+orch bridge retry  br_...   # resubmit a failed bridge as a new record
 ```
 
 **Intents:**
@@ -166,15 +176,17 @@ you can request a bridge by writing `.orch/bridge_request`:
 - `query` \u2014 Ask a question about the target project (returns answer text)
 - `inform` \u2014 One-way notification, no response expected
 
-After writing the request, continue your current work. The orchestrator will
-handle routing \u2014 it spawns a subagent on a worktree of the target project inside
-the VM with read-only access to your project for context.
+The daemon enforces per-target serialization (one bridge per target at a time
+by default), retries transient failures automatically, and will reject requests
+when the target project disables bridges via its `.orch/project.toml`. After
+submitting, continue your current work \u2014 you do not need to wait. Poll
+`orch bridge status <id>` only if a follow-up depends on the result.
 
-Check `.orch/bridge_responses/` for results. Each response is a JSON file with
-`status`, `result`, and optionally `pr_url`.
-
-If `.orch/_bridge_depth` exists, include its value + 1 as `"depth"` in your
-request. Do not send bridge requests if depth would exceed 2.
+If you fire a bridge while *handling* one (i.e. the bridge subagent itself
+needs help from a third project), pass `--parent-id` with the id of the bridge
+that's calling you. The daemon tracks depth automatically and will reject
+chains that grow too deep. You should never compute or pass a depth value
+yourself.
 
 ## Reference Library (.claude-docs/)
 

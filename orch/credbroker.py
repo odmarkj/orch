@@ -14,12 +14,17 @@ refresh_token. The next VM session that tries to refresh fails and prompts
 for login.
 
 This broker fixes that by polling Keychain for changes and mirroring fresh
-credentials to the file. It does NOT call Anthropic's /oauth/token endpoint
-itself — refresh remains the responsibility of real Claude CLI processes.
+credentials to the file. The polling loop does NOT call Anthropic's
+/oauth/token endpoint itself — refresh remains the responsibility of real
+Claude CLI processes.
 
-v0: one-way mirror only (Keychain → file). The reverse direction
-(VM-driven refresh → propagate back to Keychain) is not yet implemented;
-it would require Keychain write access which prompts the user.
+There is also a manual `refresh_now()` (CLI: `orch credbroker refresh`,
+TUI: `R`) that DOES call /oauth/token directly, using the keychain's current
+refresh_token and Claude.app's public OAuth client_id. Use it when a VM
+session is stuck on 401s and you don't want to wait for the host to rotate
+the chain on its own. Successful refresh writes back to both Keychain and
+file; a failed refresh_token means the chain has diverged past recovery —
+run `claude login` on the host.
 """
 
 from __future__ import annotations
@@ -36,10 +41,19 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 
 KEYCHAIN_SERVICE = "Claude Code-credentials"
 CREDS_FILE = pathlib.Path.home() / ".claude" / ".credentials.json"
 DEFAULT_INTERVAL_SECONDS = 30
+
+# Claude.app's public OAuth client_id and refresh endpoint, verified
+# empirically: a stale refresh_token at this URL returns the OAuth-standard
+# {"error":"invalid_grant"} response, while other Anthropic hosts reject the
+# client_id outright.
+OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+OAUTH_TOKEN_URL = "https://claude.ai/v1/oauth/token"
 
 LAUNCHD_LABEL = "com.orch.credbroker"
 LAUNCHD_PLIST = pathlib.Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
@@ -94,6 +108,121 @@ def atomic_write_file(creds: dict) -> None:
         except OSError:
             pass
         raise
+
+
+def write_keychain(creds: dict) -> None:
+    """
+    Update the Keychain entry. macOS may prompt for permission the first time
+    a non-Claude.app process writes to this entry; user can click "Always Allow"
+    to suppress future prompts (caveat: ACL is bound to code signature, so an
+    unsigned `python3` may re-prompt on each path/version change).
+    Raises RuntimeError on failure.
+    """
+    payload = json.dumps(creds)
+    user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+    result = subprocess.run(
+        [
+            "security", "add-generic-password",
+            "-U",
+            "-s", KEYCHAIN_SERVICE,
+            "-a", user,
+            "-w", payload,
+        ],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"keychain write failed (rc={result.returncode}): "
+            f"{result.stderr.strip() or result.stdout.strip()}"
+        )
+
+
+def refresh_now() -> tuple[dict, str | None]:
+    """
+    Force-refresh OAuth tokens via Anthropic's /oauth/token endpoint.
+
+    Reads the current refresh_token from Keychain (or file as fallback),
+    POSTs to OAUTH_TOKEN_URL with the official client_id, then writes the
+    new (accessToken, refreshToken, expiresAt) back to BOTH Keychain and
+    file. Preserves scopes/subscriptionType/rateLimitTier from the existing
+    creds.
+
+    Returns (new_oauth_dict, keychain_warning_or_None). The warning is
+    populated when the file write succeeded but the Keychain write did not
+    — file is fresh (VM recovers) but host's Keychain is now stale (host's
+    Claude.app will need to re-login on its next refresh attempt).
+
+    Raises RuntimeError on hard failures (no creds, refresh_token rejected,
+    network error). The caller should surface these to the user.
+    """
+    creds = read_keychain()
+    if creds is None:
+        creds = read_file()
+    if creds is None:
+        raise RuntimeError("no creds in Keychain or file; run `claude login` on host first")
+
+    oauth = _oauth(creds)
+    refresh_token = oauth.get("refreshToken")
+    if not refresh_token:
+        raise RuntimeError("no refreshToken in current creds; run `claude login` on host")
+
+    body = json.dumps({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": OAUTH_CLIENT_ID,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        OAUTH_TOKEN_URL,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            # claude.ai is fronted by Cloudflare, which blocks the default
+            # Python-urllib/X.Y UA with HTTP 403 (error 1010). Any non-default
+            # UA passes; we mimic the official client for parity.
+            "User-Agent": "claude-cli/2.1.126",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            response = json.load(resp)
+    except urllib.error.HTTPError as e:
+        err_body = e.read().decode("utf-8", errors="replace").strip()
+        if e.code == 400 and "invalid_grant" in err_body:
+            raise RuntimeError(
+                "refresh_token rejected — chain has diverged past recovery. "
+                "Run `claude login` on the host."
+            ) from e
+        raise RuntimeError(f"refresh failed [{e.code}]: {err_body}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"network error reaching {OAUTH_TOKEN_URL}: {e}") from e
+
+    new_oauth = dict(oauth)  # preserve scopes, subscriptionType, rateLimitTier
+    new_oauth["accessToken"] = response["access_token"]
+    new_oauth["refreshToken"] = response.get("refresh_token", refresh_token)
+    new_oauth["expiresAt"] = int(time.time() * 1000) + int(response["expires_in"]) * 1000
+
+    new_creds = {"claudeAiOauth": new_oauth}
+
+    # Try Keychain first. If it fails, still propagate to file so the VM
+    # session recovers — host's Claude.app falls out of sync but that's
+    # recoverable with one re-login on host.
+    keychain_warning: str | None = None
+    try:
+        write_keychain(new_creds)
+    except Exception as e:
+        keychain_warning = str(e)
+        log.warning("keychain write failed (host out of sync): %s", e)
+
+    atomic_write_file(new_creds)
+    log.info(
+        "refresh_now: wrote new tokens (expiresAt=%s, keychain_ok=%s)",
+        new_oauth["expiresAt"],
+        keychain_warning is None,
+    )
+    return new_oauth, keychain_warning
 
 
 def _oauth(creds: dict) -> dict:
@@ -228,6 +357,11 @@ def status_launchd() -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="orch-credbroker")
     parser.add_argument("--once", action="store_true", help="run a single sync cycle and exit")
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="force-call /oauth/token now and propagate to Keychain + file",
+    )
     parser.add_argument("--dry-run", action="store_true", help="don't write anything; report what would happen")
     parser.add_argument(
         "--interval",
@@ -246,6 +380,19 @@ def main(argv: list[str] | None = None) -> int:
     if platform.system() != "Darwin":
         log.error("credbroker only runs on macOS (host with Keychain)")
         return 2
+
+    if args.refresh:
+        try:
+            new_oauth, kc_warn = refresh_now()
+        except RuntimeError as e:
+            print(f"refresh failed: {e}", file=sys.stderr)
+            return 1
+        mins = (new_oauth["expiresAt"] - int(time.time() * 1000)) // 60000
+        print(f"refreshed: new access token expires in ~{mins}m")
+        if kc_warn:
+            print(f"  warning (keychain): {kc_warn}", file=sys.stderr)
+            print("  file is fresh (VM will recover); host may need `claude login`", file=sys.stderr)
+        return 0
 
     if args.once:
         result = sync_once(dry_run=args.dry_run)

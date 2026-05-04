@@ -34,14 +34,20 @@ def session_name(project: "Project") -> str:
 def session_exists(project: "Project") -> bool:
     """Check if a session is running for this project.
 
-    Checks PID file first (interactive SSH sessions), then
-    falls back to tmux (headless/dispatch sessions).
+    Checks per-window PID files first (interactive SSH sessions), then
+    falls back to tmux (headless/dispatch sessions). Each iTerm window
+    writes its own /tmp/orch-{project}-{pid}.pid; the project is
+    considered active if any such file has a live PID.
     """
     name = session_name(project)
-    # Check PID file (interactive sessions via SSH)
-    pid_file = f"/tmp/{name}.pid"
+    # Check per-window PID files (interactive sessions via SSH).
+    # Any live PID means the project has at least one active window.
     result = vm_exec(
-        f"[ -f {shlex.quote(pid_file)} ] && kill -0 $(cat {shlex.quote(pid_file)}) 2>/dev/null",
+        f'for f in /tmp/{name}-*.pid; do '
+        f'  [ -f "$f" ] || continue; '
+        f'  p=$(cat "$f" 2>/dev/null); '
+        f'  [ -n "$p" ] && kill -0 "$p" 2>/dev/null && exit 0; '
+        f'done; exit 1',
         timeout=5,
     )
     if result.returncode == 0:
@@ -98,16 +104,34 @@ def start_session(project: "Project") -> str:
 def _kill_session_tree(name: str) -> None:
     """Kill a session and everything it spawned.
 
-    For interactive sessions: kill the process from the PID file and clean up.
+    `name` can be either form:
+      - orch-{project}          → kill ALL windows + systemd scope + tmux
+      - orch-{project}-{pid}    → kill only that specific window
+
+    For interactive sessions: kill the process from the PID file(s) and clean up.
     For headless sessions: stop the systemd scope and/or tmux session.
     """
-    pid_file = f"/tmp/{name}.pid"
-    # 1. Kill interactive session via PID file
+    base, _, tail = name.rpartition("-")
+    if tail.isdigit() and base.startswith("orch-"):
+        # Per-window form — kill just this window.
+        pid_file = f"/tmp/{name}.pid"
+        vm_exec(
+            f'kill -TERM {tail} 2>/dev/null; rm -f {shlex.quote(pid_file)}',
+            timeout=5,
+        )
+        return
+
+    # Project-level form — kill all windows for this project, plus
+    # any headless artifacts (systemd scope, tmux session).
+    # 1. Kill every per-window interactive session.
     vm_exec(
-        f"[ -f {shlex.quote(pid_file)} ] && "
-        f"kill -TERM $(cat {shlex.quote(pid_file)}) 2>/dev/null; "
-        f"rm -f {shlex.quote(pid_file)}",
-        timeout=5,
+        f'for f in /tmp/{name}-*.pid; do '
+        f'  [ -f "$f" ] || continue; '
+        f'  p=$(cat "$f" 2>/dev/null); '
+        f'  [ -n "$p" ] && kill -TERM "$p" 2>/dev/null; '
+        f'  rm -f "$f"; '
+        f'done',
+        timeout=10,
     )
     # 2. Stop systemd scope (headless sessions)
     vm_exec(
@@ -136,52 +160,52 @@ def kill_session(project: "Project") -> bool:
 def list_sessions() -> list[dict]:
     """List all orch sessions inside the VM.
 
-    Checks both systemd scopes (interactive) and tmux sessions (headless).
-    Returns a list of dicts with 'name', 'project', 'created', 'attached' keys.
+    Checks per-window PID files (interactive SSH) and tmux sessions
+    (headless/dispatch). Returns one entry per live window; a project
+    with four iTerm windows produces four entries. Each dict has
+    'name', 'project', 'created', 'attached' keys, where 'name' is
+    unique per window (orch-{project}-{pid} for interactive, or
+    orch-{project} for tmux).
     """
-    seen: set[str] = set()
     sessions: list[dict] = []
+    seen_tmux: set[str] = set()
 
-    # Check PID files for interactive sessions.
-    # A session is "attached" if its process still has a controlling TTY
+    # Per-window PID files: /tmp/orch-{project}-{pid}.pid.
+    # A window is "attached" if its process still has a controlling TTY
     # (meaning the SSH connection is alive).  No TTY = SSH dropped.
+    # Gather everything in one shell pass to avoid N vm_exec round-trips.
+    # The literal glob is harmless if no files match: cat fails silently
+    # and $p is empty, so the continue below skips the iteration.
     result = vm_exec(
-        "ls /tmp/orch-*.pid 2>/dev/null",
-        timeout=5,
+        'for f in /tmp/orch-*-*.pid; do '
+        '  [ -f "$f" ] || continue; '
+        '  p=$(cat "$f" 2>/dev/null); '
+        '  [ -z "$p" ] && continue; '
+        '  if ! kill -0 "$p" 2>/dev/null; then rm -f "$f"; continue; fi; '
+        '  t=$(ps -o tty= -p "$p" 2>/dev/null | tr -d " "); '
+        '  echo "$f|$p|$t"; '
+        'done',
+        timeout=10,
     )
     if result.returncode == 0:
-        for pid_path in result.stdout.strip().splitlines():
-            pid_path = pid_path.strip()
-            if not pid_path:
+        for line in result.stdout.strip().splitlines():
+            parts = line.split("|")
+            if len(parts) != 3:
                 continue
-            # Extract name from /tmp/orch-{project}.pid
-            fname = pid_path.rsplit("/", 1)[-1]  # orch-project.pid
-            name = fname.removesuffix(".pid")     # orch-project
-            if not name.startswith("orch-"):
+            pid_path, pid, tty = parts
+            # /tmp/orch-{project}-{pid}.pid → orch-{project}-{pid}
+            fname = pid_path.rsplit("/", 1)[-1].removesuffix(".pid")
+            # Split trailing -{pid}
+            base, _, tail = fname.rpartition("-")
+            if not tail.isdigit() or not base.startswith("orch-"):
                 continue
-            # Check if PID is alive and has a TTY
-            pid_result = vm_exec(
-                f"cat {shlex.quote(pid_path)} 2>/dev/null",
-                timeout=5,
-            )
-            pid = pid_result.stdout.strip() if pid_result.returncode == 0 else ""
-            if not pid or not pid.isdigit():
-                continue
-            alive = vm_exec(f"kill -0 {pid} 2>/dev/null", timeout=5)
-            if alive.returncode != 0:
-                # Stale PID file — clean up
-                vm_exec(f"rm -f {shlex.quote(pid_path)} 2>/dev/null", timeout=5)
-                continue
-            # Check TTY to determine attached state
-            tty_result = vm_exec(f"ps -o tty= -p {pid} 2>/dev/null", timeout=5)
-            tty = tty_result.stdout.strip() if tty_result.returncode == 0 else ""
             attached = bool(tty) and tty != "?"
-            seen.add(name)
             sessions.append({
-                "name": name,
-                "project": name.removeprefix("orch-"),
+                "name": fname,
+                "project": base.removeprefix("orch-"),
                 "created": "",
                 "attached": attached,
+                "pid": pid,
             })
 
     # Also check tmux sessions (headless/dispatch)
@@ -192,14 +216,14 @@ def list_sessions() -> list[dict]:
     if result.returncode == 0:
         for line in result.stdout.strip().splitlines():
             parts = line.split("|")
-            if len(parts) >= 3 and parts[0].startswith("orch-"):
-                if parts[0] not in seen:
-                    sessions.append({
-                        "name": parts[0],
-                        "project": parts[0].removeprefix("orch-"),
-                        "created": parts[1],
-                        "attached": parts[2] != "0",
-                    })
+            if len(parts) >= 3 and parts[0].startswith("orch-") and parts[0] not in seen_tmux:
+                seen_tmux.add(parts[0])
+                sessions.append({
+                    "name": parts[0],
+                    "project": parts[0].removeprefix("orch-"),
+                    "created": parts[1],
+                    "attached": parts[2] != "0",
+                })
 
     return sessions
 
