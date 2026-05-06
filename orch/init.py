@@ -145,9 +145,13 @@ This tells the orchestrator you are idle and ready for the next task.
 
 All projects under `~/Apps/` are accessible read-only at their original paths
 inside the VM. When you need changes in another orch-managed project, submit
-a bridge request via the `orch bridge` CLI \u2014 it talks to the orch daemon,
-which atomically queues the request, runs a subagent on a worktree of the
-target project, and reports status back you can poll.
+a bridge request via the `orch bridge` CLI \u2014 it talks to the orch daemon
+over HTTP, which atomically queues the request, runs a subagent on a worktree
+of the target project, and reports status back you can poll.
+
+This works from inside the Lima VM. The CLI auto-resolves the daemon at
+`host.lima.internal:7777` from the VM and `127.0.0.1:7777` on the macOS host
+(override via `ORCH_DAEMON_HOST` if needed).
 
 ```bash
 orch bridge submit \\

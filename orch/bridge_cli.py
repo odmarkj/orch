@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import socket
 import sys
 import urllib.error
 import urllib.request
@@ -18,8 +20,27 @@ from typing import Any
 from .config import daemon_port
 
 
+def _daemon_host() -> str:
+    """Pick the right hostname to reach the daemon.
+
+    On the macOS host the daemon listens on loopback, so 127.0.0.1 is correct.
+    Inside the Lima VM, loopback is the VM itself; the host daemon is reachable
+    via the Lima-injected host.lima.internal entry. Detect by resolving that
+    name — if it exists, we're in the VM (or any environment that has aliased
+    it intentionally).
+    """
+    explicit = os.environ.get("ORCH_DAEMON_HOST")
+    if explicit:
+        return explicit
+    try:
+        socket.gethostbyname("host.lima.internal")
+        return "host.lima.internal"
+    except OSError:
+        return "127.0.0.1"
+
+
 def _api_base() -> str:
-    return f"http://127.0.0.1:{daemon_port()}"
+    return f"http://{_daemon_host()}:{daemon_port()}"
 
 
 def _http(method: str, path: str, body: dict | None = None) -> tuple[int, Any]:

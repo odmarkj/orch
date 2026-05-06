@@ -51,18 +51,34 @@ Add this to the CLAUDE.md of projects that should be able to communicate:
 ```markdown
 ## Cross-project bridge
 
-When you identify an issue, question, or need related to another project that
-orch manages, you can request a bridge by writing `.orch/bridge_request`:
+When you identify an issue, question, or need related to another orch-managed
+project, submit a bridge request via the `orch bridge` CLI. It posts to the
+orch daemon over HTTP, which atomically queues the request, runs a subagent on
+a worktree of the target project, and reports status back.
 
-\```json
-{
-  "target": "project-name",
-  "intent": "fix|review|query|inform",
-  "summary": "Brief one-line description",
-  "context": "Why you're reaching out, what you know, what you've found",
-  "request": "Specific ask — what should be done or answered",
-  "relevant_files": ["optional", "list of files in target project"]
-}
+This works from inside the Lima VM. The CLI auto-resolves the daemon at
+`host.lima.internal:7777` when run from the VM, and `127.0.0.1:7777` when run
+on the macOS host. Override with `ORCH_DAEMON_HOST` if needed.
+
+\```bash
+orch bridge submit \\
+  --target project-name \\
+  --intent fix \\
+  --summary "Brief one-line description" \\
+  --context-file ./context.md \\
+  --request-file ./request.md \\
+  [--relevant-file path/to/file] [--relevant-file ...] \\
+  [--parent-id br_...]   # only when this is a sub-request of an existing bridge
+\```
+
+The command returns immediately with a bridge id (`br_...`). Use it to check
+progress:
+
+\```bash
+orch bridge status br_...   # full record + event log
+orch bridge list            # everything you've submitted
+orch bridge cancel br_...   # cancel pending or kill an inflight worker
+orch bridge retry  br_...   # resubmit a failed bridge as a new record
 \```
 
 **Intents:**
@@ -71,20 +87,18 @@ orch manages, you can request a bridge by writing `.orch/bridge_request`:
 - `query` — Ask a question about the target project (returns answer text)
 - `inform` — One-way notification, no response expected
 
-After writing the request, continue your current work. The orchestrator will
-handle routing — it spawns a subagent on a worktree of the target project inside
-the VM with read-only access to your project for context.
+The daemon enforces per-target serialization (one bridge per target at a time
+by default), retries transient failures automatically, and rejects requests
+when the target project disables bridges via its `.orch/project.toml`. After
+submitting, continue your current work — you do not need to wait. Poll
+`orch bridge status <id>` only if a follow-up depends on the result.
 
-Check `.orch/bridge_responses/` for results. Each response is a JSON file with
-`status`, `result`, and optionally `pr_url`.
+If you fire a bridge while *handling* one (i.e. the bridge subagent itself
+needs help from a third project), pass `--parent-id` with the id of the bridge
+that's calling you. The daemon tracks depth automatically and rejects chains
+that grow too deep. Never compute or pass a depth value yourself.
 
-If `.orch/_bridge_depth` exists, include its value + 1 as `"depth"` in your
-request. Do not send bridge requests if depth would exceed 2.
+The legacy file-based protocol (`.orch/bridge_request`,
+`.orch/bridge_responses/`, `.orch/_bridge_depth`) was removed — `orch bridge
+submit` is the only supported path.
 ```
-
-The bridge works by:
-1. Claude writes `.orch/bridge_request` → orch watchdog picks it up
-2. Orch creates a worktree on the target project
-3. A subagent runs inside the VM with full context from both projects
-4. Results are delivered back to `.orch/bridge_responses/<id>.json`
-5. The worktree is cleaned up automatically
