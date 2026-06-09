@@ -635,7 +635,11 @@ class OrchApp(App):
         self._debounce_delay: float = 0.3  # seconds
         self._wfi_last_fired: dict[str, float] = {}  # per-project cooldown for waiting_for_input
         self._wfi_cooldown: float = 3.0  # seconds — suppress duplicate iTerm opens
-        self._daemon_was_down: bool = False
+        # Daemon health-probe debounce. A graceful restart blips /healthz for
+        # well under the 60s probe interval, so it can never miss two probes in
+        # a row — only a sustained outage trips the warning.
+        self._daemon_fail_streak: int = 0
+        self._daemon_down_notified: bool = False
         # JSONL journal watcher state
         self._journal_debounce_timers: dict[str, threading.Timer] = {}
         self._journal_debounce_delay: float = 0.5  # seconds — short debounce for live status
@@ -1521,25 +1525,31 @@ class OrchApp(App):
         self.run_worker(self._fetch_bridge_summary, thread=True)
 
     def _probe_daemon(self) -> None:
-        """Background probe: notify (once) when daemon goes down or comes back."""
+        """Background probe: warn (once) when the daemon is genuinely down, and
+        clear when it recovers. Debounced so a graceful restart — which blips
+        /healthz for well under the 60s probe interval — never trips a false
+        'crashed' alarm."""
         from .daemon import daemon_required
-        err = daemon_required()
-        prev = getattr(self, "_daemon_was_down", False)
+        # Consecutive misses before we believe it's really down. A restart can
+        # only ever fail a single probe, so 2 rules out restart blips entirely
+        # while delaying a real-outage warning by at most one interval.
+        FAIL_THRESHOLD = 2
+        err = daemon_required(timeout=2.0)
         if err:
-            self._daemon_was_down = True
-            if not prev:
+            self._daemon_fail_streak += 1
+            if self._daemon_fail_streak >= FAIL_THRESHOLD and not self._daemon_down_notified:
+                self._daemon_down_notified = True
                 self.call_from_thread(
                     self.notify,
-                    "orch-daemon is not running — bridges won't dispatch. "
+                    "orch-daemon isn't responding — bridges won't dispatch. "
                     "Start it with: orch daemon start",
-                    severity="error",
+                    severity="warning",
                 )
         else:
-            self._daemon_was_down = False
-            if prev:
-                self.call_from_thread(
-                    self.notify, "orch-daemon is back up.",
-                )
+            if self._daemon_down_notified:
+                self.call_from_thread(self.notify, "orch-daemon is back up.")
+            self._daemon_fail_streak = 0
+            self._daemon_down_notified = False
 
     def _fetch_bridge_summary(self) -> None:
         from .daemon import daemon_required

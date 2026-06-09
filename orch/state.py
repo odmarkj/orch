@@ -517,8 +517,14 @@ def reset_inflight_to_failed(bid: str, *, error: str) -> None:
 def delete_old_completed(*, retention_days: int) -> int:
     cutoff = datetime.now(timezone.utc).timestamp() - retention_days * 86400
     cutoff_iso = datetime.fromtimestamp(cutoff, timezone.utc).isoformat(timespec="seconds")
+    delete_filter = (
+        STATUS_COMPLETED, STATUS_FAILED, STATUS_REJECTED, STATUS_CANCELLED, cutoff_iso,
+    )
     with transaction() as conn:
-        # Foreign key cascade isn't on, so wipe events first.
+        # Foreign key cascade isn't on, so we have to detach/wipe references by
+        # hand before deleting the bridges themselves.
+        #
+        # 1. bridge_events.bridge_id -> bridges.id
         conn.execute(
             """
             DELETE FROM bridge_events
@@ -527,14 +533,29 @@ def delete_old_completed(*, retention_days: int) -> int:
               WHERE status IN (?, ?, ?, ?) AND completed_at < ?
             )
             """,
-            (STATUS_COMPLETED, STATUS_FAILED, STATUS_REJECTED, STATUS_CANCELLED, cutoff_iso),
+            delete_filter,
+        )
+        # 2. bridges.parent_id -> bridges.id (self-reference). Any row pointing
+        # at a bridge we're about to delete must be detached first, whether it
+        # survives the prune or is itself in the delete set — FK cascade is off
+        # and DELETE order within a statement isn't guaranteed, so a parent can
+        # otherwise be removed while a child still references it.
+        conn.execute(
+            """
+            UPDATE bridges SET parent_id = NULL
+            WHERE parent_id IN (
+              SELECT id FROM bridges
+              WHERE status IN (?, ?, ?, ?) AND completed_at < ?
+            )
+            """,
+            delete_filter,
         )
         cur = conn.execute(
             """
             DELETE FROM bridges
             WHERE status IN (?, ?, ?, ?) AND completed_at < ?
             """,
-            (STATUS_COMPLETED, STATUS_FAILED, STATUS_REJECTED, STATUS_CANCELLED, cutoff_iso),
+            delete_filter,
         )
         return cur.rowcount
 

@@ -713,12 +713,13 @@ def main(argv: list[str] | None = None) -> int:
     return 2
 
 
-def daemon_required() -> str | None:
+def daemon_required(*, timeout: float = 1.0) -> str | None:
     """Probe /healthz; return an error message if the daemon is unreachable.
 
-    Used by CLI and TUI to fail fast with a clear message.
+    Used by CLI and TUI to fail fast with a clear message. The TUI passes a
+    longer timeout so a momentarily busy daemon isn't mistaken for a dead one.
     """
-    if _healthz_probe():
+    if _healthz_probe(timeout=timeout):
         return None
     return (
         "orch-daemon is not running.\n"
