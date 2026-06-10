@@ -13,8 +13,13 @@ Keychain; the file is left with the now-stale, server-invalidated
 refresh_token. The next VM session that tries to refresh fails and prompts
 for login.
 
-This broker fixes that by polling Keychain for changes and mirroring fresh
-credentials to the file. The polling loop does NOT call Anthropic's
+This broker fixes that by polling both stores and reconciling them to
+whichever holds the FRESHER token, in either direction. Crucially it is
+bidirectional and newest-wins: when a VM Claude session refreshes on its own
+it rotates the refresh_token (the server invalidates the old one) and writes
+the new pair to the file, so the broker must copy file -> Keychain in that
+case. A naive Keychain -> file mirror would re-install the dead refresh_token
+and break the whole chain. The polling loop does NOT call Anthropic's
 /oauth/token endpoint itself — refresh remains the responsibility of real
 Claude CLI processes.
 
@@ -229,6 +234,16 @@ def _oauth(creds: dict) -> dict:
     return creds.get("claudeAiOauth", {}) or {}
 
 
+def _expires_at(creds: dict | None) -> int:
+    """expiresAt (ms) of these creds, or -1 if absent/unparseable."""
+    if not creds:
+        return -1
+    try:
+        return int(_oauth(creds).get("expiresAt") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def in_sync(kc: dict, fl: dict) -> bool:
     a, b = _oauth(kc), _oauth(fl)
     return (
@@ -239,23 +254,81 @@ def in_sync(kc: dict, fl: dict) -> bool:
 
 
 def sync_once(dry_run: bool = False) -> str:
+    """
+    Reconcile Keychain and file, "reverse-mostly": the routine direction is
+    file -> Keychain, and the Keychain -> file direction is guarded.
+
+    Why this shape (see the reverse-engineering of cli.js, claude-mem #643):
+    Claude CLI already coordinates concurrent refreshes itself via
+    proper-lockfile on ~/.claude/.credentials.json.lock + an expiry recheck
+    after locking, so the N VM sessions sharing the one file elect a single
+    refresher among themselves — the broker must NOT try to be that refresher
+    and must NOT fight them. OAuth rotates (server-invalidates) the
+    refresh_token on every refresh, so the freshest token is the only valid
+    one; an older token written over it is dead on arrival.
+
+    - File fresher (a VM session just rotated): mirror file -> Keychain. This
+      never touches the file the sessions coordinate on, so it can't clobber
+      them. This is the common, safe path.
+    - Keychain fresher (host genuinely refreshed, e.g. after `claude login`):
+      push Keychain -> file. This is the ONLY direction that can stomp a token
+      the VM is using, so we re-read the file immediately before writing and
+      ABORT if a session rotated it newer than the Keychain in the poll window
+      (`file_won_race`). The file always wins ties — the sessions own it.
+    """
     kc = read_keychain()
-    if kc is None:
-        return "no_keychain"
-    sub = _oauth(kc).get("subscriptionType")
-    if sub != "max":
-        # Defense against the dual-access OAuth bug: if Keychain ever holds a
-        # Console-billed token (e.g. setup-token used the wrong client_id),
-        # propagating it to file would silently route VM usage to API billing.
-        # Refuse to write — operator should re-login and verify the banner.
-        log.warning("refusing to mirror non-max creds (subscriptionType=%r)", sub)
-        return f"non_max_skip:{sub}"
     fl = read_file()
-    if fl is not None and in_sync(kc, fl):
+    if kc is None and fl is None:
+        return "no_keychain"
+    if kc is not None and fl is not None and in_sync(kc, fl):
         return "in_sync"
+
+    kc_exp, fl_exp = _expires_at(kc), _expires_at(fl)
+    # File wins ties: the VM sessions own the file and coordinate writes to it
+    # via Claude's own lockfile; we only step in when the Keychain is strictly
+    # fresher (a real host-side refresh).
+    src, src_name = (kc, "keychain") if kc_exp > fl_exp else (fl, "file")
+
+    sub = _oauth(src).get("subscriptionType")
+    if sub != "max":
+        # Defense against the dual-access OAuth bug: if the source ever holds a
+        # Console-billed token (e.g. setup-token used the wrong client_id),
+        # propagating it would silently route VM usage to API billing.
+        # Refuse to write — operator should re-login and verify the banner.
+        log.warning("refusing to mirror non-max creds (subscriptionType=%r, src=%s)", sub, src_name)
+        return f"non_max_skip:{sub}"
+
+    if src_name == "file":
+        # Routine, safe direction: a VM session rotated on its own; carry the
+        # new token back to the Keychain so the host never holds the
+        # invalidated older refresh_token. Never touches the shared file.
+        # Best-effort: if the Keychain write fails (e.g. locked keychain in a
+        # headless launchd context), the file already holds the fresh token so
+        # VM sessions keep working; only the host falls behind.
+        if dry_run:
+            return "would_write_keychain"
+        try:
+            write_keychain(src)
+        except Exception as e:
+            log.warning("reverse sync: keychain write failed (host left stale): %s", e)
+            return "keychain_write_failed"
+        log.info("wrote_keychain: file fresher (file_exp=%d keychain_exp=%d)", fl_exp, kc_exp)
+        return "wrote_keychain"
+
+    # Keychain fresher -> push to file. Guard against clobbering a session that
+    # refreshed during the poll window: re-read and bail if the file is now
+    # newer than the Keychain.
     if dry_run:
         return "would_write" if fl is not None else "would_write_new"
+    fresh = read_file()
+    if fresh is not None and _expires_at(fresh) > kc_exp:
+        log.info(
+            "file_won_race: skipping keychain->file, file refreshed mid-poll "
+            "(file_exp=%d keychain_exp=%d)", _expires_at(fresh), kc_exp,
+        )
+        return "file_won_race"
     atomic_write_file(kc)
+    log.info("wrote: keychain fresher (keychain_exp=%d file_exp=%d)", kc_exp, fl_exp)
     return "wrote" if fl is not None else "wrote_new"
 
 
