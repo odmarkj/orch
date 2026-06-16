@@ -12,6 +12,7 @@ from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
 from textual.events import Click, Resize
 from textual.reactive import reactive
+from textual.screen import ModalScreen
 from textual.timer import Timer
 from textual.widgets import (
     Header,
@@ -471,6 +472,89 @@ def _build_iterm_tab_script(*, profile: str, dedicated: bool, window_title: str,
         """
 
 
+# ── Session resume picker ─────────────────────────────────────────────────────
+
+def _age_str(epoch: float) -> str:
+    """Compact relative age like '5m', '3h', '2d' from an epoch timestamp."""
+    delta = max(0, int(time.time() - epoch))
+    if delta < 3600:
+        return f"{delta // 60}m"
+    if delta < 86400:
+        return f"{delta // 3600}h"
+    return f"{delta // 86400}d"
+
+
+class SessionPickerScreen(ModalScreen):
+    """Modal list of resumable Claude sessions; dismisses with the chosen one.
+
+    Returns the selected ``SessionEntry`` via ``dismiss``, or ``None`` on Esc.
+    """
+
+    DEFAULT_CSS = """
+    SessionPickerScreen {
+        align: center middle;
+    }
+    SessionPickerScreen > Vertical {
+        width: 90%;
+        max-width: 110;
+        height: auto;
+        max-height: 80%;
+        background: $panel;
+        border: round $accent;
+        padding: 1 2;
+    }
+    SessionPickerScreen #picker-title {
+        text-style: bold;
+        padding-bottom: 1;
+    }
+    SessionPickerScreen ListView {
+        height: auto;
+        max-height: 24;
+    }
+    """
+
+    BINDINGS = [Binding("escape", "cancel", "Close", show=False)]
+
+    def __init__(self, project: Project, entries: list) -> None:
+        super().__init__()
+        self._project = project
+        self._entries = entries
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Static(
+                f"Resume a Claude session — {self._project.name}  "
+                f"[dim]({len(self._entries)})  Enter resume · Esc cancel[/]",
+                id="picker-title",
+                markup=True,
+            )
+            items: list[ListItem] = []
+            for e in self._entries:
+                if e.kind == "worktree":
+                    tag = f"[magenta]w[/] [dim]{e.branch or '?'}[/]"
+                else:
+                    tag = "[green]c[/] [dim]root[/]"
+                line = (
+                    f"{tag}  [dim]{_age_str(e.mtime):>3} · "
+                    f"{e.session_id[:8]}[/]  {e.summary}"
+                )
+                items.append(ListItem(Label(line, markup=True)))
+            yield ListView(*items, id="session-list")
+
+    def on_mount(self) -> None:
+        self.query_one("#session-list", ListView).focus()
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        idx = event.list_view.index
+        if idx is None or idx < 0 or idx >= len(self._entries):
+            self.dismiss(None)
+            return
+        self.dismiss(self._entries[idx])
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 # ── Main App ──────────────────────────────────────────────────────────────────
 
 class OrchApp(App):
@@ -604,6 +688,8 @@ class OrchApp(App):
         Binding("a", "focus_input_todo", "Add Todo", show=True),
         Binding("e", "exec_shell", "Shell", show=True),
         Binding("c", "session_start", "Claude", show=True),
+        Binding("w", "session_start_worktree", "Wktree", show=True),
+        Binding("v", "resume_session", "Resume", show=True),
         Binding("x", "vm_shell", "VM Shell", show=True),
         Binding("d", "session_stop_press", "Stop(dd)", show=True),
         Binding("l", "open_logs", "Logs", show=True),
@@ -642,6 +728,10 @@ class OrchApp(App):
         self._jsonl_dir_to_project: dict[str, Project] = {}
         # Session existence cache: project name -> bool (refreshed periodically)
         self._session_cache: dict[str, bool] = {}
+        # Worktree session tracking: worktree path str -> Project, plus
+        # observer Watch handles so we can unschedule on cleanup.
+        self._worktree_path_to_project: dict[str, Project] = {}
+        self._worktree_watches: dict[str, list] = {}  # wt_path -> [Watch, ...]
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -659,7 +749,7 @@ class OrchApp(App):
                 yield Static("todos", id="right-title")
                 yield Markdown("", id="todos-view")
         yield Static(
-            "[dim]j/k[/] navigate  [dim]Enter[/] select  [dim]t[/]ask  [dim]a[/]dd todo  [dim]e[/]xec  [dim]c[/]laude  [dim]x[/] vm shell  [dim]dd[/] stop\n"
+            "[dim]j/k[/] navigate  [dim]Enter[/] select  [dim]t[/]ask  [dim]a[/]dd todo  [dim]e[/]xec  [dim]c[/]laude  [dim]w[/]ktree  [dim]v[/] resume  [dim]x[/] vm shell  [dim]dd[/] stop\n"
             "[dim]l[/]ogs  [dim]p[/]lan  [dim]b[/]ridge  [dim]s[/]tage  [dim]i[/]gnore  [dim]g[/] auto  [dim]o[/] config  [dim]r[/]efresh  [dim]R[/] reauth  [dim]q[/]uit  [dim]Esc[/] cancel",
             id="help-bar",
             markup=True,
@@ -724,9 +814,41 @@ class OrchApp(App):
         # Kill detached sessions — they're stale (iTerm window was closed).
         # Use _kill_session_tree to also kill the sandboxed process tree,
         # since signals don't propagate through sudo/unshare/su.
+        # Also fire worktree cleanup for any `w` session that just detached.
         for s in active:
             if not s["attached"]:
                 _kill_session_tree(s["name"])
+                wt_id = s.get("worktree_id", "")
+                if wt_id:
+                    self._cleanup_worktree(s["project"], wt_id)
+
+        # Orphan worktree rows (active in DB but no live session — e.g.
+        # orch was restarted while a `w` session window was still open,
+        # then the user closed iTerm). Clean those up too.
+        try:
+            from . import state as _state
+            from .worktrees import cleanup_closed_session as _cleanup
+            live_wt_ids = {
+                s.get("worktree_id", "") for s in active if s.get("worktree_id")
+            }
+            for row in _state.list_active_worktrees():
+                if row["id"] in live_wt_ids:
+                    continue
+                project = next(
+                    (p for p in self.projects if p.name == row["project_name"]),
+                    None,
+                )
+                if project is None:
+                    continue
+                try:
+                    _cleanup(project, row["id"])
+                except Exception:
+                    pass
+                self.call_from_thread(
+                    self._remove_worktree_watch, row["worktree_path"],
+                )
+        except Exception:
+            pass
 
         # Only count attached sessions as active
         active_names = {s["project"] for s in active if s["attached"]}
@@ -756,6 +878,37 @@ class OrchApp(App):
     def _has_session_cached(self, project) -> bool:
         """Check if a session exists (from cache)."""
         return self._session_cache.get(project.name, False)
+
+    def _cleanup_worktree(self, project_name: str, wt_id: str) -> None:
+        """Cleanup hook for a detached `w` session — runs from worker thread.
+
+        Runs cleanup_closed_session (removes worktree if clean, marks status
+        otherwise), then unschedules the watcher.
+        """
+        try:
+            from . import state
+            from .worktrees import cleanup_closed_session
+        except Exception:
+            return
+
+        project = next(
+            (p for p in self.projects if p.name == project_name), None,
+        )
+        if project is None:
+            return
+
+        row = state.get_worktree(wt_id)
+        if row is None:
+            return
+        wt_path = row["worktree_path"]
+
+        try:
+            cleanup_closed_session(project, wt_id)
+        except Exception:
+            pass
+
+        # Always unschedule: the session is gone regardless of outcome.
+        self.call_from_thread(self._remove_worktree_watch, wt_path)
 
     def _refresh_all_labels(self) -> None:
         """Refresh all project list labels and panes."""
@@ -856,6 +1009,24 @@ class OrchApp(App):
                     self._jsonl_dir_to_project[jdir_str] = p
         self._observer.start()
 
+        # Rehydrate watchers for active worktree sessions left over from a
+        # previous orch run. Each row already has project_path; map back to
+        # the matching Project (skip orphans where the project is no longer
+        # discovered).
+        try:
+            from . import state
+            state.init_db()
+            project_by_path = {str(p.path): p for p in self.projects}
+            for row in state.list_active_worktrees():
+                project = project_by_path.get(row["project_path"])
+                if project is None:
+                    continue
+                self._add_worktree_watch(
+                    row["worktree_path"], row["jsonl_dir"], project,
+                )
+        except Exception:
+            pass  # best-effort — daemon is the source of truth
+
     def _on_file_changed(self, path: str) -> None:
         """Called from watchdog thread — debounce rapid events per project."""
         # Find which project this path belongs to for debounce grouping
@@ -897,8 +1068,44 @@ class OrchApp(App):
             self._debounce_timers[key] = timer
             timer.start()
 
+    def _project_for_worktree_path(self, path: Path) -> Project | None:
+        """If `path` is inside a registered worktree, return the parent project."""
+        for wt_path_str, project in self._worktree_path_to_project.items():
+            try:
+                if path.is_relative_to(Path(wt_path_str)):
+                    return project
+            except ValueError:
+                pass
+        return None
+
+    def _mirror_worktree_state(self, changed: Path, project: Project) -> None:
+        """Mirror a worktree's .orch/status or wfi write to the project's .orch/.
+
+        The project-side watcher will catch the mirror write and fire the
+        normal notification/indicator path. We never fire notifications from
+        the worktree-side event directly — that would double-notify.
+        """
+        if changed.name not in ("status", "waiting_for_input"):
+            return
+        target = project.orch_dir / changed.name
+        try:
+            project.orch_dir.mkdir(parents=True, exist_ok=True)
+            if changed.exists():
+                target.write_text(changed.read_text())
+            else:
+                target.unlink(missing_ok=True)
+        except OSError:
+            pass
+
     def _handle_file_change(self, path: str) -> None:
         changed = Path(path)
+
+        # ── Worktree-side event: mirror status/wfi into the project, then return.
+        # The project-side watcher will catch the mirror and run the normal flow.
+        wt_project = self._project_for_worktree_path(changed)
+        if wt_project is not None:
+            self._mirror_worktree_state(changed, wt_project)
+            return
 
         # ── waiting_for_input created: Claude needs you ──────────────────────
         if changed.name == "waiting_for_input" and changed.exists():
@@ -1343,6 +1550,139 @@ class OrchApp(App):
         self._refresh_project_item(p)
 
 
+    def action_session_start_worktree(self) -> None:
+        """Open a Claude session in a fresh git worktree (w shortcut).
+
+        Each press spawns an isolated session — many can run on the same
+        project without stepping on each other. The worktree branches off
+        the project's main; cleanup happens automatically on session close.
+        """
+        if self._input_focused: return
+        if self._mobile:
+            self.notify("Not available on mobile — use the bridge instead", severity="warning")
+            return
+        p = self.selected_project
+        if not p:
+            self.notify("No project selected", severity="warning")
+            return
+        if not (p.path / ".git").is_dir():
+            self.notify(
+                f"w requires a git repo — {p.name} isn't one. Use c instead.",
+                severity="warning",
+            )
+            return
+
+        pane = self.query_one("#status-pane", StatusPane)
+        pane.start_spinner("Creating worktree session", p)
+
+        def _launch():
+            try:
+                vm_ensure_running()
+                from .agent import create_session_worktree
+                from .iterm import open_vm_session_in_worktree
+                from . import state
+
+                wt_path, branch, base_branch, wt_id = create_session_worktree(p)
+
+                # If the project has a pending_task queued, move it into the
+                # worktree so the worktree's Claude picks it up via the
+                # CLAUDE_SNIPPET protocol. Removed from the project so the
+                # next `w` press doesn't redeliver the same task.
+                pt_src = p.orch_dir / "pending_task"
+                if pt_src.exists():
+                    try:
+                        (wt_path / ".orch" / "pending_task").write_text(pt_src.read_text())
+                        pt_src.unlink()
+                    except OSError:
+                        pass
+
+                # Pre-create the JSONL log dir so the watcher can schedule it
+                # before Claude lazily creates it on first turn.
+                jsonl_dir = Path.home() / ".claude" / "projects" / str(wt_path).replace("/", "-")
+                jsonl_dir.mkdir(parents=True, exist_ok=True)
+
+                state.insert_worktree(
+                    project_name=p.name,
+                    project_path=str(p.path),
+                    worktree_path=str(wt_path),
+                    branch=branch,
+                    base_branch=base_branch,
+                    jsonl_dir=str(jsonl_dir),
+                    wt_id=wt_id,
+                )
+
+                self.call_from_thread(
+                    self._add_worktree_watch, str(wt_path), str(jsonl_dir), p,
+                )
+
+                open_vm_session_in_worktree(
+                    p, wt_path, wt_id, branch=branch, base_branch=base_branch,
+                )
+                self.call_from_thread(
+                    self._stop_spinner_and_refresh, p,
+                    f"Worktree session launched for {p.name}",
+                )
+            except Exception as e:
+                self.call_from_thread(
+                    self._stop_spinner_and_refresh, p,
+                    f"Worktree launch failed: {e}", "error",
+                )
+
+        self.run_worker(_launch, thread=True)
+
+    def _add_worktree_watch(self, wt_path: str, jsonl_dir: str, project: Project) -> None:
+        """Schedule watcher on a worktree's .orch/ and JSONL dirs.
+
+        Main-thread only (touches the Observer + reverse-map dicts).
+        """
+        if self._observer is None:
+            return
+        # Skip if already scheduled (shouldn't happen, but defensive)
+        if wt_path in self._worktree_watches:
+            return
+
+        handles: list = []
+        try:
+            wt_orch = Path(wt_path) / ".orch"
+            wt_orch.mkdir(parents=True, exist_ok=True)
+            handles.append(
+                self._observer.schedule(
+                    StatusFileHandler(self._on_file_changed),
+                    str(wt_orch), recursive=False,
+                )
+            )
+            handles.append(
+                self._observer.schedule(
+                    SessionJournalHandler(self._on_journal_changed),
+                    jsonl_dir, recursive=False,
+                )
+            )
+            self._worktree_watches[wt_path] = handles
+            self._worktree_path_to_project[wt_path] = project
+            self._jsonl_dir_to_project[jsonl_dir] = project
+        except Exception:
+            # Best-effort: a watch failure shouldn't block session launch
+            for h in handles:
+                try:
+                    self._observer.unschedule(h)
+                except Exception:
+                    pass
+
+    def _remove_worktree_watch(self, wt_path: str) -> None:
+        """Unschedule watchers for a worktree (called during cleanup)."""
+        handles = self._worktree_watches.pop(wt_path, None)
+        project = self._worktree_path_to_project.pop(wt_path, None)
+        # Remove jsonl_dir mapping too
+        jsonl_dir = str(Path.home() / ".claude" / "projects" / wt_path.replace("/", "-"))
+        self._jsonl_dir_to_project.pop(jsonl_dir, None)
+        if self._observer is None or not handles:
+            return
+        for h in handles:
+            try:
+                self._observer.unschedule(h)
+            except Exception:
+                pass
+
     def action_session_start(self) -> None:
         """Open an iTerm2 window with Claude running in the VM."""
         if self._input_focused: return
@@ -1367,6 +1707,94 @@ class OrchApp(App):
             except Exception as e:
                 self.call_from_thread(self._stop_spinner_and_refresh, p,
                                       f"Launch failed: {e}", "error")
+
+        self.run_worker(_launch, thread=True)
+
+    def action_resume_session(self) -> None:
+        """Open a picker of resumable Claude sessions (`c` root + `w` worktree).
+
+        Selecting one relaunches `claude --resume <id>` in its original cwd in a
+        fresh iTerm window — the way back into a worktree conversation after its
+        window was closed.
+        """
+        if self._input_focused: return
+        if self._mobile:
+            self.notify("Not available on mobile — use the bridge instead", severity="warning")
+            return
+        p = self.selected_project
+        if not p:
+            self.notify("No project selected", severity="warning")
+            return
+
+        def _load():
+            from .sessions import list_resumable_sessions
+            try:
+                entries = list_resumable_sessions(p)
+            except Exception as e:
+                self.call_from_thread(
+                    self.notify, f"Couldn't list sessions: {e}", severity="error",
+                )
+                return
+            self.call_from_thread(self._show_session_picker, p, entries)
+
+        self.run_worker(_load, thread=True)
+
+    def _show_session_picker(self, project: Project, entries: list) -> None:
+        """Main-thread: present the modal picker and resume on selection."""
+        if not entries:
+            self.notify(
+                f"No resumable sessions for {project.name}", severity="warning",
+            )
+            return
+
+        def _on_pick(entry) -> None:
+            if entry is not None:
+                self._resume_picked(project, entry)
+
+        self.push_screen(SessionPickerScreen(project, entries), _on_pick)
+
+    def _resume_picked(self, project: Project, entry) -> None:
+        """Relaunch the chosen session in a new iTerm window."""
+        pane = self.query_one("#status-pane", StatusPane)
+        pane.start_spinner("Resuming session", project)
+
+        def _launch():
+            try:
+                vm_ensure_running()
+                from .iterm import open_vm_resume_session
+                from . import state
+
+                # Reactivate the worktree row + re-arm its watchers so the
+                # resumed session shows live status and is tracked on close.
+                if entry.kind == "worktree" and entry.wt_id:
+                    try:
+                        state.update_worktree_status(entry.wt_id, state.WT_ACTIVE)
+                        row = state.get_worktree(entry.wt_id)
+                        if row:
+                            self.call_from_thread(
+                                self._add_worktree_watch,
+                                row["worktree_path"], row["jsonl_dir"], project,
+                            )
+                    except Exception:
+                        pass
+
+                open_vm_resume_session(
+                    project,
+                    cwd=entry.cwd,
+                    session_id=entry.session_id,
+                    wt_id=entry.wt_id,
+                    branch=entry.branch,
+                    base_branch=entry.base_branch,
+                )
+                self.call_from_thread(
+                    self._stop_spinner_and_refresh, project,
+                    f"Resumed session in {project.name}",
+                )
+            except Exception as e:
+                self.call_from_thread(
+                    self._stop_spinner_and_refresh, project,
+                    f"Resume failed: {e}", "error",
+                )
 
         self.run_worker(_launch, thread=True)
 
