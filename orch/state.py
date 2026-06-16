@@ -22,7 +22,7 @@ from typing import Any, Iterable, Iterator
 
 DB_PATH = Path.home() / ".orch" / "state.db"
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA_SQL = """
 PRAGMA journal_mode = WAL;
@@ -80,6 +80,28 @@ CREATE TABLE IF NOT EXISTS bridge_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_events_bridge ON bridge_events(bridge_id, ts);
+
+-- Session worktrees (the `w` shortcut). Each row tracks a Claude session
+-- launched into a fresh git worktree. `id` doubles as the correlation_id
+-- written to /tmp/orch-{project}-{pid}.worktree so list_sessions can match
+-- a live pid back to its worktree row.
+CREATE TABLE IF NOT EXISTS worktrees (
+  id                TEXT PRIMARY KEY,
+  project_name      TEXT NOT NULL,
+  project_path      TEXT NOT NULL,
+  worktree_path     TEXT NOT NULL UNIQUE,
+  branch            TEXT NOT NULL UNIQUE,
+  base_branch       TEXT NOT NULL,
+  jsonl_dir         TEXT NOT NULL,
+  status            TEXT NOT NULL,
+  pid               INTEGER,
+  created_at        TEXT NOT NULL,
+  closed_at         TEXT,
+  last_pr_check_at  TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_worktrees_status  ON worktrees(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_worktrees_project ON worktrees(project_name, status);
 """
 
 
@@ -141,7 +163,8 @@ def init_db() -> None:
     row = conn.execute(
         "SELECT version FROM schema_version ORDER BY version DESC LIMIT 1"
     ).fetchone()
-    if row is None:
+    current = int(row["version"]) if row else 0
+    if current < SCHEMA_VERSION:
         conn.execute(
             "INSERT INTO schema_version (version, applied_at) VALUES (?, ?)",
             (SCHEMA_VERSION, now_iso()),
@@ -573,6 +596,105 @@ def count_inflight_for_target(target: str) -> int:
         (STATUS_INFLIGHT, target),
     ).fetchone()
     return int(row["n"]) if row else 0
+
+
+# ── Worktree CRUD ───────────────────────────────────────────────────────────
+
+# Status vocabulary for worktree rows.
+WT_ACTIVE        = "active"          # session live in this worktree
+WT_KEPT          = "kept"            # session closed, has commits — GC checks for merged PR
+WT_KEPT_DIRTY    = "kept-dirty"      # session closed, no commits but dirty tree — GC removes after age
+WT_KEPT_CLEAN    = "kept-clean"      # session closed, no commits + clean — kept for resume, GC ages out
+WT_ABANDONED     = "abandoned"       # GC marked: commits but no merged PR after 30d (surfaced, not deleted)
+WT_REMOVED_CLEAN = "removed-clean"   # cleanup at close: no commits + clean → removed
+WT_REMOVED_MERGED = "removed-merged" # GC: matching PR merged on remote → removed
+WT_REMOVED_STALE = "removed-stale"   # GC: dirty-only > age threshold → removed
+WT_FAILED        = "failed"          # spawn failed; row kept for audit
+
+
+def new_worktree_id() -> str:
+    """Opaque, time-sortable. `wt_<base16-time><rand>`. Doubles as correlation_id."""
+    ms = int(time.time() * 1000)
+    rand = secrets.token_hex(4)
+    return f"wt_{ms:012x}{rand}"
+
+
+def insert_worktree(
+    *,
+    project_name: str,
+    project_path: str,
+    worktree_path: str,
+    branch: str,
+    base_branch: str,
+    jsonl_dir: str,
+    wt_id: str | None = None,
+) -> str:
+    """Insert a new worktree row in 'active' status. Returns the id."""
+    wid = wt_id or new_worktree_id()
+    _get_conn().execute(
+        """
+        INSERT INTO worktrees
+          (id, project_name, project_path, worktree_path, branch, base_branch,
+           jsonl_dir, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (wid, project_name, project_path, worktree_path, branch, base_branch,
+         jsonl_dir, WT_ACTIVE, now_iso()),
+    )
+    return wid
+
+
+def get_worktree(wid: str) -> dict | None:
+    row = _get_conn().execute(
+        "SELECT * FROM worktrees WHERE id=?", (wid,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def list_worktrees(*, status: str | None = None, project: str | None = None) -> list[dict]:
+    sql = "SELECT * FROM worktrees WHERE 1=1"
+    args: list[Any] = []
+    if status:
+        sql += " AND status=?"
+        args.append(status)
+    if project:
+        sql += " AND project_name=?"
+        args.append(project)
+    sql += " ORDER BY created_at DESC"
+    rows = _get_conn().execute(sql, args).fetchall()
+    return [dict(r) for r in rows]
+
+
+def list_active_worktrees() -> list[dict]:
+    """All worktrees whose session is supposedly still live."""
+    return list_worktrees(status=WT_ACTIVE)
+
+
+def update_worktree_pid(wid: str, pid: int | None) -> None:
+    _get_conn().execute("UPDATE worktrees SET pid=? WHERE id=?", (pid, wid))
+
+
+def update_worktree_status(wid: str, status: str) -> None:
+    _get_conn().execute(
+        "UPDATE worktrees SET status=? WHERE id=?", (status, wid),
+    )
+
+
+def mark_worktree_closed(wid: str, status: str) -> None:
+    _get_conn().execute(
+        "UPDATE worktrees SET status=?, closed_at=? WHERE id=?",
+        (status, now_iso(), wid),
+    )
+
+
+def set_worktree_pr_check(wid: str) -> None:
+    _get_conn().execute(
+        "UPDATE worktrees SET last_pr_check_at=? WHERE id=?", (now_iso(), wid),
+    )
+
+
+def delete_worktree_row(wid: str) -> None:
+    _get_conn().execute("DELETE FROM worktrees WHERE id=?", (wid,))
 
 
 def pending_targets() -> list[str]:

@@ -115,8 +115,10 @@ def _kill_session_tree(name: str) -> None:
     if tail.isdigit() and base.startswith("orch-"):
         # Per-window form — kill just this window.
         pid_file = f"/tmp/{name}.pid"
+        wt_file = f"/tmp/{name}.worktree"
         vm_exec(
-            f'kill -TERM {tail} 2>/dev/null; rm -f {shlex.quote(pid_file)}',
+            f'kill -TERM {tail} 2>/dev/null; '
+            f'rm -f {shlex.quote(pid_file)} {shlex.quote(wt_file)}',
             timeout=5,
         )
         return
@@ -129,7 +131,7 @@ def _kill_session_tree(name: str) -> None:
         f'  [ -f "$f" ] || continue; '
         f'  p=$(cat "$f" 2>/dev/null); '
         f'  [ -n "$p" ] && kill -TERM "$p" 2>/dev/null; '
-        f'  rm -f "$f"; '
+        f'  rm -f "$f" "${{f%.pid}}.worktree"; '
         f'done',
         timeout=10,
     )
@@ -181,18 +183,23 @@ def list_sessions() -> list[dict]:
         '  [ -f "$f" ] || continue; '
         '  p=$(cat "$f" 2>/dev/null); '
         '  [ -z "$p" ] && continue; '
-        '  if ! kill -0 "$p" 2>/dev/null; then rm -f "$f"; continue; fi; '
+        '  if ! kill -0 "$p" 2>/dev/null; then rm -f "$f" "${f%.pid}.worktree"; continue; fi; '
         '  t=$(ps -o tty= -p "$p" 2>/dev/null | tr -d " "); '
-        '  echo "$f|$p|$t"; '
+        '  w=""; '
+        '  if [ -f "${f%.pid}.worktree" ]; then w=$(cat "${f%.pid}.worktree" 2>/dev/null); fi; '
+        '  echo "$f|$p|$t|$w"; '
         'done',
         timeout=10,
     )
     if result.returncode == 0:
         for line in result.stdout.strip().splitlines():
             parts = line.split("|")
-            if len(parts) != 3:
+            if len(parts) < 3:
                 continue
-            pid_path, pid, tty = parts
+            pid_path = parts[0]
+            pid = parts[1]
+            tty = parts[2]
+            wt_id = parts[3] if len(parts) > 3 else ""
             # /tmp/orch-{project}-{pid}.pid → orch-{project}-{pid}
             fname = pid_path.rsplit("/", 1)[-1].removesuffix(".pid")
             # Split trailing -{pid}
@@ -206,6 +213,7 @@ def list_sessions() -> list[dict]:
                 "created": "",
                 "attached": attached,
                 "pid": pid,
+                "worktree_id": wt_id,
             })
 
     # Also check tmux sessions (headless/dispatch)
@@ -384,28 +392,116 @@ def create_worktree(
     return worktree_dir, branch_name
 
 
+def detect_main_branch(project: "Project") -> str:
+    """Return the project's main branch name (e.g. 'main' or 'master').
+
+    Tries origin/HEAD → origin/main → origin/master → current HEAD.
+    """
+    result = subprocess.run(
+        ["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+        capture_output=True, text=True,
+        cwd=str(project.path), timeout=10,
+    )
+    if result.returncode == 0 and result.stdout.strip():
+        ref = result.stdout.strip()
+        if "/" in ref:
+            return ref.split("/", 1)[1]
+        return ref
+
+    for candidate in ("main", "master"):
+        chk = subprocess.run(
+            ["git", "rev-parse", "--verify", f"origin/{candidate}"],
+            capture_output=True, text=True,
+            cwd=str(project.path), timeout=10,
+        )
+        if chk.returncode == 0:
+            return candidate
+
+    head = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        capture_output=True, text=True,
+        cwd=str(project.path), timeout=10,
+    )
+    if head.returncode == 0 and head.stdout.strip() not in ("HEAD", ""):
+        return head.stdout.strip()
+    return "main"
+
+
+def create_session_worktree(project: "Project") -> tuple[Path, str, str, str]:
+    """Create a worktree for a `w` session, branched off the project's main.
+
+    Returns (worktree_path, branch_name, base_branch, wt_id).
+    The wt_id is also the SQLite row id and the correlation_id written to
+    /tmp/orch-{project}-{pid}.worktree so list_sessions can pair pids to
+    worktrees.
+    """
+    from .state import new_worktree_id
+
+    _ensure_worktrees_gitignored(project)
+
+    wt_id = new_worktree_id()
+    # branch name strips the "wt_" prefix for aesthetics
+    branch_name = f"claude/{wt_id[3:]}"
+    worktree_dir = project.path.parent / ".orch-worktrees" / project.name / wt_id
+    worktree_dir.parent.mkdir(parents=True, exist_ok=True)
+
+    base = detect_main_branch(project)
+    base_ref = f"origin/{base}"
+    if subprocess.run(
+        ["git", "rev-parse", "--verify", base_ref],
+        capture_output=True, cwd=str(project.path), timeout=10,
+    ).returncode != 0:
+        base_ref = base
+
+    result = subprocess.run(
+        ["git", "worktree", "add", "-b", branch_name, str(worktree_dir), base_ref],
+        capture_output=True, text=True,
+        cwd=str(project.path), timeout=30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"git worktree add failed: {result.stderr.strip()}")
+
+    # Pre-create .orch/ so Claude can write status etc. without racing.
+    (worktree_dir / ".orch").mkdir(parents=True, exist_ok=True)
+
+    return worktree_dir, branch_name, base, wt_id
+
+
 def remove_worktree(
     project: "Project", worktree_path: Path, branch_name: str = "",
+    *, force_delete_branch: bool = False,
 ) -> None:
-    """Remove a git worktree and delete the local branch if pushed."""
+    """Remove a git worktree and (optionally) delete the local branch.
+
+    By default the branch is only deleted if it was pushed (preserves
+    bridge_worker behavior). Pass force_delete_branch=True to always
+    drop the local branch — used by session worktree cleanup where the
+    branch may never have been pushed.
+    """
     subprocess.run(
         ["git", "worktree", "remove", "--force", str(worktree_path)],
         capture_output=True, text=True,
         cwd=str(project.path), timeout=30,
     )
 
-    if branch_name:
+    if not branch_name:
+        return
+
+    should_delete = force_delete_branch
+    if not should_delete:
         check = subprocess.run(
             ["git", "branch", "-r", "--list", f"origin/{branch_name}"],
             capture_output=True, text=True,
             cwd=str(project.path), timeout=10,
         )
-        if check.stdout.strip():
-            subprocess.run(
-                ["git", "branch", "-D", branch_name],
-                capture_output=True, text=True,
-                cwd=str(project.path), timeout=10,
-            )
+        should_delete = bool(check.stdout.strip())
+
+    if should_delete:
+        subprocess.run(
+            ["git", "branch", "-D", branch_name],
+            capture_output=True, text=True,
+            cwd=str(project.path), timeout=10,
+        )
 
 
 # ── Git operations (run inside VM for direnv/mise toolchain) ─────────────────

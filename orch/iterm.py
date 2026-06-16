@@ -18,6 +18,7 @@ import base64
 import json
 import shlex
 import subprocess
+import time
 from pathlib import Path
 
 from .models import Project
@@ -377,11 +378,37 @@ def clear_stale_handle(project: Project) -> None:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+def _ensure_iterm_running() -> None:
+    """Ensure iTerm2 is running before AppleScript is compiled against it.
+
+    osascript compiles a `tell application "iTerm2"` block using the app's
+    scripting dictionary. If iTerm2 is not already running, the dictionary
+    isn't loaded, so compound terms like `profile name` fail to parse with a
+    -2741 syntax error ("found property"). This bites right after a reboot,
+    when no iTerm2 window is open yet. Launch the app (in the background, so we
+    don't steal focus) and wait until it's scriptable. Idempotent and fast when
+    iTerm2 is already running.
+    """
+    if subprocess.run(["pgrep", "-x", "iTerm2"],
+                      capture_output=True).returncode == 0:
+        return
+    subprocess.run(["open", "-ga", "iTerm"], capture_output=True, text=True)
+    for _ in range(50):  # up to ~5s
+        probe = subprocess.run(
+            ["osascript", "-e", 'tell application "iTerm2" to return name'],
+            capture_output=True, text=True,
+        )
+        if probe.returncode == 0:
+            return
+        time.sleep(0.1)
+
+
 def _run_iterm_script(script: str) -> str:
     """
     Run an AppleScript that interacts with iTerm2. Returns stdout.
     Raises RuntimeError with stderr if it fails.
     """
+    _ensure_iterm_running()
     result = subprocess.run(
         ["osascript", "-e", script],
         capture_output=True,
@@ -494,6 +521,282 @@ def open_vm_session(project: Project, with_shell: bool = False) -> None:
     if with_shell:
         shell_tab_name = f"{project.name} (shell)"
         shell_inner = f"cd {shlex.quote(project_dir)} && exec bash"
+        shell_vm_cmd = vm_ssh_cmd(extra_cmd=shell_inner)
+        shell_cmd = _applescript_quote(f"{badge} && {shell_vm_cmd}")
+
+        script = f"""
+        tell application "iTerm2"
+            try
+                set newWindow to (create window with profile "{profile}")
+            on error
+                set newWindow to (create window with default profile)
+            end try
+            tell newWindow
+                tell current session
+                    set name to "{tab_name}"
+                    set badge to "{project.name}"
+                    write text {claude_cmd}
+                    set claudeTty to tty
+                end tell
+                try
+                    create tab with profile "{profile}"
+                on error
+                    create tab with default profile
+                end try
+                tell current session
+                    set name to "{shell_tab_name}"
+                    set badge to "{project.name}"
+                    write text {shell_cmd}
+                end tell
+                repeat with aTab in tabs
+                    try
+                        repeat with aSession in sessions of aTab
+                            try
+                                if tty of aSession is claudeTty then
+                                    select aTab
+                                    exit repeat
+                                end if
+                            on error
+                            end try
+                        end repeat
+                    on error
+                    end try
+                end repeat
+            end tell
+        end tell
+        """
+    else:
+        script = f"""
+        tell application "iTerm2"
+            try
+                set newWindow to (create window with profile "{profile}")
+            on error
+                set newWindow to (create window with default profile)
+            end try
+            tell newWindow
+                tell current session
+                    set name to "{tab_name}"
+                    set badge to "{project.name}"
+                    write text {claude_cmd}
+                end tell
+            end tell
+        end tell
+        """
+
+    _run_iterm_script(script)
+
+
+def open_vm_session_in_worktree(
+    project: Project,
+    worktree_path: Path,
+    wt_id: str,
+    *,
+    branch: str,
+    base_branch: str,
+    with_shell: bool = True,
+) -> None:
+    """Open a NEW iTerm2 window with Claude running in a worktree.
+
+    Mirrors `open_vm_session` but:
+      - cd's to the worktree path (not project root)
+      - writes both /tmp/orch-{project}-{pid}.pid AND .worktree files
+      - does NOT pass --resume (each worktree session is fresh)
+      - exports ORCH_WORKTREE=1, ORCH_BRANCH, ORCH_BASE_BRANCH so Claude
+        can push the branch by name without surfacing it to the user
+    """
+    import shlex
+    from .vm import vm_ssh_cmd
+    from .agent import session_exists, fire_first_session_hook
+
+    if not session_exists(project):
+        fire_first_session_hook(project)
+
+    from .agent import _maybe_update_stack_detection
+    _maybe_update_stack_detection(project)
+
+    # Clear stale status from previous sessions in this worktree (paranoid;
+    # the worktree was just created, but in case of a re-spawn)
+    try:
+        (worktree_path / ".orch").mkdir(parents=True, exist_ok=True)
+        (worktree_path / ".orch" / "status").write_text("Starting session")
+    except OSError:
+        pass
+
+    cfg = _load_config()
+    profile = cfg["iterm"].get("profile", "orch")
+    wt_dir = str(worktree_path)
+
+    tab_name = f"{project.name} [w]"
+    badge = _iterm_badge_cmd(project.name)
+    claude_args = "--dangerously-skip-permissions"
+
+    pid_prefix = f"/tmp/orch-{project.name}"
+    # The PIDFILE and WTFILE share the same {pid_prefix}-$$ stem so
+    # list_sessions and _kill_session_tree can find one from the other.
+    inner_cmd = (
+        f"export TERM=xterm-256color COLORTERM=truecolor; "
+        f"export ORCH_WORKTREE=1 "
+        f"ORCH_BRANCH={shlex.quote(branch)} "
+        f"ORCH_BASE_BRANCH={shlex.quote(base_branch)} "
+        f"ORCH_WORKTREE_ID={shlex.quote(wt_id)}; "
+        f"cd {shlex.quote(wt_dir)} && "
+        f'PIDFILE={shlex.quote(pid_prefix)}-$$.pid; '
+        f'WTFILE={shlex.quote(pid_prefix)}-$$.worktree; '
+        f'trap "rm -f $PIDFILE $WTFILE" EXIT HUP; '
+        f'echo $$ > "$PIDFILE"; '
+        f'echo {shlex.quote(wt_id)} > "$WTFILE"; '
+        f"clear; claude {claude_args} {_orch_prompt_arg()}"
+    )
+    vm_cmd = vm_ssh_cmd(extra_cmd=inner_cmd)
+    claude_cmd = _applescript_quote(f"{badge} && {vm_cmd}")
+
+    if with_shell:
+        shell_tab_name = f"{project.name} [w] (shell)"
+        shell_inner = f"cd {shlex.quote(wt_dir)} && exec bash"
+        shell_vm_cmd = vm_ssh_cmd(extra_cmd=shell_inner)
+        shell_cmd = _applescript_quote(f"{badge} && {shell_vm_cmd}")
+
+        script = f"""
+        tell application "iTerm2"
+            try
+                set newWindow to (create window with profile "{profile}")
+            on error
+                set newWindow to (create window with default profile)
+            end try
+            tell newWindow
+                tell current session
+                    set name to "{tab_name}"
+                    set badge to "{project.name}"
+                    write text {claude_cmd}
+                    set claudeTty to tty
+                end tell
+                try
+                    create tab with profile "{profile}"
+                on error
+                    create tab with default profile
+                end try
+                tell current session
+                    set name to "{shell_tab_name}"
+                    set badge to "{project.name}"
+                    write text {shell_cmd}
+                end tell
+                repeat with aTab in tabs
+                    try
+                        repeat with aSession in sessions of aTab
+                            try
+                                if tty of aSession is claudeTty then
+                                    select aTab
+                                    exit repeat
+                                end if
+                            on error
+                            end try
+                        end repeat
+                    on error
+                    end try
+                end repeat
+            end tell
+        end tell
+        """
+    else:
+        script = f"""
+        tell application "iTerm2"
+            try
+                set newWindow to (create window with profile "{profile}")
+            on error
+                set newWindow to (create window with default profile)
+            end try
+            tell newWindow
+                tell current session
+                    set name to "{tab_name}"
+                    set badge to "{project.name}"
+                    write text {claude_cmd}
+                end tell
+            end tell
+        end tell
+        """
+
+    _run_iterm_script(script)
+
+
+def open_vm_resume_session(
+    project: Project,
+    *,
+    cwd: Path,
+    session_id: str,
+    wt_id: str | None = None,
+    branch: str | None = None,
+    base_branch: str | None = None,
+    with_shell: bool = True,
+) -> None:
+    """Open a NEW iTerm2 window resuming an existing Claude session.
+
+    Works for both root (`c`) and worktree (`w`) sessions — Claude keys
+    ``--resume`` on the working directory, so we just cd to the session's
+    original ``cwd`` and pass ``--resume <session_id>``.
+
+    For worktree resumes pass ``wt_id``/``branch``/``base_branch`` so the
+    relaunched session re-exports the ORCH_* env and re-writes the
+    ``/tmp/orch-{project}-{pid}.worktree`` correlation file. That lets
+    ``list_sessions`` pair the live pid back to its worktree row and lets the
+    close-cleanup re-evaluate the worktree when the window is closed again.
+    """
+    import shlex
+    from .vm import vm_ssh_cmd
+    from .agent import session_exists, fire_first_session_hook
+
+    if not session_exists(project):
+        fire_first_session_hook(project)
+
+    from .agent import _maybe_update_stack_detection
+    _maybe_update_stack_detection(project)
+
+    is_worktree = wt_id is not None
+    try:
+        status_dir = cwd / ".orch"
+        status_dir.mkdir(parents=True, exist_ok=True)
+        (status_dir / "status").write_text("Resuming session")
+    except OSError:
+        pass
+
+    cfg = _load_config()
+    profile = cfg["iterm"].get("profile", "orch")
+    work_dir = str(cwd)
+
+    suffix = " [w]" if is_worktree else ""
+    tab_name = f"{project.name}{suffix}"
+    badge = _iterm_badge_cmd(project.name)
+    claude_args = f"--dangerously-skip-permissions --resume {shlex.quote(session_id)}"
+
+    pid_prefix = f"/tmp/orch-{project.name}"
+    env_exports = "export TERM=xterm-256color COLORTERM=truecolor; "
+    wt_lines = ""
+    if is_worktree:
+        env_exports += (
+            f"export ORCH_WORKTREE=1 "
+            f"ORCH_BRANCH={shlex.quote(branch or '')} "
+            f"ORCH_BASE_BRANCH={shlex.quote(base_branch or '')} "
+            f"ORCH_WORKTREE_ID={shlex.quote(wt_id)}; "
+        )
+        wt_lines = (
+            f'WTFILE={shlex.quote(pid_prefix)}-$$.worktree; '
+            f'echo {shlex.quote(wt_id)} > "$WTFILE"; '
+        )
+    trap_targets = '$PIDFILE $WTFILE' if is_worktree else '$PIDFILE'
+    inner_cmd = (
+        f"{env_exports}"
+        f"cd {shlex.quote(work_dir)} && "
+        f'PIDFILE={shlex.quote(pid_prefix)}-$$.pid; '
+        f'{wt_lines}'
+        f'trap "rm -f {trap_targets}" EXIT HUP; '
+        f'echo $$ > "$PIDFILE"; '
+        f"clear; claude {claude_args} {_orch_prompt_arg()}"
+    )
+    vm_cmd = vm_ssh_cmd(extra_cmd=inner_cmd)
+    claude_cmd = _applescript_quote(f"{badge} && {vm_cmd}")
+
+    if with_shell:
+        shell_tab_name = f"{project.name}{suffix} (shell)"
+        shell_inner = f"cd {shlex.quote(work_dir)} && exec bash"
         shell_vm_cmd = vm_ssh_cmd(extra_cmd=shell_inner)
         shell_cmd = _applescript_quote(f"{badge} && {shell_vm_cmd}")
 
