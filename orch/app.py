@@ -2264,7 +2264,7 @@ class OrchApp(App):
     def _on_dispatch_complete(
         self, project: Project, todo_text: str, results: dict
     ) -> None:
-        from .agent import remove_worktree
+        from .agent import remove_worktree, worktree_unpushed_reason
 
         # Mark done
         self._mark_todo_done(project, todo_text)
@@ -2290,11 +2290,22 @@ class OrchApp(App):
         if review and pr_url:
             self._post_review_comment(pr_url, review)
 
-        # Clean up worktree and local branch
+        # Clean up worktree and local branch — but never force-remove one
+        # still holding work that isn't on a remote (a swallowed push
+        # failure would otherwise destroy the commits with no record).
         wt_path = results.get("worktree")
         if wt_path:
             try:
-                remove_worktree(project, Path(wt_path), branch)
+                reason = worktree_unpushed_reason(
+                    Path(wt_path), results.get("base_commit", ""),
+                )
+                if reason is None:
+                    remove_worktree(project, Path(wt_path), branch)
+                else:
+                    self.notify(
+                        f"⚠ worktree kept ({reason}): {wt_path}",
+                        severity="warning",
+                    )
             except Exception:
                 pass
 

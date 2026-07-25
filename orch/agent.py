@@ -467,6 +467,91 @@ def create_session_worktree(project: "Project") -> tuple[Path, str, str, str]:
     return worktree_dir, branch_name, base, wt_id
 
 
+def worktree_head(worktree_path: Path) -> str:
+    """Best-effort HEAD sha of a worktree via host-side git ('' on failure)."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True, text=True,
+            cwd=str(worktree_path), timeout=10,
+        )
+    except Exception:
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def worktree_branch(worktree_path: Path) -> str:
+    """Best-effort checked-out branch of a worktree via host-side git.
+
+    Returns 'HEAD' when detached, '' on failure.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True,
+            cwd=str(worktree_path), timeout=10,
+        )
+    except Exception:
+        return ""
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def head_on_any_remote(worktree_path: Path) -> bool | None:
+    """Whether the worktree's HEAD commit is reachable from any remote-
+    tracking ref. None if it could not be determined. Host-side git so the
+    answer is available even when the VM is down."""
+    try:
+        result = subprocess.run(
+            ["git", "branch", "-r", "--contains", "HEAD"],
+            capture_output=True, text=True,
+            cwd=str(worktree_path), timeout=15,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    return bool(result.stdout.strip())
+
+
+def worktree_unpushed_reason(worktree_path: Path, base_commit: str = "") -> str | None:
+    """Why this worktree must NOT be force-removed, or None if removal is safe.
+
+    Safe means: no uncommitted changes (.orch/ scratch excluded) and HEAD
+    either still sits at *base_commit* (nothing was ever committed here) or
+    is reachable from a remote-tracking ref. Anything unverifiable counts as
+    unpushed — a false "keep" costs a stray directory; a false "remove"
+    destroys work with no record.
+    """
+    try:
+        status = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True, text=True,
+            cwd=str(worktree_path), timeout=15,
+        )
+    except Exception as e:
+        return f"could not verify worktree state: {e}"
+    if status.returncode != 0:
+        return f"git status failed: {(status.stderr or '').strip()[:200]}"
+    dirty = [
+        line for line in status.stdout.splitlines()
+        if line.strip() and not line[3:].startswith(".orch/")
+    ]
+    if dirty:
+        return f"{len(dirty)} uncommitted change(s)"
+
+    head = worktree_head(worktree_path)
+    if not head:
+        return "could not resolve HEAD"
+    if base_commit and head == base_commit:
+        return None
+    on_remote = head_on_any_remote(worktree_path)
+    if on_remote is None:
+        return "could not verify HEAD against remote branches"
+    if not on_remote:
+        return f"HEAD commit {head[:12]} is not on any remote branch"
+    return None
+
+
 def remove_worktree(
     project: "Project", worktree_path: Path, branch_name: str = "",
     *, force_delete_branch: bool = False,
@@ -617,9 +702,11 @@ def run_task_in_worktree(project: "Project", todo_text: str) -> dict:
     Returns a dict: {branch, worktree, pr_url, review, test_attempts, tests_passed}.
     """
     worktree_path, branch_name = create_worktree(project, todo_text)
+    base_commit = worktree_head(worktree_path)
     results = {
         "branch": branch_name,
         "worktree": str(worktree_path),
+        "base_commit": base_commit,
         "pr_url": None,
         "review": "",
         "test_attempts": 0,
@@ -704,8 +791,13 @@ def run_task_in_worktree(project: "Project", todo_text: str) -> dict:
         results["pr_url"] = pr_url
 
     except Exception:
+        # Never force-remove a worktree still holding work that isn't on a
+        # remote — commits and uncommitted changes would be destroyed with
+        # no record. A preserved worktree can be inspected or cleaned by
+        # hand; destroyed work cannot.
         try:
-            remove_worktree(project, worktree_path, branch_name)
+            if worktree_unpushed_reason(worktree_path, base_commit) is None:
+                remove_worktree(project, worktree_path, branch_name)
         except Exception:
             pass
         raise
