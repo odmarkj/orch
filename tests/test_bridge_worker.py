@@ -53,7 +53,8 @@ def temp_db(tmp_path, monkeypatch):
 
 @pytest.fixture
 def repo(tmp_path):
-    """A project clone with a local bare 'origin' so pushes are real."""
+    """A project clone whose 'origin' is a local bare repo behind a file://
+    URL, so pushes go through git's real smart transport."""
     origin = tmp_path / "origin.git"
     subprocess.run(
         ["git", "init", "--bare", "-b", "main", str(origin)],
@@ -62,7 +63,7 @@ def repo(tmp_path):
     project_dir = tmp_path / "apps" / "proj"
     project_dir.parent.mkdir()
     subprocess.run(
-        ["git", "clone", str(origin), str(project_dir)],
+        ["git", "clone", f"file://{origin}", str(project_dir)],
         check=True, capture_output=True, text=True,
     )
     _git(project_dir, "checkout", "-B", "main")
@@ -295,6 +296,32 @@ def test_fix_prompt_explains_post_exit_flow():
 
 
 # ── run_bridge end-to-end: the exact incident, replayed ─────────────────────
+#
+# These drive the real pipeline — worktree created by run_bridge, real
+# commits, real pushes over file:// to a bare origin, real teardown. Only
+# three things are stubbed: the LLM (a function that edits the worktree
+# directly), `gh pr create`, and the VM liveness check.
+
+@pytest.fixture
+def bridge_env(repo, temp_db, local_git, fake_pr, monkeypatch):
+    """Everything run_bridge needs except an agent: temp DB, local git,
+    stubbed PR creation, VM check disabled, project discoverable."""
+    monkeypatch.setattr("orch.vm.vm_ensure_running", lambda: None)
+    monkeypatch.setattr(bw, "discover_projects", lambda: [repo.project])
+    return repo
+
+
+def _fake_agent(behavior):
+    """A run_headless stand-in: applies *behavior* to the worktree (the
+    "agent edits"), writes the result note, and reports success."""
+    def run(project, prompt, *, workdir=None, **kwargs):
+        behavior(Path(workdir))
+        orch_dir = Path(workdir) / ".orch"
+        orch_dir.mkdir(exist_ok=True)
+        (orch_dir / "bridge_result").write_text("did the work")
+        return SimpleNamespace(returncode=0, stdout="did the work", stderr="")
+    return run
+
 
 def test_run_bridge_branch_mismatch_never_loses_the_commit(
     repo, temp_db, local_git, fake_pr, monkeypatch, tmp_path,
@@ -321,13 +348,137 @@ def test_run_bridge_branch_mismatch_never_loses_the_commit(
     assert rec["branch"] == "agent/went-elsewhere"
     assert rec["pr_url"] == "https://github.test/pr/agent/went-elsewhere"
 
-    # The commit reached the remote — the work was never lost.
+    # The commit reached the remote — the work was never lost — and is
+    # retrievable from the bare origin by content, not just by ref.
     remote = _git(repo.origin, "rev-parse", "refs/heads/agent/went-elsewhere", check=False)
     assert remote.returncode == 0
+    shown = _git(repo.origin, "show", "refs/heads/agent/went-elsewhere:fix.py")
+    assert shown.stdout == "the actual work\n"
+
+    # The stale planned ref was NOT silently pushed at the base commit —
+    # that "successful" empty push is what made the original incident
+    # invisible.
+    mismatch = [
+        e for e in state.get_events(b["id"]) if e["event"] == "branch_mismatch"
+    ][0]
+    planned = mismatch["detail"]["planned"]
+    stale = _git(repo.origin, "rev-parse", f"refs/heads/{planned}", check=False)
+    assert stale.returncode != 0
 
     # Everything shipped, so the worktree was safe to remove.
     assert not Path(rec["worktree_path"]).exists()
 
     event_names = [e["event"] for e in state.get_events(b["id"])]
     assert "branch_mismatch" in event_names
+    assert "no_changes" not in event_names
+
+
+def test_run_bridge_detached_head_ships_to_planned_branch(bridge_env, monkeypatch):
+    """Agent forced into detached HEAD → commit still reaches the planned ref.
+
+    Detached HEAD is what git imposes when the agent tries to check out a
+    branch that is already checked out elsewhere — plausibly what happened
+    in the original incident. The behavior below reproduces that sequence
+    for real rather than assuming it.
+    """
+    repo = bridge_env
+    b = _make_bridge(target_name=repo.project.name)
+
+    def behavior(workdir):
+        # main is checked out in the project clone, so git refuses this —
+        # the exact refusal that pushes real agents into detached HEAD.
+        refused = _git(workdir, "checkout", "main", check=False)
+        assert refused.returncode != 0
+        assert "already" in (refused.stderr + refused.stdout)
+        _git(workdir, "checkout", "--detach")
+        (workdir / "fix.py").write_text("detached work\n")
+
+    monkeypatch.setattr(agent_mod, "run_headless", _fake_agent(behavior))
+
+    bw.run_bridge(b)
+
+    rec = state.get_bridge(b["id"])
+    assert rec["status"] == "completed", rec["error"]
+    planned = rec["branch"]
+    assert planned.startswith("bridge/")
+
+    # The commit reached refs/heads/<planned> on the origin and the work
+    # is retrievable from the bare repo.
+    shown = _git(repo.origin, "show", f"refs/heads/{planned}:fix.py")
+    assert shown.stdout == "detached work\n"
+
+    # Shipped everywhere it needed to go, so the worktree is gone.
+    assert not Path(rec["worktree_path"]).exists()
+
+    events = [e for e in state.get_events(b["id"]) if e["event"] == "branch_mismatch"]
+    assert len(events) == 1
+    assert events[0]["detail"]["actual"] == "(detached HEAD)"
+
+
+def test_run_bridge_push_failure_preserves_worktree(bridge_env, monkeypatch):
+    """The teardown guard, observed actually saving work.
+
+    The push fails (remote gone), the bridge records a transient failure —
+    and the worktree survives on disk with the commit still in it, with a
+    worktree_preserved event saying where to look.
+    """
+    repo = bridge_env
+    b = _make_bridge(target_name=repo.project.name)
+
+    def behavior(workdir):
+        (workdir / "fix.py").write_text("nearly lost work\n")
+        # The remote disappears before the push. Repo config is shared with
+        # the project clone, which is how a broken remote presents for real.
+        _git(workdir, "remote", "set-url", "origin", "/nonexistent/origin.git")
+
+    monkeypatch.setattr(agent_mod, "run_headless", _fake_agent(behavior))
+
+    bw.run_bridge(b)
+
+    rec = state.get_bridge(b["id"])
+    assert rec["status"] == "failed"
+    assert rec["error_class"] == "transient"
+    assert "push" in rec["error"]
+    assert rec["next_retry_at"] is not None
+
+    # The worktree is still on disk and the commit inside it still holds
+    # the work.
+    wt = Path(rec["worktree_path"])
+    assert wt.exists()
+    shown = _git(wt, "show", "HEAD:fix.py")
+    assert shown.stdout == "nearly lost work\n"
+
+    events = [e for e in state.get_events(b["id"]) if e["event"] == "worktree_preserved"]
+    assert len(events) == 1
+    assert events[0]["detail"]["worktree_path"] == str(wt)
+    assert "not on any remote branch" in events[0]["detail"]["reason"]
+
+
+def test_run_bridge_happy_path_pushes_planned_branch_and_cleans_up(
+    bridge_env, monkeypatch,
+):
+    """Agent stays on the planned branch → normal push, PR, full teardown."""
+    repo = bridge_env
+    b = _make_bridge(target_name=repo.project.name)
+
+    def behavior(workdir):
+        (workdir / "fix.py").write_text("routine work\n")
+
+    monkeypatch.setattr(agent_mod, "run_headless", _fake_agent(behavior))
+
+    bw.run_bridge(b)
+
+    rec = state.get_bridge(b["id"])
+    assert rec["status"] == "completed", rec["error"]
+    planned = rec["branch"]
+    assert planned.startswith("bridge/")
+    assert rec["pr_url"] == f"https://github.test/pr/{planned}"
+
+    shown = _git(repo.origin, "show", f"refs/heads/{planned}:fix.py")
+    assert shown.stdout == "routine work\n"
+    assert not Path(rec["worktree_path"]).exists()
+
+    event_names = [e["event"] for e in state.get_events(b["id"])]
+    assert "branch_mismatch" not in event_names
+    assert "worktree_preserved" not in event_names
     assert "no_changes" not in event_names
