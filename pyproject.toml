@@ -12,6 +12,9 @@ dependencies = [
     "watchdog>=4.0.0",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
 [project.scripts]
 orch = "orch.__main__:main"
 orch-setup = "orch.setup:main"
@@ -22,3 +25,6 @@ include = ["orch*"]
 
 [tool.setuptools.package-data]
 orch = ["templates/**/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

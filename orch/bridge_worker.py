@@ -10,7 +10,9 @@ as transient vs permanent so the janitor can auto-retry the right ones.
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
 from . import state
@@ -109,9 +111,24 @@ class TransientBridgeError(Exception):
     network blip, git push race, Claude API rate-limit, etc)."""
 
 
+@dataclass
+class CommitOutcome:
+    """Structured result of the commit/push/PR stage.
+
+    "The agent changed nothing" (changed=False) must be distinguishable
+    from every other outcome — a bridge that produced work but shipped
+    none of it silently destroyed an agent's commits once, precisely
+    because both cases collapsed to the same return value.
+    """
+    changed: bool
+    pushed: bool = False
+    branch: str | None = None
+    pr_url: str | None = None
+
+
 # ── Prompt ─────────────────────────────────────────────────────────────────
 
-def _build_prompt(b: dict) -> str:
+def _build_prompt(b: dict, branch_name: str = "") -> str:
     lines = [
         f'You are handling a bridge request from project "{b["source_project"]}".',
         "",
@@ -132,11 +149,16 @@ def _build_prompt(b: dict) -> str:
             *(f"- {f}" for f in b["relevant_files"]),
             "",
         ]
+    branch_display = branch_name or "the bridge branch"
     intent_instructions = {
         "fix": [
             "- Make the requested code changes in this project",
             "- Save all changes. Do not commit or push.",
-            "- Write a brief summary of what you changed to .orch/bridge_result",
+            f"- After you exit, the orchestrator commits everything on branch "
+            f"`{branch_display}`, pushes it, and opens a PR. Stay on that "
+            "branch — do not switch branches, commit, or push yourself.",
+            "- Write a brief summary of what you changed to .orch/bridge_result. "
+            "It becomes the PR body, so write it as a description of the change.",
         ],
         "review": [
             "- Review the relevant code and provide feedback",
@@ -173,10 +195,7 @@ def run_bridge(bridge: dict) -> None:
     bid = bridge["id"]
 
     try:
-        from .agent import (
-            create_worktree, remove_worktree, run_headless,
-            _run_git, _create_pr,
-        )
+        from .agent import create_worktree, worktree_head
         from .vm import vm_ensure_running
 
         target = _find_target(bridge["target_project"])
@@ -197,6 +216,7 @@ def run_bridge(bridge: dict) -> None:
 
         worktree_path: Path | None = None
         branch_name = ""
+        base_commit = ""
         try:
             try:
                 worktree_path, branch_name = create_worktree(
@@ -205,6 +225,10 @@ def run_bridge(bridge: dict) -> None:
             except RuntimeError as e:
                 raise TransientBridgeError(f"worktree creation failed: {e}") from e
 
+            # HEAD at creation time — lets the teardown guard tell "no
+            # commits ever landed here" apart from "local-only commits".
+            base_commit = worktree_head(worktree_path)
+
             state.set_inflight_meta(
                 bid,
                 worker_pid=os.getpid(),
@@ -212,7 +236,7 @@ def run_bridge(bridge: dict) -> None:
                 branch=branch_name,
             )
 
-            prompt = _build_prompt(bridge)
+            prompt = _build_prompt(bridge, branch_name=branch_name)
             state.add_event(bid, "prompt_sent")
             stdout, _stderr = _run_headless_capture(
                 target, prompt, bid=bid, phase="initial",
@@ -251,27 +275,39 @@ def run_bridge(bridge: dict) -> None:
                 result_text = output
 
             pr_url = None
+            pushed_branch = None
             if bridge["intent"] == "fix":
-                pr_url = _commit_and_pr(
+                outcome = _commit_and_pr(
                     target, worktree_path, branch_name,
                     bridge["summary"], result_text,
+                    bid=bid, base_commit=base_commit,
                 )
+                pr_url = outcome.pr_url
+                pushed_branch = outcome.branch
+                if not outcome.changed:
+                    state.add_event(bid, "no_changes", {
+                        "note": "agent made no changes; nothing was committed or pushed",
+                    })
+                elif outcome.pushed and not pr_url:
+                    state.add_event(bid, "pr_missing", {
+                        "branch": pushed_branch,
+                        "warning": "changes were pushed but no PR URL was captured",
+                    })
 
             state.mark_completed(
                 bid,
                 result=result_text,
                 pr_url=pr_url,
-                branch=branch_name if bridge["intent"] == "fix" else None,
+                branch=pushed_branch,
             )
             if pr_url:
                 state.add_event(bid, "pr_created", {"pr_url": pr_url})
 
         finally:
             if worktree_path is not None:
-                try:
-                    remove_worktree(target, worktree_path, branch_name)
-                except Exception:
-                    pass
+                _teardown_worktree(
+                    bid, target, worktree_path, branch_name, base_commit,
+                )
 
     except PermanentBridgeError as e:
         state.mark_rejected(bid, reason=str(e))
@@ -390,32 +426,87 @@ def _run_clarification(bridge: dict, question: str) -> str:
 
 def _commit_and_pr(
     target: Project, worktree_path: Path, branch_name: str,
-    summary: str, result_text: str,
-) -> str | None:
-    from .agent import _run_git, _create_pr
+    summary: str, result_text: str, *, bid: str, base_commit: str = "",
+) -> CommitOutcome:
+    """Commit whatever the agent produced, push it, and open a PR.
+
+    Pushes the branch HEAD is actually on — never a possibly-stale planned
+    ref. If the agent moved to another branch, `git push origin <planned>`
+    exits 0 while shipping nothing, and the teardown then destroys the only
+    copy of the commit. That exact sequence lost real work once.
+    """
+    from .agent import _run_git, _create_pr, head_on_any_remote, worktree_head
     import time
 
     _run_git(target, worktree_path, ["add", "-A"], timeout=10)
     status_check = _run_git(
         target, worktree_path, ["status", "--porcelain"], timeout=10,
     )
-    if not status_check.stdout.strip():
-        return None
+    dirty = bool(status_check.stdout.strip())
 
-    _run_git(
-        target, worktree_path,
-        ["commit", "-m", f"bridge: {summary[:60]}"],
-        timeout=30,
+    if not dirty:
+        # Nothing to commit — but that is only a genuine no-op if HEAD holds
+        # no new local-only commits (an agent that committed its own work
+        # must not be mistaken for one that did nothing).
+        head_sha = worktree_head(worktree_path)
+        if base_commit and head_sha == base_commit:
+            return CommitOutcome(changed=False)
+        if head_on_any_remote(worktree_path):
+            return CommitOutcome(changed=False)
+        # Local-only commits with a clean tree: fall through and push them.
+
+    if dirty:
+        commit = _run_git(
+            target, worktree_path,
+            ["commit", "-m", f"bridge: {summary[:60]}"],
+            timeout=30,
+        )
+        if commit.returncode != 0:
+            raise TransientBridgeError(
+                "git commit failed: "
+                + (commit.stderr or commit.stdout or "").strip()[:400]
+            )
+
+    head = _run_git(
+        target, worktree_path, ["rev-parse", "--abbrev-ref", "HEAD"], timeout=10,
     )
+    current = head.stdout.strip()
+    if not current:
+        raise TransientBridgeError(
+            "could not determine checked-out branch before push"
+        )
+
+    if current == "HEAD":
+        # Detached HEAD: no branch to push by name, so ship the commit to
+        # the planned branch ref explicitly. Never push the bare planned
+        # branch here — its ref was left behind at the base commit and the
+        # push would "succeed" while shipping nothing.
+        push_branch = branch_name
+        push_args = ["push", "origin", f"HEAD:refs/heads/{branch_name}"]
+        state.add_event(bid, "branch_mismatch", {
+            "planned": branch_name,
+            "actual": "(detached HEAD)",
+            "action": f"pushed HEAD to {branch_name}",
+        })
+    elif current != branch_name:
+        # The agent moved to another branch; the work lives there. Push
+        # what HEAD actually is and open the PR against it.
+        push_branch = current
+        push_args = ["push", "-u", "origin", current]
+        state.add_event(bid, "branch_mismatch", {
+            "planned": branch_name,
+            "actual": current,
+            "action": f"pushed {current} instead",
+        })
+        state.set_inflight_meta(bid, branch=current)
+    else:
+        push_branch = branch_name
+        push_args = ["push", "-u", "origin", branch_name]
 
     delays = [2, 4, 8, 16]
     pushed = False
     for attempt in range(5):
-        push = _run_git(
-            target, worktree_path,
-            ["push", "-u", "origin", branch_name],
-            timeout=60,
-        )
+        push = _run_git(target, worktree_path, push_args, timeout=60)
         if push.returncode == 0:
             pushed = True
             break
@@ -423,9 +514,71 @@ def _commit_and_pr(
             time.sleep(delays[attempt])
 
     if not pushed:
-        raise TransientBridgeError("git push failed after retries")
+        raise TransientBridgeError(
+            f"git push of {push_branch} failed after retries"
+        )
 
-    return _create_pr(
-        target, worktree_path, branch_name,
+    pr_url = _create_pr(
+        target, worktree_path, push_branch,
         summary, result_text, title_prefix="bridge",
     )
+    if pr_url is None:
+        # `gh pr create` fails when the branch already has an open PR — in
+        # that case the push above just updated it, which is a success
+        # worth recording, not a missing PR.
+        pr_url = _existing_pr_url(worktree_path, push_branch)
+    return CommitOutcome(changed=True, pushed=True, branch=push_branch, pr_url=pr_url)
+
+
+def _existing_pr_url(worktree_path: Path, branch: str) -> str | None:
+    """URL of an already-open PR for *branch*, or None."""
+    from .vm import vm_exec
+
+    try:
+        result = vm_exec(
+            f"gh pr view {shlex.quote(branch)} --json url --jq .url",
+            cwd=str(worktree_path), timeout=30,
+        )
+    except Exception:
+        return None
+    url = (result.stdout or "").strip()
+    if result.returncode == 0 and url.startswith("http"):
+        return url
+    return None
+
+
+def _teardown_worktree(
+    bid: str, target: Project, worktree_path: Path,
+    branch_name: str, base_commit: str,
+) -> None:
+    """Remove the bridge worktree — unless it still holds work that never
+    reached a remote, in which case leave it in place and make that loud.
+
+    This is a safety net, not a feature: if the push logic is correct it
+    should almost never trigger. When it does, the work still exists and
+    `orch bridge status` says where. Never raises (runs in a finally).
+    """
+    from .agent import remove_worktree, worktree_branch, worktree_unpushed_reason
+
+    try:
+        reason = worktree_unpushed_reason(worktree_path, base_commit)
+    except Exception as e:
+        reason = f"could not verify worktree state: {e!r}"
+
+    if reason:
+        try:
+            state.add_event(bid, "worktree_preserved", {
+                "reason": reason,
+                "worktree_path": str(worktree_path),
+                "planned_branch": branch_name,
+                "checked_out_branch": worktree_branch(worktree_path) or "(unknown)",
+                "note": "worktree left in place so unpushed work can be recovered",
+            })
+        except Exception:
+            pass
+        return
+
+    try:
+        remove_worktree(target, worktree_path, branch_name)
+    except Exception:
+        pass
