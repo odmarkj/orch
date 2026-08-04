@@ -482,3 +482,78 @@ def test_run_bridge_happy_path_pushes_planned_branch_and_cleans_up(
     assert "branch_mismatch" not in event_names
     assert "worktree_preserved" not in event_names
     assert "no_changes" not in event_names
+
+
+# ── Undeliverable payloads must not be retried ──────────────────────────────
+
+_MUX_STDERR = (
+    "mm_send_fd: sendmsg(1): Message too long\n"
+    "mux_client_request_session: send fds failed"
+)
+
+
+def test_undeliverable_prompt_is_permanent_not_transient(bridge_env, monkeypatch):
+    """ssh dying at session setup means the command never reached the VM.
+    That is a property of the payload, identical on every attempt — so the
+    bridge must fail once, permanently, instead of auto-retrying."""
+    repo = bridge_env
+    b = _make_bridge(target_name=repo.project.name)
+
+    def undeliverable(project, prompt, *, workdir=None, **kwargs):
+        return SimpleNamespace(returncode=255, stdout="", stderr=_MUX_STDERR)
+
+    monkeypatch.setattr(agent_mod, "run_headless", undeliverable)
+
+    bw.run_bridge(b)
+
+    rec = state.get_bridge(b["id"])
+    assert rec["status"] == "rejected"
+    assert rec["error_class"] == "permanent"
+    assert rec["next_retry_at"] is None
+    assert rec["retry_count"] == 0
+    # The message has to say what to do about it, not just what happened.
+    assert "never delivered" in rec["error"]
+    assert "file" in rec["error"]
+
+    # Nothing was left behind: no commit to preserve, so the worktree goes.
+    assert not Path(rec["worktree_path"]).exists()
+
+
+def test_oversized_command_is_permanent(bridge_env, monkeypatch):
+    """The pre-flight size guard fails the bridge outright rather than
+    surfacing as an unknown error that the janitor would requeue."""
+    repo = bridge_env
+    b = _make_bridge(target_name=repo.project.name)
+
+    from orch.vm import CommandTooLargeError
+
+    def too_large(project, prompt, *, workdir=None, **kwargs):
+        raise CommandTooLargeError("remote command is 99999 bytes; ...")
+
+    monkeypatch.setattr(agent_mod, "run_headless", too_large)
+
+    bw.run_bridge(b)
+
+    rec = state.get_bridge(b["id"])
+    assert rec["status"] == "rejected"
+    assert rec["error_class"] == "permanent"
+    assert rec["next_retry_at"] is None
+    assert "could not be delivered" in rec["error"]
+
+
+def test_ordinary_nonzero_exit_is_still_transient(bridge_env, monkeypatch):
+    """Guard against over-reaching: a normal failed Claude run retries."""
+    repo = bridge_env
+    b = _make_bridge(target_name=repo.project.name)
+
+    def failed(project, prompt, *, workdir=None, **kwargs):
+        return SimpleNamespace(returncode=1, stdout="", stderr="API rate limit")
+
+    monkeypatch.setattr(agent_mod, "run_headless", failed)
+
+    bw.run_bridge(b)
+
+    rec = state.get_bridge(b["id"])
+    assert rec["status"] == "failed"
+    assert rec["error_class"] == "transient"
+    assert rec["next_retry_at"] is not None
