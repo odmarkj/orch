@@ -259,13 +259,22 @@ def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="orch bridge")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    s = sub.add_parser("submit", help="submit a cross-project bridge request")
+    s = sub.add_parser(
+        "submit", help="submit a cross-project bridge request",
+        description=(
+            "Submit a cross-project bridge request. Keep --context and "
+            "--request to roughly a page each: all projects share the VM "
+            "filesystem, so long detail (logs, diffs, full reports) belongs "
+            "in a file that the request references by path (e.g. "
+            "/tmp/report.md), not inline in the request itself."
+        ),
+    )
     s.add_argument("--target", required=True, help="target project name")
     s.add_argument("--intent", required=True, choices=("fix", "review", "query", "inform"))
     s.add_argument("--summary", required=True, help="one-line description")
-    s.add_argument("--context", help="context text (or use --context-file)")
+    s.add_argument("--context", help="context text, ~a page (or use --context-file)")
     s.add_argument("--context-file", help="path to a file containing context")
-    s.add_argument("--request", help="request text (or use --request-file)")
+    s.add_argument("--request", help="request text, ~a page (or use --request-file)")
     s.add_argument("--request-file", help="path to a file containing the request")
     s.add_argument("--relevant-file", action="append", default=[],
                    help="file in target project to highlight (repeatable)")

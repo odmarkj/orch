@@ -314,20 +314,24 @@ def run_headless(
 
     Used by auto-dispatch and bridge communication. Filesystem writes
     are sandboxed to the project directory (and any extra allowed_dirs).
+
+    The prompt is delivered over stdin, never on the command line: ssh
+    sends the whole remote command to the mux master in one control
+    message, so a prompt past a few KB killed the session at setup with
+    rc=255 ("mm_send_fd: sendmsg(1): Message too long") before claude ever
+    ran. `claude -p` with no positional prompt reads it from stdin, so the
+    command stays short and constant no matter how long the prompt is.
     """
     vm_ensure_running()
 
     if workdir is None:
         workdir = str(project.path)
 
-    safe_prompt = prompt.replace("'", "'\\''")
-    dirs_flag = ""
+    parts = ["claude", "--dangerously-skip-permissions"]
     if allowed_dirs:
-        dirs_flag = " ".join(
-            f"--add-dir {shlex.quote(d)}" for d in allowed_dirs
-        )
-
-    cmd = f"claude --dangerously-skip-permissions {dirs_flag} -p '{safe_prompt}'"
+        parts += [f"--add-dir {shlex.quote(d)}" for d in allowed_dirs]
+    parts.append("-p")
+    cmd = " ".join(parts)
 
     writable = [str(project.path)]
     if allowed_dirs:
@@ -335,6 +339,7 @@ def run_headless(
 
     return vm_exec_sandboxed(
         cmd, cwd=workdir, writable_dirs=writable, timeout=timeout,
+        input=prompt,
     )
 
 
@@ -677,20 +682,24 @@ def _create_pr(
     review_text: str = "",
     title_prefix: str = "auto",
 ) -> str | None:
-    """Create a PR via gh CLI inside the VM. Returns the PR URL or None."""
+    """Create a PR via gh CLI inside the VM. Returns the PR URL or None.
+
+    The body goes over stdin (`--body-file -`) for the same reason the
+    headless prompt does: a bridge result of more than a few KB would blow
+    the ssh control-channel limit and the PR would silently never be
+    created, right after the work was pushed.
+    """
     body = f"## Auto-dispatched task\n\n{todo_text}\n"
     if review_text:
         body += f"\n## Code Review\n\n{review_text}\n"
 
-    safe_title = f"{title_prefix}: {todo_text[:60]}"
-    safe_body = body.replace("'", "'\\''")
-    safe_title_sh = safe_title.replace("'", "'\\''")
+    title = f"{title_prefix}: {todo_text[:60]}"
 
     gh_cmd = (
-        f"gh pr create --title '{safe_title_sh}' "
-        f"--body '{safe_body}' --head '{branch_name}'"
+        f"gh pr create --title {shlex.quote(title)} "
+        f"--body-file - --head {shlex.quote(branch_name)}"
     )
-    result = vm_exec(gh_cmd, cwd=str(worktree_path), timeout=30)
+    result = vm_exec(gh_cmd, cwd=str(worktree_path), timeout=30, input=body)
     if result.returncode == 0:
         return result.stdout.strip()
     return None

@@ -61,13 +61,28 @@ def _run_headless_capture(
     target: Project, prompt: str, *, bid: str, phase: str, **kwargs,
 ) -> tuple[str, str]:
     """Run a headless Claude turn, persisting both streams to the event log
-    regardless of outcome. Returns (stdout, stderr). Raises TransientBridgeError
-    on subprocess error, timeout, or non-zero exit; the failure path includes
-    the captured streams so callers don't need to unpack again."""
+    regardless of outcome. Returns (stdout, stderr).
+
+    Raises TransientBridgeError on subprocess error, timeout, or non-zero
+    exit; the failure path includes the captured streams so callers don't
+    need to unpack again. Raises PermanentBridgeError when the command
+    never reached the VM because it was too large for the ssh control
+    channel — that outcome is a property of the payload, so every retry
+    would fail identically and calling it transient just burns the budget
+    while telling the submitter to "try again later"."""
     from .agent import run_headless
+    from .vm import CommandTooLargeError, is_ssh_undeliverable
 
     try:
         result = run_headless(target, prompt, **kwargs)
+    except CommandTooLargeError as e:
+        _record_headless_output(
+            bid, phase, returncode=None, stdout=None, stderr=str(e),
+        )
+        raise PermanentBridgeError(
+            f"headless {phase} could not be delivered ({len(prompt)}-byte "
+            f"prompt): {e}"
+        ) from e
     except subprocess.TimeoutExpired as e:
         # TimeoutExpired carries whatever streams were collected before the
         # timeout fired. Capture them, log, then surface as transient.
@@ -92,6 +107,18 @@ def _run_headless_capture(
         bid, phase, returncode=result.returncode, stdout=out, stderr=err,
     )
     if result.returncode != 0:
+        if is_ssh_undeliverable(result.returncode, err):
+            # ssh died at session setup — the remote command never ran, so
+            # this says nothing about the VM's health and everything about
+            # the size of what we tried to send.
+            raise PermanentBridgeError(
+                f"headless {phase} was never delivered to the VM: ssh failed at "
+                f"session setup (rc={result.returncode}) because the command "
+                f"exceeded the ssh control-channel limit. An identical retry "
+                f"cannot succeed — shrink the request (put long detail in a "
+                f"file and reference the path from the bridge). "
+                f"stderr tail: {_tail(err, 400)}"
+            )
         raise TransientBridgeError(
             f"headless {phase} exited {result.returncode}"
             + (f"; stderr tail: {_tail(err, 400)}" if err.strip() else "")

@@ -8,12 +8,89 @@ management, no credential injection.
 
 from __future__ import annotations
 
+import os
 import shlex
 import subprocess
 from pathlib import Path
 
 VM_NAME = "orch"
 LIMA_YAML = Path(__file__).parent.parent / "lima" / "orch.yaml"
+
+
+# ── Remote command size limit ────────────────────────────────────────────────
+#
+# ssh hands the *entire* remote command to the ControlMaster in a single mux
+# control message. Past a few KB the client's sendmsg() returns EMSGSIZE and
+# the session dies at setup — before the remote command ever runs — with
+#
+#     mm_send_fd: sendmsg(1): Message too long
+#     mux_client_request_session: send fds failed
+#
+# and rc=255. Observed: a ~5.5 KB command failed every time (four attempts,
+# ~2s each), the same command at ~1 KB succeeded. This is *permanent for a
+# given payload*: an identical retry can never succeed.
+#
+# So never interpolate bulk text into a command string. Pass it over stdin
+# (`input=`) or write it to a file in the VM and reference the path. The cap
+# below is the backstop for anything that slips through; it is deliberately
+# below the fuzzy real boundary so the failure is a clear message rather than
+# rc=255. Override with ORCH_SSH_CMD_MAX_BYTES if you must.
+
+_DEFAULT_SSH_CMD_MAX_BYTES = 4096
+
+
+def ssh_cmd_max_bytes() -> int:
+    """Byte cap for a remote command string (env-overridable)."""
+    raw = os.environ.get("ORCH_SSH_CMD_MAX_BYTES", "")
+    if raw.strip():
+        try:
+            return int(raw)
+        except ValueError:
+            pass
+    return _DEFAULT_SSH_CMD_MAX_BYTES
+
+
+class CommandTooLargeError(RuntimeError):
+    """The assembled remote command exceeds what ssh can deliver.
+
+    Permanent for a given payload — retrying the identical command cannot
+    succeed, so callers should fail fast rather than schedule a retry.
+    """
+
+
+def _check_cmd_size(shell_cmd: str) -> None:
+    """Refuse an oversized remote command with an actionable message."""
+    size = len(shell_cmd.encode("utf-8", errors="replace"))
+    cap = ssh_cmd_max_bytes()
+    if size <= cap:
+        return
+    raise CommandTooLargeError(
+        f"remote command is {size} bytes; the ssh control channel caps it near "
+        f"{cap} bytes and fails at session setup (rc=255, "
+        f"'mm_send_fd: sendmsg: Message too long') above that. Pass the bulk "
+        f"text over stdin instead, or write it to a file the VM can read and "
+        f"reference the path from the command."
+    )
+
+
+# stderr fingerprints of the failure above. rc=255 plus any of these means the
+# command never reached the VM.
+_UNDELIVERABLE_MARKERS = (
+    "mm_send_fd",
+    "mux_client_request_session",
+    "Message too long",
+)
+
+
+def is_ssh_undeliverable(returncode: int | None, stderr: str | None) -> bool:
+    """True when ssh failed to hand the command to the mux master.
+
+    Distinguishes "the payload is too big to deliver" (permanent) from an
+    ordinary non-zero exit of the remote command (possibly transient).
+    """
+    if returncode != 255 or not stderr:
+        return False
+    return any(m in stderr for m in _UNDELIVERABLE_MARKERS)
 
 
 def vm_status() -> str:
@@ -81,6 +158,7 @@ def vm_exec(
     cwd: str | Path | None = None,
     timeout: int = 120,
     capture: bool = True,
+    input: str | None = None,
 ) -> subprocess.CompletedProcess:
     """Run a command inside the VM via direct SSH.
 
@@ -89,12 +167,19 @@ def vm_exec(
     a full login shell to keep execution fast.
 
     If *cwd* is given, the command runs in that directory.
+    If *input* is given it is written to the remote command's stdin — use
+    this for anything bulky rather than interpolating it into *cmd* (see
+    CommandTooLargeError).
+
+    Raises CommandTooLargeError if the assembled command is too large for
+    the ssh control channel.
     """
     inner_parts = ["[ -f ~/.bash_env ] && . ~/.bash_env"]
     if cwd:
         inner_parts.append(f"cd {shlex.quote(str(cwd))}")
     inner_parts.append(cmd)
     shell_cmd = " && ".join(inner_parts)
+    _check_cmd_size(shell_cmd)
 
     return subprocess.run(
         [
@@ -108,6 +193,7 @@ def vm_exec(
         capture_output=capture,
         text=True,
         timeout=timeout,
+        input=input,
     )
 
 
@@ -237,10 +323,19 @@ def vm_exec_sandboxed(
     writable_dirs: list[str],
     timeout: int = 120,
     capture: bool = True,
+    input: str | None = None,
 ) -> subprocess.CompletedProcess:
     """Run a command inside the VM with filesystem sandboxing.
 
     ~/Apps is read-only except for the directories in writable_dirs.
+
+    *input* is written to the sandboxed command's stdin (it survives the
+    sudo/unshare/su chain untouched), which is how bulk text — prompts,
+    PR bodies — must be delivered. Interpolating it into *cmd* instead
+    blows the ssh control-channel limit; see CommandTooLargeError.
+
+    Raises CommandTooLargeError if the assembled command is too large for
+    the ssh control channel.
     """
     if cwd:
         full_cmd = f"cd {shlex.quote(str(cwd))} && {cmd}"
@@ -248,6 +343,8 @@ def vm_exec_sandboxed(
         full_cmd = cmd
 
     sandboxed = sandbox_cmd(full_cmd, writable_dirs)
+    shell_cmd = f"[ -f ~/.bash_env ] && . ~/.bash_env && {sandboxed}"
+    _check_cmd_size(shell_cmd)
 
     return subprocess.run(
         [
@@ -256,11 +353,12 @@ def vm_exec_sandboxed(
             *_MUX_OPTS,
             "-F", str(SSH_CONFIG),
             f"lima-{VM_NAME}",
-            f"[ -f ~/.bash_env ] && . ~/.bash_env && {sandboxed}",
+            shell_cmd,
         ],
         capture_output=capture,
         text=True,
         timeout=timeout,
+        input=input,
     )
 
 

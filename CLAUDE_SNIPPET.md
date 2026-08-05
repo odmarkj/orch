@@ -87,6 +87,19 @@ orch bridge retry  br_...   # resubmit a failed bridge as a new record
 - `query` — Ask a question about the target project (returns answer text)
 - `inform` — One-way notification, no response expected
 
+**Payload size — put long detail in a file.** Keep `--context` and `--request`
+to roughly a page each. Both projects share the VM filesystem, so for anything
+longer (logs, diffs, full reports) write it to a file and reference the path
+from the request — `/tmp/my-report.md` is readable by the target's agent, and
+a path costs a line instead of ten kilobytes. This is a convention, not a hard
+cap: the prompt is handed to the target agent over stdin, so a long request
+will be delivered, it just makes for a worse brief.
+
+If a bridge ever comes back `[permanent]` saying the request could not be
+delivered, that is this limit being hit somewhere it still bites. Resubmitting
+the same bytes cannot help — shorten the request, move the bulk into a file,
+and submit again.
+
 The daemon enforces per-target serialization (one bridge per target at a time
 by default), retries transient failures automatically, and rejects requests
 when the target project disables bridges via its `.orch/project.toml`. After
