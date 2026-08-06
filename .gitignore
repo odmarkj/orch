@@ -37,6 +37,7 @@ pyvenv.cfg
 .orch/_bridge_depth
 .orch/bridge_result
 .orch/last_review.md
+.orch/_archive/
 
 # Database dumps (large, local only)
 data-dumps/
@@ -44,3 +45,7 @@ data-dumps/
 # Claude Code long-lived OAuth token — must never be committed
 claude_oauth_token
 .orch-worktrees
+
+# Local scratch — not part of the project
+lima.REJECTED.yaml
+share-attempts/
