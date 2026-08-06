@@ -414,6 +414,23 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_text(f"invalid intent: {body['intent']!r}", 400)
             return
 
+        # A source_path at or above the projects root (e.g. $HOME, which has
+        # .claude/ and .orch/ and used to fool the CLI's auto-detection) gets
+        # bind-mounted over itself by the worker's sandbox, shadowing the
+        # ~/Apps mount and making the freshly created worktree invisible.
+        # Reject it here so the submitter gets an actionable error instead of
+        # three doomed retries.
+        from .discovery import SITES_ROOT
+        src = Path(os.path.normpath(body["source_path"]))
+        if src == SITES_ROOT or src in SITES_ROOT.parents:
+            self._send_text(
+                f"source_path {src} is not a project directory (it is at or "
+                f"above the projects root {SITES_ROOT}); run from inside a "
+                "project or pass --source and --source-path",
+                400,
+            )
+            return
+
         sub = state.BridgeSubmission(
             source_project=body["source_project"],
             source_path=body["source_path"],

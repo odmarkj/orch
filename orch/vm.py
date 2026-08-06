@@ -279,8 +279,18 @@ def sandbox_cmd(cmd: str, writable_dirs: list[str], *, scope: str | None = None)
         f"mount --bind {shlex.quote(APPS_ROOT)} {shlex.quote(APPS_ROOT)}",
         f"mount -o remount,bind,ro {shlex.quote(APPS_ROOT)}",
     ]
+    apps = Path(APPS_ROOT)
     for d in writable_dirs:
-        qd = shlex.quote(d)
+        # Only paths strictly inside ~/Apps get a rw bind punched through the
+        # ro layer. Anything else is at best a no-op (outside ~/Apps nothing
+        # was made read-only) and at worst — ~/Apps itself or an ancestor
+        # like $HOME — a non-recursive self-bind that shadows the ~/Apps
+        # mount, so every path under it resolves to the empty stub directory
+        # behind the mountpoint and the sandboxed command sees no files.
+        p = Path(os.path.normpath(d))
+        if apps not in p.parents:
+            continue
+        qd = shlex.quote(str(p))
         parts.append(f"mount --bind {qd} {qd}")
         parts.append(f"mount -o remount,bind,rw {qd}")
 
