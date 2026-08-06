@@ -94,6 +94,20 @@ def bridge_max_concurrent_total() -> int:
         return 3
 
 
+def bridge_worker_timeout_seconds() -> int:
+    """Per-call timeout for the headless Claude subprocess that runs a bridge.
+
+    Covers both the initial turn and any clarification follow-up. Bumping this
+    lets bridges that legitimately need to do long work (e.g. multi-file
+    refactors with lots of test runs) finish instead of being killed.
+    """
+    raw = _section("bridge").get("worker_timeout_seconds", 3600)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 3600
+
+
 def bridge_max_retries() -> int:
     raw = _section("bridge").get("max_retries", 3)
     try:
