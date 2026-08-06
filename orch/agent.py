@@ -9,6 +9,7 @@ Also contains worktree management (moved from container.py).
 
 from __future__ import annotations
 
+import os
 import random
 import re
 import shlex
@@ -370,10 +371,43 @@ def _ensure_worktrees_gitignored(project: "Project") -> None:
         pass
 
 
+def _fresh_base_ref(project: "Project") -> tuple[str, str]:
+    """Return (base_branch, ref to branch new worktrees from).
+
+    Fetches origin/<base> first so worktrees start from the remote tip rather
+    than wherever origin/<base> pointed the last time anything fetched — the
+    local repo has no reason to be current once PRs merge on GitHub. The fetch
+    only updates the remote-tracking ref; no local branch or working tree is
+    touched, so sessions on the root checkout are unaffected.
+
+    Best-effort: offline / no-remote / timeout falls back to whatever refs the
+    repo already has (origin/<base>, then local <base>, then HEAD).
+    """
+    base = detect_main_branch(project)
+    # GIT_TERMINAL_PROMPT=0: a missing credential helper must fail the fetch,
+    # not hang it waiting for a password nobody will type.
+    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    try:
+        subprocess.run(
+            ["git", "fetch", "--no-tags", "origin", base],
+            capture_output=True, cwd=str(project.path), timeout=30, env=env,
+        )
+    except subprocess.TimeoutExpired:
+        pass
+
+    for ref in (f"origin/{base}", base):
+        if subprocess.run(
+            ["git", "rev-parse", "--verify", ref],
+            capture_output=True, cwd=str(project.path), timeout=10,
+        ).returncode == 0:
+            return base, ref
+    return base, "HEAD"
+
+
 def create_worktree(
     project: "Project", todo_text: str, *, branch_prefix: str = "auto",
 ) -> tuple[Path, str]:
-    """Create a git worktree for the given task.
+    """Create a git worktree for the given task, branched off fresh remote main.
 
     Returns (worktree_path, branch_name).
     """
@@ -386,8 +420,9 @@ def create_worktree(
 
     worktree_dir.parent.mkdir(parents=True, exist_ok=True)
 
+    _base, base_ref = _fresh_base_ref(project)
     result = subprocess.run(
-        ["git", "worktree", "add", "-b", branch_name, str(worktree_dir)],
+        ["git", "worktree", "add", "-b", branch_name, str(worktree_dir), base_ref],
         capture_output=True, text=True,
         cwd=str(project.path), timeout=30,
     )
@@ -433,7 +468,7 @@ def detect_main_branch(project: "Project") -> str:
 
 
 def create_session_worktree(project: "Project") -> tuple[Path, str, str, str]:
-    """Create a worktree for a `w` session, branched off the project's main.
+    """Create a worktree for a `w` session, branched off fresh remote main.
 
     Returns (worktree_path, branch_name, base_branch, wt_id).
     The wt_id is also the SQLite row id and the correlation_id written to
@@ -450,13 +485,7 @@ def create_session_worktree(project: "Project") -> tuple[Path, str, str, str]:
     worktree_dir = project.path.parent / ".orch-worktrees" / project.name / wt_id
     worktree_dir.parent.mkdir(parents=True, exist_ok=True)
 
-    base = detect_main_branch(project)
-    base_ref = f"origin/{base}"
-    if subprocess.run(
-        ["git", "rev-parse", "--verify", base_ref],
-        capture_output=True, cwd=str(project.path), timeout=10,
-    ).returncode != 0:
-        base_ref = base
+    base, base_ref = _fresh_base_ref(project)
 
     result = subprocess.run(
         ["git", "worktree", "add", "-b", branch_name, str(worktree_dir), base_ref],

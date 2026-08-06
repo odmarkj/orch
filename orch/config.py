@@ -75,6 +75,15 @@ def daemon_record_retention_days() -> int:
         return 30
 
 
+def daemon_main_sync_interval_seconds() -> int:
+    """Cadence of the daemon's local-main fast-forward sweep. 0 disables."""
+    raw = _section("daemon").get("main_sync_interval_seconds", 900)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 900
+
+
 # ── Bridge defaults ────────────────────────────────────────────────────────
 
 def bridge_max_concurrent_total() -> int:

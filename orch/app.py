@@ -1558,8 +1558,8 @@ class OrchApp(App):
         """Open a Claude session in a fresh git worktree (w shortcut).
 
         Each press spawns an isolated session — many can run on the same
-        project without stepping on each other. The worktree branches off
-        the project's main; cleanup happens automatically on session close.
+        project without stepping on each other. The worktree branches off a
+        freshly fetched remote main; cleanup happens on session close.
         """
         if self._input_focused: return
         if self._mobile:

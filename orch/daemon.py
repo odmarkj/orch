@@ -40,6 +40,7 @@ from urllib.parse import parse_qs, urlparse
 from . import state
 from .config import (
     bridge_max_concurrent_total,
+    daemon_main_sync_interval_seconds,
     daemon_port,
     daemon_record_retention_days,
     daemon_worker_timeout_seconds,
@@ -261,6 +262,143 @@ class _Janitor:
         deleted = state.delete_old_completed(retention_days=daemon_record_retention_days())
         if deleted:
             log.info("janitor pruned %d old records", deleted)
+
+
+# ── Main-branch sync ──────────────────────────────────────────────────────
+
+class _MainSync:
+    """Opportunistically fast-forwards each project's local main to origin.
+
+    Worktree sessions branch off a freshly fetched origin/<main>, so a stale
+    local main can't poison new `w` sessions — but root (`c`) sessions launch
+    on the local checkout, so keep it current when provably safe:
+
+      - the fetch never touches a working tree or local branch — always safe;
+      - main NOT checked out in the root repo → `git fetch origin main:main`
+        updates just the ref; git itself refuses non-fast-forward updates and
+        refuses to move a branch any worktree has checked out;
+      - main IS checked out → `merge --ff-only`, but only with a clean tree
+        AND no live root session on the project — a session's checkout must
+        never change underneath it.
+
+    A diverged local main (commits not on origin) is never touched. Every
+    failure is a silent skip, re-evaluated next sweep; this is best-effort.
+    """
+
+    def __init__(self) -> None:
+        self._stop = threading.Event()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def run(self) -> None:
+        log.info("main-sync started")
+        while not self._stop.is_set():
+            interval = daemon_main_sync_interval_seconds()
+            if interval <= 0:
+                self._stop.wait(60)  # disabled; poll config once a minute
+                continue
+            try:
+                self._tick()
+            except Exception as exc:
+                log.exception("main-sync tick errored")
+                if state.is_connection_fault(exc):
+                    state.close_conn()
+            self._stop.wait(interval)
+
+    def _tick(self) -> None:
+        from .discovery import discover_projects
+
+        root_sessions = self._projects_with_root_sessions()
+        for project in discover_projects():
+            if not (project.path / ".git").is_dir():
+                continue
+            try:
+                outcome = self._sync_one(project, root_sessions)
+            except Exception:
+                log.exception("main-sync failed for %s", project.name)
+                continue
+            if outcome == "fast-forwarded":
+                log.info("main-sync: %s fast-forwarded", project.name)
+            else:
+                log.debug("main-sync: %s %s", project.name, outcome)
+
+    def _projects_with_root_sessions(self) -> set[str] | None:
+        """Names of projects with a live root (`c`) session. None = unknown,
+        which callers must treat as "assume every project has one"."""
+        from .vm import vm_is_running
+        try:
+            if not vm_is_running():
+                return set()  # sessions only exist inside the VM
+            from .agent import list_sessions
+            # tmux (headless) entries carry no worktree_id and count as root —
+            # conservative, since we can't prove they're in a worktree.
+            return {
+                s["project"] for s in list_sessions()
+                if not s.get("worktree_id")
+            }
+        except Exception:
+            return None
+
+    def _sync_one(self, project: Any, root_sessions: set[str] | None) -> str:
+        from .agent import detect_main_branch
+
+        path = str(project.path)
+        base = detect_main_branch(project)
+
+        # GIT_TERMINAL_PROMPT=0: fail, don't hang, if credentials are missing.
+        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+        try:
+            subprocess.run(
+                ["git", "fetch", "--no-tags", "origin", base],
+                capture_output=True, cwd=path, timeout=30, env=env,
+            )
+        except subprocess.TimeoutExpired:
+            return "fetch-timeout"
+
+        counts = subprocess.run(
+            ["git", "rev-list", "--left-right", "--count",
+             f"{base}...origin/{base}"],
+            capture_output=True, text=True, cwd=path, timeout=15,
+        )
+        if counts.returncode != 0:
+            return "no-refs"  # no remote, or no local <base> branch
+        try:
+            ahead, behind = (int(x) for x in counts.stdout.split())
+        except ValueError:
+            return "no-refs"
+        if behind == 0:
+            return "up-to-date"
+        if ahead > 0:
+            return "diverged"
+
+        head = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, cwd=path, timeout=10,
+        )
+        if head.returncode != 0:
+            return "no-head"
+
+        if head.stdout.strip() != base:
+            result = subprocess.run(
+                ["git", "fetch", "origin", f"{base}:{base}"],
+                capture_output=True, text=True, cwd=path, timeout=30, env=env,
+            )
+            return "fast-forwarded" if result.returncode == 0 else "ref-update-refused"
+
+        if root_sessions is None or project.name in root_sessions:
+            return "session-active"
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True, text=True, cwd=path, timeout=15,
+        )
+        if dirty.returncode != 0 or dirty.stdout.strip():
+            return "dirty"
+        result = subprocess.run(
+            ["git", "merge", "--ff-only", f"origin/{base}"],
+            capture_output=True, text=True, cwd=path, timeout=30,
+        )
+        return "fast-forwarded" if result.returncode == 0 else "merge-refused"
 
 
 def _pid_alive(pid: int) -> bool:
@@ -571,11 +709,13 @@ def run_daemon(verbose: bool = False) -> int:
 
     dispatcher = _Dispatcher()
     janitor = _Janitor()
+    main_sync = _MainSync()
 
     threads = [
         threading.Thread(target=server.serve_forever, name="http", daemon=True),
         threading.Thread(target=dispatcher.run, name="dispatcher", daemon=True),
         threading.Thread(target=janitor.run, name="janitor", daemon=True),
+        threading.Thread(target=main_sync.run, name="main-sync", daemon=True),
     ]
     for t in threads:
         t.start()
@@ -599,6 +739,7 @@ def run_daemon(verbose: bool = False) -> int:
             pass
         dispatcher.stop()
         janitor.stop()
+        main_sync.stop()
         for t in threads:
             t.join(timeout=10)
         _clear_pidfile()

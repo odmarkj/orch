@@ -43,3 +43,4 @@ data-dumps/
 
 # Claude Code long-lived OAuth token — must never be committed
 claude_oauth_token
+.orch-worktrees
