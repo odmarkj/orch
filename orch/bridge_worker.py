@@ -223,7 +223,10 @@ def run_bridge(bridge: dict) -> None:
 
     try:
         from .agent import create_worktree, worktree_head
+        from .config import bridge_worker_timeout_seconds
         from .vm import vm_ensure_running
+
+        work_timeout = bridge_worker_timeout_seconds()
 
         target = _find_target(bridge["target_project"])
         if target is None:
@@ -269,7 +272,7 @@ def run_bridge(bridge: dict) -> None:
                 target, prompt, bid=bid, phase="initial",
                 workdir=worktree_path,
                 allowed_dirs=[str(worktree_path), bridge["source_path"]],
-                timeout=600,
+                timeout=work_timeout,
             )
             output = stdout.strip()
 
@@ -287,7 +290,7 @@ def run_bridge(bridge: dict) -> None:
                     )
                     stdout, _stderr = _run_headless_capture(
                         target, followup, bid=bid, phase="clarification",
-                        workdir=worktree_path, timeout=600,
+                        workdir=worktree_path, timeout=work_timeout,
                     )
                     output = stdout.strip()
 

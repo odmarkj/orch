@@ -75,6 +75,15 @@ def daemon_record_retention_days() -> int:
         return 30
 
 
+def daemon_main_sync_interval_seconds() -> int:
+    """Cadence of the daemon's local-main fast-forward sweep. 0 disables."""
+    raw = _section("daemon").get("main_sync_interval_seconds", 900)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 900
+
+
 # ── Bridge defaults ────────────────────────────────────────────────────────
 
 def bridge_max_concurrent_total() -> int:
@@ -83,6 +92,20 @@ def bridge_max_concurrent_total() -> int:
         return int(raw)
     except (TypeError, ValueError):
         return 3
+
+
+def bridge_worker_timeout_seconds() -> int:
+    """Per-call timeout for the headless Claude subprocess that runs a bridge.
+
+    Covers both the initial turn and any clarification follow-up. Bumping this
+    lets bridges that legitimately need to do long work (e.g. multi-file
+    refactors with lots of test runs) finish instead of being killed.
+    """
+    raw = _section("bridge").get("worker_timeout_seconds", 3600)
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 3600
 
 
 def bridge_max_retries() -> int:

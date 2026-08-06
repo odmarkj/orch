@@ -1,0 +1,21 @@
+# orch project lifecycle — committed with the repo
+# Edit freely. Claude can update this file.
+# Stages: idea → building → mvp → staging → live → maintaining
+# Set ignored = true to hide this project from orch
+
+[project]
+name        = "orch"
+description = ""
+stage       = "building"
+ignored     = false
+
+# Ledger is append-only. Add entries at the bottom.
+# Claude will add entries automatically on stage transitions.
+
+[[ledger]]
+date  = "2026-04-27"
+stage = "building"
+note  = "Project registered with orch"
+
+[bridge]
+max_concurrent_as_target = 3

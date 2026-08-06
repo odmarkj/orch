@@ -40,6 +40,7 @@ from urllib.parse import parse_qs, urlparse
 from . import state
 from .config import (
     bridge_max_concurrent_total,
+    daemon_main_sync_interval_seconds,
     daemon_port,
     daemon_record_retention_days,
     daemon_worker_timeout_seconds,
@@ -116,8 +117,13 @@ class _Dispatcher:
         while not self._stop.is_set():
             try:
                 self._tick()
-            except Exception:
+            except Exception as exc:
                 log.exception("dispatcher tick errored")
+                # A poisoned connection would otherwise make every remaining
+                # tick fail identically, once a second, until someone restarts
+                # the daemon. Drop it; the next tick reconnects.
+                if state.is_connection_fault(exc):
+                    state.close_conn()
             self._stop.wait(1.0)
         log.info("dispatcher stopping; waiting for workers")
         with self._lock:
@@ -224,8 +230,10 @@ class _Janitor:
         while not self._stop.wait(self.INTERVAL_SECONDS):
             try:
                 self._tick()
-            except Exception:
+            except Exception as exc:
                 log.exception("janitor tick errored")
+                if state.is_connection_fault(exc):
+                    state.close_conn()
 
     def _tick(self) -> None:
         # 1. Recover stale-inflight (claimed but worker is dead/timed-out).
@@ -256,6 +264,143 @@ class _Janitor:
             log.info("janitor pruned %d old records", deleted)
 
 
+# ── Main-branch sync ──────────────────────────────────────────────────────
+
+class _MainSync:
+    """Opportunistically fast-forwards each project's local main to origin.
+
+    Worktree sessions branch off a freshly fetched origin/<main>, so a stale
+    local main can't poison new `w` sessions — but root (`c`) sessions launch
+    on the local checkout, so keep it current when provably safe:
+
+      - the fetch never touches a working tree or local branch — always safe;
+      - main NOT checked out in the root repo → `git fetch origin main:main`
+        updates just the ref; git itself refuses non-fast-forward updates and
+        refuses to move a branch any worktree has checked out;
+      - main IS checked out → `merge --ff-only`, but only with a clean tree
+        AND no live root session on the project — a session's checkout must
+        never change underneath it.
+
+    A diverged local main (commits not on origin) is never touched. Every
+    failure is a silent skip, re-evaluated next sweep; this is best-effort.
+    """
+
+    def __init__(self) -> None:
+        self._stop = threading.Event()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def run(self) -> None:
+        log.info("main-sync started")
+        while not self._stop.is_set():
+            interval = daemon_main_sync_interval_seconds()
+            if interval <= 0:
+                self._stop.wait(60)  # disabled; poll config once a minute
+                continue
+            try:
+                self._tick()
+            except Exception as exc:
+                log.exception("main-sync tick errored")
+                if state.is_connection_fault(exc):
+                    state.close_conn()
+            self._stop.wait(interval)
+
+    def _tick(self) -> None:
+        from .discovery import discover_projects
+
+        root_sessions = self._projects_with_root_sessions()
+        for project in discover_projects():
+            if not (project.path / ".git").is_dir():
+                continue
+            try:
+                outcome = self._sync_one(project, root_sessions)
+            except Exception:
+                log.exception("main-sync failed for %s", project.name)
+                continue
+            if outcome == "fast-forwarded":
+                log.info("main-sync: %s fast-forwarded", project.name)
+            else:
+                log.debug("main-sync: %s %s", project.name, outcome)
+
+    def _projects_with_root_sessions(self) -> set[str] | None:
+        """Names of projects with a live root (`c`) session. None = unknown,
+        which callers must treat as "assume every project has one"."""
+        from .vm import vm_is_running
+        try:
+            if not vm_is_running():
+                return set()  # sessions only exist inside the VM
+            from .agent import list_sessions
+            # tmux (headless) entries carry no worktree_id and count as root —
+            # conservative, since we can't prove they're in a worktree.
+            return {
+                s["project"] for s in list_sessions()
+                if not s.get("worktree_id")
+            }
+        except Exception:
+            return None
+
+    def _sync_one(self, project: Any, root_sessions: set[str] | None) -> str:
+        from .agent import detect_main_branch
+
+        path = str(project.path)
+        base = detect_main_branch(project)
+
+        # GIT_TERMINAL_PROMPT=0: fail, don't hang, if credentials are missing.
+        env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+        try:
+            subprocess.run(
+                ["git", "fetch", "--no-tags", "origin", base],
+                capture_output=True, cwd=path, timeout=30, env=env,
+            )
+        except subprocess.TimeoutExpired:
+            return "fetch-timeout"
+
+        counts = subprocess.run(
+            ["git", "rev-list", "--left-right", "--count",
+             f"{base}...origin/{base}"],
+            capture_output=True, text=True, cwd=path, timeout=15,
+        )
+        if counts.returncode != 0:
+            return "no-refs"  # no remote, or no local <base> branch
+        try:
+            ahead, behind = (int(x) for x in counts.stdout.split())
+        except ValueError:
+            return "no-refs"
+        if behind == 0:
+            return "up-to-date"
+        if ahead > 0:
+            return "diverged"
+
+        head = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, cwd=path, timeout=10,
+        )
+        if head.returncode != 0:
+            return "no-head"
+
+        if head.stdout.strip() != base:
+            result = subprocess.run(
+                ["git", "fetch", "origin", f"{base}:{base}"],
+                capture_output=True, text=True, cwd=path, timeout=30, env=env,
+            )
+            return "fast-forwarded" if result.returncode == 0 else "ref-update-refused"
+
+        if root_sessions is None or project.name in root_sessions:
+            return "session-active"
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain"],
+            capture_output=True, text=True, cwd=path, timeout=15,
+        )
+        if dirty.returncode != 0 or dirty.stdout.strip():
+            return "dirty"
+        result = subprocess.run(
+            ["git", "merge", "--ff-only", f"origin/{base}"],
+            capture_output=True, text=True, cwd=path, timeout=30,
+        )
+        return "fast-forwarded" if result.returncode == 0 else "merge-refused"
+
+
 def _pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -273,6 +418,17 @@ class _Handler(BaseHTTPRequestHandler):
 
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A003
         log.debug("http " + format, *args)
+
+    def finish(self) -> None:
+        # ThreadingHTTPServer runs each TCP connection in its own thread, and
+        # state._get_conn() caches a sqlite connection in thread-local storage.
+        # That connection never gets reused after this thread dies, so close it
+        # here to avoid leaking fds (db/-wal/-shm) until the daemon hits
+        # RLIMIT_NOFILE and sqlite starts failing to open the database.
+        try:
+            super().finish()
+        finally:
+            state.close_conn()
 
     # ── Helpers ────────────────────────────────────────────────────────────
 
@@ -309,6 +465,18 @@ class _Handler(BaseHTTPRequestHandler):
         qs = parse_qs(parsed.query)
 
         if path == "/healthz":
+            # A health check that ignores the DB is worse than none: the daemon
+            # can be listening yet unable to serve any real request (e.g. fd
+            # exhaustion -> "unable to open database file"). Probe the DB so an
+            # unhealthy daemon reports unhealthy.
+            try:
+                state.ping()
+            except Exception as exc:
+                self._send_json(
+                    {"ok": False, "error": str(exc), "ts": state.now_iso()},
+                    status=503,
+                )
+                return
             self._send_json({"ok": True, "ts": state.now_iso()})
             return
 
@@ -382,6 +550,23 @@ class _Handler(BaseHTTPRequestHandler):
                 return
         if body["intent"] not in state.VALID_INTENTS:
             self._send_text(f"invalid intent: {body['intent']!r}", 400)
+            return
+
+        # A source_path at or above the projects root (e.g. $HOME, which has
+        # .claude/ and .orch/ and used to fool the CLI's auto-detection) gets
+        # bind-mounted over itself by the worker's sandbox, shadowing the
+        # ~/Apps mount and making the freshly created worktree invisible.
+        # Reject it here so the submitter gets an actionable error instead of
+        # three doomed retries.
+        from .discovery import SITES_ROOT
+        src = Path(os.path.normpath(body["source_path"]))
+        if src == SITES_ROOT or src in SITES_ROOT.parents:
+            self._send_text(
+                f"source_path {src} is not a project directory (it is at or "
+                f"above the projects root {SITES_ROOT}); run from inside a "
+                "project or pass --source and --source-path",
+                400,
+            )
             return
 
         sub = state.BridgeSubmission(
@@ -524,11 +709,13 @@ def run_daemon(verbose: bool = False) -> int:
 
     dispatcher = _Dispatcher()
     janitor = _Janitor()
+    main_sync = _MainSync()
 
     threads = [
         threading.Thread(target=server.serve_forever, name="http", daemon=True),
         threading.Thread(target=dispatcher.run, name="dispatcher", daemon=True),
         threading.Thread(target=janitor.run, name="janitor", daemon=True),
+        threading.Thread(target=main_sync.run, name="main-sync", daemon=True),
     ]
     for t in threads:
         t.start()
@@ -552,6 +739,7 @@ def run_daemon(verbose: bool = False) -> int:
             pass
         dispatcher.stop()
         janitor.stop()
+        main_sync.stop()
         for t in threads:
             t.join(timeout=10)
         _clear_pidfile()

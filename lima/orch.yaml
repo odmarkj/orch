@@ -8,9 +8,9 @@
 # Requirements: Lima >= 1.0, macOS with Apple Virtualization.framework
 
 vmType: vz
-cpus: 8
-memory: "24GiB"
-disk: "100GiB"
+cpus: 12
+memory: "48GiB"
+disk: "300GiB"
 
 images:
   - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
@@ -134,6 +134,18 @@ provision:
       # Must go in .bash_env (sourced from .profile) not .bashrc, because
       # .bashrc has an interactive-only guard that blocks non-interactive shells.
       echo 'export CLAUDE_CONFIG_DIR=/Users/joshuaodmark/.claude' >> ~/.bash_env
+
+      # ── Zyte API key (for scraping; same key the host's asha daemon uses) ──
+      # Bootstrap from business-scorer-api/.env (host-mounted, survives VM
+      # rebuild) into a VM-local canonical file the bash_env line below reads.
+      # If business-scorer-api/.env disappears, drop the key into
+      # ~/.config/zyte/api_key by hand and the next session picks it up.
+      if [ ! -s "$HOME/.config/zyte/api_key" ] && [ -r /Users/joshuaodmark/Apps/business-scorer-api/.env ]; then
+        mkdir -p "$HOME/.config/zyte"
+        awk -F= '/^ZYTE_API_KEY=/{print $2; exit}' /Users/joshuaodmark/Apps/business-scorer-api/.env > "$HOME/.config/zyte/api_key"
+        chmod 600 "$HOME/.config/zyte/api_key"
+      fi
+      echo '[ -r "$HOME/.config/zyte/api_key" ] && export ZYTE_API_KEY="$(cat "$HOME/.config/zyte/api_key")"' >> ~/.bash_env
 
       # ── Claude Code OAuth credentials (Max-plan billed) ──
       # VM Claude reads OAuth creds from $CLAUDE_CONFIG_DIR/.credentials.json
