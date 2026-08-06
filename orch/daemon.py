@@ -281,6 +281,17 @@ class _Handler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:  # noqa: A003
         log.debug("http " + format, *args)
 
+    def finish(self) -> None:
+        # ThreadingHTTPServer runs each TCP connection in its own thread, and
+        # state._get_conn() caches a sqlite connection in thread-local storage.
+        # That connection never gets reused after this thread dies, so close it
+        # here to avoid leaking fds (db/-wal/-shm) until the daemon hits
+        # RLIMIT_NOFILE and sqlite starts failing to open the database.
+        try:
+            super().finish()
+        finally:
+            state.close_conn()
+
     # ── Helpers ────────────────────────────────────────────────────────────
 
     def _send_json(self, data: Any, status: int = 200) -> None:
@@ -316,6 +327,18 @@ class _Handler(BaseHTTPRequestHandler):
         qs = parse_qs(parsed.query)
 
         if path == "/healthz":
+            # A health check that ignores the DB is worse than none: the daemon
+            # can be listening yet unable to serve any real request (e.g. fd
+            # exhaustion -> "unable to open database file"). Probe the DB so an
+            # unhealthy daemon reports unhealthy.
+            try:
+                state.ping()
+            except Exception as exc:
+                self._send_json(
+                    {"ok": False, "error": str(exc), "ts": state.now_iso()},
+                    status=503,
+                )
+                return
             self._send_json({"ok": True, "ts": state.now_iso()})
             return
 
