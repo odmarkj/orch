@@ -1627,6 +1627,15 @@ class OrchApp(App):
                     f"Worktree session launched for {p.name}",
                 )
             except Exception as e:
+                # Worker threads are pooled and state caches a sqlite
+                # connection per thread, so a poisoned one would fail every
+                # future `w` press landing on this thread. Drop it here.
+                try:
+                    from . import state
+                    if state.is_connection_fault(e):
+                        state.close_conn()
+                except Exception:
+                    pass
                 self.call_from_thread(
                     self._stop_spinner_and_refresh, p,
                     f"Worktree launch failed: {e}", "error",

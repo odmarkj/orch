@@ -10,6 +10,7 @@ daemon's owned data layer.
 from __future__ import annotations
 
 import json
+import logging
 import secrets
 import sqlite3
 import threading
@@ -19,6 +20,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator
+
+log = logging.getLogger(__name__)
 
 DB_PATH = Path.home() / ".orch" / "state.db"
 
@@ -137,22 +140,113 @@ def now_iso() -> str:
 
 _local = threading.local()
 
+# Errors that mean "this connection is unusable", not "this query was bad".
+# A cached connection can go bad while the file on disk is perfectly fine —
+# a transient I/O fault or a WAL/shm reset under an idle reader leaves the
+# pager reading garbage, and SQLite then reports one of these forever. Since
+# _get_conn() caches per thread, a long-lived process (the daemon's dispatcher
+# and janitor loops, the TUI's worker threads) would keep reusing the poisoned
+# connection and fail on every subsequent call until restarted by hand — which
+# is exactly how a one-second blip turns into an hour of dead `w` presses.
+_CONN_FAULT_MARKERS = (
+    "file is not a database",
+    "disk i/o error",
+    "unable to open database file",
+    "database disk image is malformed",
+    "attempt to write a readonly database",
+)
+
+
+def is_connection_fault(exc: BaseException) -> bool:
+    """True if *exc* means the connection is poisoned and should be reopened.
+
+    Distinguishes connection-level faults from genuine query errors (a bad
+    constraint, a typo'd column) which reopening would not fix.
+    """
+    if not isinstance(exc, sqlite3.Error):
+        return False
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _CONN_FAULT_MARKERS)
+
+
+def _open_conn() -> sqlite3.Connection:
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(
+        DB_PATH,
+        isolation_level=None,           # autocommit; we manage txns explicitly
+        timeout=30.0,
+        check_same_thread=False,
+    )
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def _probe(conn: sqlite3.Connection) -> None:
+    """Cheapest read that actually touches the database file.
+
+    `SELECT 1` is answered from thin air and proves nothing — user_version
+    lives in the header, so this opens a read transaction and reads page 1,
+    which is what surfaces a poisoned pager.
+    """
+    conn.execute("PRAGMA user_version").fetchone()
+
 
 def _get_conn() -> sqlite3.Connection:
-    """Per-thread connection. SQLite connections are not thread-safe."""
+    """Per-thread connection. SQLite connections are not thread-safe.
+
+    Self-healing: a cached connection is probed before reuse and replaced if
+    it has gone bad, so a transient fault costs one reconnect instead of
+    wedging the process until someone notices and restarts it.
+    """
     conn = getattr(_local, "conn", None)
-    if conn is None:
-        DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(
-            DB_PATH,
-            isolation_level=None,           # autocommit; we manage txns explicitly
-            timeout=30.0,
-            check_same_thread=False,
-        )
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
-        _local.conn = conn
+    if conn is not None:
+        if conn.in_transaction:
+            # Mid-transaction the caller owns the connection; swapping it out
+            # here would silently drop their uncommitted work. Let the error
+            # surface so transaction() can ROLLBACK and the caller retry.
+            return conn
+        try:
+            _probe(conn)
+            return conn
+        except sqlite3.Error as exc:
+            log.warning("sqlite connection unusable (%s); reopening", exc)
+            try:
+                conn.close()
+            except Exception:
+                pass
+            _local.conn = None
+
+    conn = _open_conn()
+    _local.conn = conn
     return conn
+
+
+def close_conn() -> None:
+    """Close and drop this thread's connection, if any.
+
+    Long-lived threads (dispatcher, janitor) keep their connection for the
+    process lifetime, but the HTTP server spawns one short-lived thread per
+    TCP connection. Without this, each request thread leaks an unclosed
+    sqlite connection (3 fds: db/-wal/-shm); under load the daemon blows past
+    RLIMIT_NOFILE and every subsequent connect fails with
+    ``unable to open database file``. Call this when a request thread ends.
+    """
+    conn = getattr(_local, "conn", None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        _local.conn = None
+
+
+def ping() -> None:
+    """Cheap liveness probe for the data layer. Opens (or reuses) this
+    thread's connection and reads from the database file. Raises sqlite3.Error
+    if the database can't be reached — callers (e.g. /healthz) should treat a
+    raised exception as unhealthy rather than reporting OK."""
+    _probe(_get_conn())
 
 
 def init_db() -> None:
@@ -177,8 +271,17 @@ def transaction() -> Iterator[sqlite3.Connection]:
     conn.execute("BEGIN IMMEDIATE")
     try:
         yield conn
-    except Exception:
-        conn.execute("ROLLBACK")
+    except Exception as exc:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error as rollback_exc:
+            # A poisoned connection can't even roll back. Drop it so the next
+            # caller reconnects, and let the original error propagate — the
+            # rollback failure is a symptom, not the cause worth reporting.
+            log.warning("rollback failed (%s); dropping connection", rollback_exc)
+            close_conn()
+        if is_connection_fault(exc):
+            close_conn()
         raise
     else:
         conn.execute("COMMIT")

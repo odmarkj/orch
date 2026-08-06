@@ -116,8 +116,13 @@ class _Dispatcher:
         while not self._stop.is_set():
             try:
                 self._tick()
-            except Exception:
+            except Exception as exc:
                 log.exception("dispatcher tick errored")
+                # A poisoned connection would otherwise make every remaining
+                # tick fail identically, once a second, until someone restarts
+                # the daemon. Drop it; the next tick reconnects.
+                if state.is_connection_fault(exc):
+                    state.close_conn()
             self._stop.wait(1.0)
         log.info("dispatcher stopping; waiting for workers")
         with self._lock:
@@ -224,8 +229,10 @@ class _Janitor:
         while not self._stop.wait(self.INTERVAL_SECONDS):
             try:
                 self._tick()
-            except Exception:
+            except Exception as exc:
                 log.exception("janitor tick errored")
+                if state.is_connection_fault(exc):
+                    state.close_conn()
 
     def _tick(self) -> None:
         # 1. Recover stale-inflight (claimed but worker is dead/timed-out).
