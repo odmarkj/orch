@@ -109,6 +109,90 @@ Per-project environment isolation is handled by **direnv** (environment variable
 
 All projects under `~/Apps/` are accessible at their original paths inside the VM. You can tell Claude "look at how project-x handles rate limiting" and it already knows where to find them — no special configuration needed.
 
+### Shared services
+
+The VM runs a few services that every project shares rather than each one
+standing up its own. orch provisions them (`lima/provision-services.sh`) and
+owns their lifecycle; projects consume them.
+
+| Service | Endpoint | Owner |
+|---|---|---|
+| PostgreSQL 17 + pgvector | `:5432` | orch |
+| Redis 8 | `:6379` | orch |
+| Web fetch | `127.0.0.1:9876` | orch, backed by `~/Apps/web-fetch` |
+
+**A project must not install a systemd unit for a shared port.** The fetch
+service spent four months being served by an untracked snapshot of an
+unrelated project, because that project shipped its own unit files and won the
+race for the port. Nothing recorded which implementation was live. Ownership
+lives in one place now.
+
+### Web fetch service
+
+A tier-escalating fetcher on `127.0.0.1:9876`: it tries a direct HTTP request
+first and climbs to proxied and browser-rendered tiers only when a site
+refuses the cheap one, caching results for 24h and learning per host which
+tier to start from. Lima forwards the port, so the same URL works from inside
+the VM and from the macOS host.
+
+```bash
+curl -sX POST http://127.0.0.1:9876/fetch \
+  -H 'Content-Type: application/json' \
+  -d '{"url":"https://example.com"}'
+```
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /fetch` | One URL, synchronous. Body: `url`, `render`, `mode`, `force_refresh`, `include_html`, … |
+| `POST /fetch/batch` | 1–10000 URLs queued. Body: `urls`, `queue` (`fetch_default`\|`fetch_bulk`) |
+| `GET /fetch/batch/<id>` | Batch progress and per-URL outcome |
+| `GET /fetch/<request_id>` | One queued request's full result |
+| `GET /health` | Liveness — `{"status": "ok"}` |
+| `GET /status` | Which tiers are live and why the rest are not |
+
+Responses carry `{status, tier_used, cached, cost_usd, markdown, chunks,
+metadata, …}` with `status` in `done | cached | blocked | failed`.
+
+**`blocked` means the site refused us. A configuration gap says so instead.**
+A tier with no credentials is skipped, and when *every* eligible tier is
+skipped the old service returned `blocked` / `"escalation exhausted"` with an
+empty `attempts` list — indistinguishable from a bot wall, and the actual
+cause was an empty `ZYTE_API_KEY`. Now that case returns `status: "failed"`
+with `error_class: "not_configured"`, names the missing setting, and startup
+logs the full tier inventory:
+
+```
+tiers live: direct | tiers skipped: zyte-http(zyte_api_key), zyte-browser(zyte_api_key), …
+only the direct tier is live: any site that needs a proxy or a browser will
+fail with error_class=not_configured, not 'blocked'
+```
+
+`orch fetch doctor` prints the same picture on demand.
+
+#### Ownership and credentials
+
+The HTTP layer is orch's (`orch/fetchsvc/`); the fetching is `web-fetch` at
+`~/Apps/web-fetch`, imported in-process and run from its own virtualenv. The split is deliberate: the shape at `:9876`
+is the platform contract orch publishes to every Claude session, while
+web-fetch stays a library other projects embed directly without inheriting a
+web server.
+
+Credentials come from exactly one orch-owned file, `~/.config/orch/fetch.env`
+(mode 600), loaded by the unit with `EnvironmentFile=`. The service inherits no
+ambient environment and reads no project `.env`. `orch fetch sync-credentials`
+mirrors `~/.config/<provider>/<secret>` into it and **refuses to write an empty
+value** — an unset key is reported, never persisted as `""`.
+
+```bash
+orch fetch doctor              # why isn't it working?
+orch fetch install             # provision + start (idempotent)
+orch fetch adopt               # retire legacy units, then install
+orch fetch restart | logs
+orch fetch sync-credentials    # rewrite ~/.config/orch/fetch.env
+```
+
+Run from the macOS host, each command is forwarded into the VM.
+
 ### Auto-dispatch with parallel worktrees
 
 When auto-dispatch is enabled (`g` in the TUI), orch automatically picks up pending todos from `TODOS.md` and runs them — each in its own git worktree with a dedicated Claude instance. Up to 3 tasks run in parallel by default (configurable via `max_parallel`).
@@ -191,6 +275,12 @@ orch vm stop                        # Stop the Lima VM
 orch vm status                      # Check VM status
 orch vm ssh                         # SSH into the VM
 orch vm create                      # Create VM from template
+orch fetch doctor                   # Diagnose the local fetch service (:9876)
+orch fetch install                  # Provision + start the fetch service
+orch fetch adopt                    # Retire legacy units, then install
+orch fetch start|stop|restart       # Control the fetch service
+orch fetch status | logs            # systemd state / journal
+orch fetch sync-credentials         # Rewrite ~/.config/orch/fetch.env
 orch init [dir]                     # Bootstrap a project for Claude + orch
 orch init --name NAME --stage mvp   # With options (see Bootstrapping below)
 orch ignore <project>               # Hide project from orch
@@ -420,6 +510,8 @@ The Lima VM provides a full Linux environment with:
 - **Port forwarding** — dev server ports (3000-9999) auto-forward to host
 - **SSH agent** — GitHub auth passes through automatically
 - **Wrangler** — run local Cloudflare Workers dev servers
+- **Shared Postgres/Redis** — `:5432` and `:6379`, provisioned once for all projects
+- **Web fetch** — tier-escalating fetcher on `127.0.0.1:9876` (see above)
 
 ---
 
@@ -480,6 +572,13 @@ orch/
 │   ├── bridge.py          # Mobile web bridge (HTTP server + REST API)
 │   ├── comm.py            # Cross-project agent communication protocol
 │   ├── discovery.py       # Auto-discovery of projects in ~/Apps
+│   ├── fetchsvc/          # Local web fetch service on :9876
+│   │   ├── __init__.py    #   paths, settings, credential sources
+│   │   ├── __main__.py    #   `python -m orch.fetchsvc <action>`
+│   │   ├── batch.py       #   SQLite batch queue + in-process workers
+│   │   ├── diagnostics.py #   "not configured" vs "blocked"
+│   │   ├── manage.py      #   systemd unit, credentials, database, doctor
+│   │   └── server.py      #   the HTTP contract
 │   ├── iterm.py           # iTerm2 tab management and notifications
 │   ├── lifecycle.py       # Project stages, ledger, stall detection
 │   ├── logs.py            # Session log capture and rotation
@@ -488,7 +587,8 @@ orch/
 │   ├── setup.py           # First-time setup wizard
 │   └── vm.py              # Lima VM lifecycle management
 ├── lima/
-│   └── orch.yaml          # Lima VM template (Ubuntu, virtiofs, provisioning)
+│   ├── orch.yaml          # Lima VM template (Ubuntu, virtiofs, provisioning)
+│   └── provision-services.sh  # Shared Postgres, Redis and fetch service
 ├── profiles/
 │   └── orch-iterm2-profile.json  # iTerm2 dynamic profile
 ├── CLAUDE_SNIPPET.md      # Status integration snippet for projects

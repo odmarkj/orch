@@ -35,6 +35,27 @@ the next task.
 Claude will update these files automatically. Orch reads them in real time to
 show live status, fire notifications, and track progress — zero LLM calls.
 
+## Web fetching
+
+The fetch service on `127.0.0.1:9876` is orch-owned and shared by every
+project. Its contract is unchanged from before orch adopted it, so any
+CLAUDE.md already documenting it stays correct. Two things are worth adding to
+the block describing it:
+
+```markdown
+`status` is `done | cached | blocked | failed`. A missing credential is
+reported as `status: "failed"` with `error_class: "not_configured"` — it is a
+gap in the fetch service, **not** the site blocking you. Do not retry it or
+route around it; fix the configuration. `GET /status` lists which tiers are
+live and what each dead one is waiting for.
+
+If the daemon is down, fall back to WebFetch. Bring it back with
+`orch fetch restart`, and diagnose with `orch fetch doctor`.
+```
+
+Do not install a systemd unit for port 9876 from a project. orch provisions
+the service; projects call it.
+
 ## Reference projects
 
 All projects under `~/Apps/` are accessible at their original paths inside the
