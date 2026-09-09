@@ -68,20 +68,22 @@ def _http(method: str, path: str, body: dict | None = None) -> tuple[int, Any]:
 
 
 def _detect_source_project() -> tuple[str, str] | None:
-    """Walk up from cwd looking for a project root (.claude/ + .orch/ + git).
+    """Walk up from cwd looking for a project root (.orch/ + git).
 
-    The git marker (.git is a dir in a repo root, a file in a worktree) is
-    what stops the walk from matching the user's home directory — home has
-    both .claude/ (Claude config) and .orch/ (daemon state) but is not a
-    project, and a home source_path poisons the bridge worker's sandbox.
+    The two markers together are what make this safe. .git (a dir in a repo
+    root, a file in a worktree) rules out the user's home directory, which has
+    .orch/ for daemon state but is not a project — a home source_path poisons
+    the bridge worker's sandbox. .orch/ in turn rules out the projects root
+    itself, which is a git repo.
+
+    Deliberately does NOT require .claude/: orch worktrees don't get one, and
+    a project that was never `orch init`-ed doesn't either. Requiring it made
+    bridge submission fail to auto-detect from exactly those directories while
+    adding nothing to the safety argument above.
     """
     cwd = Path.cwd().resolve()
     for candidate in [cwd, *cwd.parents]:
-        if (
-            (candidate / ".claude").is_dir()
-            and (candidate / ".orch").is_dir()
-            and (candidate / ".git").exists()
-        ):
+        if (candidate / ".orch").is_dir() and (candidate / ".git").exists():
             return candidate.name, str(candidate)
     return None
 
