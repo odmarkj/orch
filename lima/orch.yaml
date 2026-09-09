@@ -130,6 +130,16 @@ provision:
       # sessions report "claude: not found" even though the binary exists.
       echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bash_env
 
+      # ── orch CLI shim (VM-side) ──
+      # The `orch` console script is not installed in the VM, and the repo root
+      # holds a macOS venv (bin/, pyvenv.cfg -> /opt/homebrew) that looks like
+      # one. VM sessions find that first, conclude the CLI is host-only, and
+      # stop submitting bridges. Symlink the gated shim instead: it routes
+      # VM-safe commands at the repo's Linux .venv and fails fast on the
+      # launchd/limactl/Keychain families.
+      mkdir -p "$HOME/.local/bin"
+      ln -sf /Users/joshuaodmark/Apps/orch/lima/orch-vm-shim.sh "$HOME/.local/bin/orch"
+
       # ── Claude config dir (use host-mounted .claude so JSONL files are visible to host) ──
       # Must go in .bash_env (sourced from .profile) not .bashrc, because
       # .bashrc has an interactive-only guard that blocks non-interactive shells.
