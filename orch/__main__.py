@@ -29,6 +29,12 @@ orch CLI
   orch credbroker run               Run broker loop in foreground (for launchd)
   orch credbroker sync              One-shot Keychain→file mirror (debug)
   orch credbroker refresh           Force-refresh OAuth tokens via /oauth/token
+  orch fetch doctor                 Diagnose the local fetch service (:9876)
+  orch fetch install                Provision + start the fetch service
+  orch fetch adopt                  Retire legacy asha units, then install
+  orch fetch start | stop | restart  Control the fetch service
+  orch fetch status | logs          systemd state / journal
+  orch fetch sync-credentials       Rewrite ~/.config/orch/fetch.env
   orch init [dir]                   Bootstrap project for Claude Code
   orch ignore <project>              Hide project from orch
   orch ignore <project> --undo      Un-hide project
@@ -257,6 +263,34 @@ def cmd_credbroker(argv: list[str]) -> None:
         sys.exit(1)
 
 
+def cmd_fetch(argv: list[str]) -> None:
+    """Manage the local web fetch service.
+
+    The service is a systemd *user* unit inside the Lima VM, so on the macOS
+    host every action is forwarded into the VM rather than attempted locally —
+    there is no systemd here, and silently doing nothing would be worse than
+    the round trip.
+    """
+    import platform
+
+    if platform.system() == "Darwin":
+        from .fetchsvc import orch_pythonpath
+        from .vm import vm_exec, vm_ensure_running
+
+        vm_ensure_running()
+        # The VM runs the *installed* orch at its shared path, not whichever
+        # checkout (or bridge worktree) the host command was launched from.
+        remote = (
+            f"PYTHONPATH={orch_pythonpath()} python3 -m orch.fetchsvc "
+            + " ".join(argv or ["doctor"])
+        )
+        sys.exit(vm_exec(remote, capture=False, timeout=900).returncode)
+
+    from .fetchsvc.__main__ import main as fetch_main
+
+    sys.exit(fetch_main(argv))
+
+
 def cmd_ignore(argv: list[str]) -> None:
     from .lifecycle import ignore_project, unignore_project
 
@@ -337,6 +371,8 @@ def main() -> None:
         cmd_init(argv[1:])
     elif sub in ("ignore",):
         cmd_ignore(argv[1:])
+    elif sub in ("fetch",):
+        cmd_fetch(argv[1:])
     elif sub in ("credbroker",):
         cmd_credbroker(argv[1:])
     elif sub in ("daemon",):

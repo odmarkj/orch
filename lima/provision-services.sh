@@ -1,9 +1,10 @@
 #!/bin/bash
 # Idempotent provisioning for shared native services in the orch VM.
 #
-# Installs PostgreSQL 17 + pgvector and Redis, enables them, and restores
-# dumps from data-dumps/ if present. Safe to re-run against existing VMs —
-# each step is a no-op when already satisfied.
+# Installs PostgreSQL 17 + pgvector and Redis, enables them, restores dumps
+# from data-dumps/ if present, and installs the local web fetch service on
+# 127.0.0.1:9876. Safe to re-run against existing VMs — each step is a no-op
+# when already satisfied.
 #
 # Invoked from lima/orch.yaml at VM creation. Run manually against an
 # existing VM with:
@@ -128,4 +129,52 @@ if [ -f "$DUMP_DIR/redis.rdb" ]; then
   fi
 fi
 
-log "Done. PostgreSQL on :5432, Redis on :6379"
+# ── Local web fetch service (127.0.0.1:9876) ──
+# orch owns this service: it provisions the unit, the credentials and the
+# database, and `web-fetch` is the implementation it runs. Previously each
+# project installed its own units, which is how the port ended up served by an
+# untracked snapshot nobody could point at. Projects must not install units for
+# :9876; they call the endpoint.
+#
+# The unit is a systemd *user* unit (it runs as the developer, reads
+# ~/.config/orch/fetch.env, and writes ~/.orch/fetch), so this root-context
+# script hands the work to `orch fetch adopt` running as that user. `adopt`
+# also stops and disables the legacy asha-daemon/asha-worker units so two
+# implementations can never both claim the port.
+ORCH_USER="${SUDO_USER:-joshuaodmark}"
+ORCH_DIR="/Users/joshuaodmark/Apps/orch"
+WEB_FETCH_DIR="/Users/joshuaodmark/Apps/web-fetch"
+
+if [ ! -d "$ORCH_DIR/orch/fetchsvc" ]; then
+  log "Skipping fetch service — $ORCH_DIR/orch/fetchsvc not present"
+elif ! id "$ORCH_USER" >/dev/null 2>&1; then
+  log "Skipping fetch service — user $ORCH_USER not found"
+else
+  ORCH_UID="$(id -u "$ORCH_USER")"
+
+  # A user unit needs the user manager alive without an active login session;
+  # without lingering the service would only exist while someone is SSH'd in.
+  loginctl enable-linger "$ORCH_USER" 2>/dev/null || true
+  for _ in $(seq 1 15); do
+    [ -S "/run/user/$ORCH_UID/bus" ] && break
+    sleep 1
+  done
+
+  if [ ! -x "$WEB_FETCH_DIR/.venv/bin/python" ] && [ -f "$WEB_FETCH_DIR/pyproject.toml" ]; then
+    log "Creating the web-fetch virtualenv"
+    sudo -u "$ORCH_USER" sh -lc "cd '$WEB_FETCH_DIR' && uv sync" \
+      || log "WARNING: uv sync failed — the unit will fall back to 'uv run'"
+  fi
+
+  log "Installing the fetch service (127.0.0.1:9876)"
+  # `env` rather than `sudo VAR=val`: sudoers rejects command-line variable
+  # assignments unless the rule carries SETENV, and the failure is silent.
+  sudo -u "$ORCH_USER" env \
+    XDG_RUNTIME_DIR="/run/user/$ORCH_UID" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$ORCH_UID/bus" \
+    PYTHONPATH="$ORCH_DIR" \
+    python3 -m orch.fetchsvc adopt \
+      || log "WARNING: fetch service install failed — run 'orch fetch doctor'"
+fi
+
+log "Done. PostgreSQL on :5432, Redis on :6379, fetch on :9876"
