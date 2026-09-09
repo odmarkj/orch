@@ -37,7 +37,7 @@ from queue import Empty, Queue
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from . import state
+from . import gitexclude, state
 from .config import (
     bridge_max_concurrent_total,
     daemon_main_sync_interval_seconds,
@@ -266,6 +266,43 @@ class _Janitor:
 
 # ── Main-branch sync ──────────────────────────────────────────────────────
 
+# Outcomes that mean the sweep did its job, or that nothing it could do would
+# ever help (no remote / no local base branch). These never count as "stuck".
+_SYNC_QUIET_OUTCOMES = frozenset({"up-to-date", "fast-forwarded", "no-refs"})
+
+# Consecutive identical non-quiet outcomes before a project gets promoted from
+# DEBUG to WARNING. At the 900s default that is ~1h of no progress — long
+# enough to ignore a session that is merely open, short enough that a project
+# wedged for a month can't stay invisible. Re-warn every _SYNC_STUCK_REPEAT
+# sweeps after that (~4h) so it stays visible without flooding the log.
+_SYNC_STUCK_SWEEPS = 4
+_SYNC_STUCK_REPEAT = 16
+
+
+def _dirt_excluding_orch(porcelain: str) -> list[str]:
+    """Porcelain entries that are not orch's own ``.orch/`` scratch.
+
+    orch writes ``.orch/`` into every project it manages, so in a repo whose
+    ``.gitignore`` doesn't cover it that directory alone makes the tree dirty
+    and the sync below skips the project forever. ``.git/info/exclude``
+    normally keeps it out of ``git status`` entirely (see
+    ``gitexclude.ensure_orch_excluded``), but a clone orch could not write to
+    must not be gated on orch's own artifact either.
+    """
+    entries = []
+    for line in porcelain.splitlines():
+        if not line.strip():
+            continue
+        rest = line[3:]  # porcelain v1: XY, a space, then the path(s)
+        # `R  old -> new`: only orch's own if BOTH ends are, since a rename
+        # out of .orch/ still deletes a real tracked file.
+        paths = rest.split(" -> ", 1) if " -> " in rest else [rest]
+        if all(gitexclude.is_orch_path(p) for p in paths):
+            continue
+        entries.append(line)
+    return entries
+
+
 class _MainSync:
     """Opportunistically fast-forwards each project's local main to origin.
 
@@ -287,6 +324,8 @@ class _MainSync:
 
     def __init__(self) -> None:
         self._stop = threading.Event()
+        # project name -> (last non-quiet outcome, consecutive sweeps at it)
+        self._streaks: dict[str, tuple[str, int]] = {}
 
     def stop(self) -> None:
         self._stop.set()
@@ -313,15 +352,45 @@ class _MainSync:
         for project in discover_projects():
             if not (project.path / ".git").is_dir():
                 continue
+            # orch's own .orch/ must not read as "the human has work here".
+            gitexclude.ensure_orch_excluded(project.path)
             try:
                 outcome = self._sync_one(project, root_sessions)
             except Exception:
                 log.exception("main-sync failed for %s", project.name)
                 continue
-            if outcome == "fast-forwarded":
-                log.info("main-sync: %s fast-forwarded", project.name)
-            else:
-                log.debug("main-sync: %s %s", project.name, outcome)
+            self._log_outcome(project.name, outcome)
+
+    def _log_outcome(self, name: str, outcome: str) -> None:
+        """Per-sweep line at DEBUG; a project stuck on one outcome gets louder.
+
+        The failure this exists for is silent: a project sitting at
+        `session-active` or `dirty` sweep after sweep drifts a month behind
+        origin with nothing in the log above DEBUG to say so.
+        """
+        if outcome == "fast-forwarded":
+            log.info("main-sync: %s fast-forwarded", name)
+            self._streaks.pop(name, None)
+            return
+        if outcome in _SYNC_QUIET_OUTCOMES:
+            self._streaks.pop(name, None)
+            log.debug("main-sync: %s %s", name, outcome)
+            return
+
+        prev, count = self._streaks.get(name, ("", 0))
+        count = count + 1 if prev == outcome else 1
+        self._streaks[name] = (outcome, count)
+
+        stuck = count >= _SYNC_STUCK_SWEEPS
+        repeat = (count - _SYNC_STUCK_SWEEPS) % _SYNC_STUCK_REPEAT == 0
+        if stuck and repeat:
+            log.warning(
+                "main-sync: %s stuck on %s for %d consecutive sweeps — its "
+                "local main has not moved since",
+                name, outcome, count,
+            )
+        else:
+            log.debug("main-sync: %s %s", name, outcome)
 
     def _projects_with_root_sessions(self) -> set[str] | None:
         """Names of projects with a live root (`c`) session. None = unknown,
@@ -337,7 +406,15 @@ class _MainSync:
                 s["project"] for s in list_sessions()
                 if not s.get("worktree_id")
             }
-        except Exception:
+        except Exception as exc:
+            # Returning None makes callers skip EVERY project this sweep, so
+            # this one failure stalls main-sync globally. Never let that be
+            # invisible.
+            log.warning(
+                "main-sync: could not list live sessions (%s: %s) — assuming "
+                "every project has a root session, so this whole sweep skips",
+                type(exc).__name__, exc,
+            )
             return None
 
     def _sync_one(self, project: Any, root_sessions: set[str] | None) -> str:
@@ -349,12 +426,26 @@ class _MainSync:
         # GIT_TERMINAL_PROMPT=0: fail, don't hang, if credentials are missing.
         env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
         try:
-            subprocess.run(
+            fetch = subprocess.run(
                 ["git", "fetch", "--no-tags", "origin", base],
-                capture_output=True, cwd=path, timeout=30, env=env,
+                capture_output=True, text=True, cwd=path, timeout=30, env=env,
             )
         except subprocess.TimeoutExpired:
+            log.warning(
+                "main-sync: %s fetch of origin/%s timed out after 30s",
+                project.name, base,
+            )
             return "fetch-timeout"
+        if fetch.returncode != 0:
+            # Not fatal — the comparison below still runs against whatever the
+            # last successful fetch left behind, which is the best available
+            # answer. But a repo orch can no longer reach is exactly the thing
+            # that must not fail silently.
+            log.warning(
+                "main-sync: %s fetch of origin/%s failed (exit %d): %s",
+                project.name, base, fetch.returncode,
+                (fetch.stderr or fetch.stdout or "").strip()[:400],
+            )
 
         counts = subprocess.run(
             ["git", "rev-list", "--left-right", "--count",
@@ -384,15 +475,24 @@ class _MainSync:
                 ["git", "fetch", "origin", f"{base}:{base}"],
                 capture_output=True, text=True, cwd=path, timeout=30, env=env,
             )
-            return "fast-forwarded" if result.returncode == 0 else "ref-update-refused"
+            if result.returncode != 0:
+                log.warning(
+                    "main-sync: %s refused the %s ref update: %s",
+                    project.name, base,
+                    (result.stderr or result.stdout or "").strip()[:400],
+                )
+                return "ref-update-refused"
+            return "fast-forwarded"
 
         if root_sessions is None or project.name in root_sessions:
             return "session-active"
-        dirty = subprocess.run(
+        status = subprocess.run(
             ["git", "status", "--porcelain"],
             capture_output=True, text=True, cwd=path, timeout=15,
         )
-        if dirty.returncode != 0 or dirty.stdout.strip():
+        if status.returncode != 0:
+            return "dirty"  # unverifiable: assume the human has work here
+        if _dirt_excluding_orch(status.stdout):
             return "dirty"
         result = subprocess.run(
             ["git", "merge", "--ff-only", f"origin/{base}"],

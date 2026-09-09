@@ -9,6 +9,7 @@ Also contains worktree management (moved from container.py).
 
 from __future__ import annotations
 
+import logging
 import os
 import random
 import re
@@ -18,10 +19,14 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from .gitexclude import ensure_orch_excluded
 from .vm import vm_exec, vm_exec_sandboxed, vm_ensure_running, vm_is_running
 
 if TYPE_CHECKING:
     from .models import Project
+
+
+log = logging.getLogger("orch.agent")
 
 
 # ── session management ───────────────────────────────────────────────────────
@@ -371,7 +376,7 @@ def _ensure_worktrees_gitignored(project: "Project") -> None:
         pass
 
 
-def _fresh_base_ref(project: "Project") -> tuple[str, str]:
+def _fresh_base_ref(project: "Project", *, bid: str | None = None) -> tuple[str, str]:
     """Return (base_branch, ref to branch new worktrees from).
 
     Fetches origin/<base> first so worktrees start from the remote tip rather
@@ -381,37 +386,82 @@ def _fresh_base_ref(project: "Project") -> tuple[str, str]:
     touched, so sessions on the root checkout are unaffected.
 
     Best-effort: offline / no-remote / timeout falls back to whatever refs the
-    repo already has (origin/<base>, then local <base>, then HEAD).
+    repo already has (origin/<base>, then local <base>, then HEAD). That
+    fallback is deliberately not fatal — branching from a stale ref beats not
+    running at all — but it is never silent. A failed fetch is logged, and when
+    *bid* names a bridge it is recorded as a ``stale_base_ref`` event, so a
+    bridge that answered against month-old code is distinguishable from a
+    healthy one after the fact instead of just looking confidently wrong.
     """
     base = detect_main_branch(project)
     # GIT_TERMINAL_PROMPT=0: a missing credential helper must fail the fetch,
-    # not hang it waiting for a password nobody will type.
+    # not hang it waiting for a password nobody will type. It also means a
+    # private repo orch cannot authenticate to exits non-zero instantly.
     env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    stale_reason = ""
     try:
-        subprocess.run(
+        fetch = subprocess.run(
             ["git", "fetch", "--no-tags", "origin", base],
-            capture_output=True, cwd=str(project.path), timeout=30, env=env,
+            capture_output=True, text=True,
+            cwd=str(project.path), timeout=30, env=env,
         )
+        if fetch.returncode != 0:
+            stale_reason = (
+                (fetch.stderr or fetch.stdout or "").strip()[:400]
+                or f"git fetch exited {fetch.returncode}"
+            )
     except subprocess.TimeoutExpired:
-        pass
+        stale_reason = "git fetch timed out after 30s"
+    except OSError as exc:
+        stale_reason = f"git fetch could not run: {exc}"
 
-    for ref in (f"origin/{base}", base):
-        if subprocess.run(
-            ["git", "rev-parse", "--verify", ref],
-            capture_output=True, cwd=str(project.path), timeout=10,
-        ).returncode == 0:
-            return base, ref
-    return base, "HEAD"
+    ref, sha = "HEAD", ""
+    for candidate in (f"origin/{base}", base):
+        rev = subprocess.run(
+            ["git", "rev-parse", "--verify", candidate],
+            capture_output=True, text=True,
+            cwd=str(project.path), timeout=10,
+        )
+        if rev.returncode == 0:
+            ref, sha = candidate, rev.stdout.strip()
+            break
+
+    if stale_reason:
+        log.warning(
+            "%s: could not fetch origin/%s — branching from %s (%s), which "
+            "may be stale: %s",
+            project.name, base, ref, sha[:12] or "unknown", stale_reason,
+        )
+        if bid:
+            try:
+                from . import state
+                state.add_event(bid, "stale_base_ref", {
+                    "base": base,
+                    "ref": ref,
+                    "commit": sha[:12],
+                    "reason": stale_reason,
+                    "warning": "fetch failed; this bridge ran against a "
+                               "possibly stale base ref",
+                })
+            except Exception:  # noqa: BLE001 — telemetry must not fail the run
+                log.exception("could not record stale_base_ref for %s", bid)
+
+    return base, ref
 
 
 def create_worktree(
     project: "Project", todo_text: str, *, branch_prefix: str = "auto",
+    bid: str | None = None,
 ) -> tuple[Path, str]:
     """Create a git worktree for the given task, branched off fresh remote main.
+
+    Pass *bid* from the bridge path so a stale base ref (fetch failed, see
+    _fresh_base_ref) is recorded against that bridge.
 
     Returns (worktree_path, branch_name).
     """
     _ensure_worktrees_gitignored(project)
+    ensure_orch_excluded(project.path)
 
     slug = _slugify(todo_text)
     suffix = random.randint(1000, 9999)
@@ -420,7 +470,7 @@ def create_worktree(
 
     worktree_dir.parent.mkdir(parents=True, exist_ok=True)
 
-    _base, base_ref = _fresh_base_ref(project)
+    _base, base_ref = _fresh_base_ref(project, bid=bid)
     result = subprocess.run(
         ["git", "worktree", "add", "-b", branch_name, str(worktree_dir), base_ref],
         capture_output=True, text=True,
@@ -478,6 +528,7 @@ def create_session_worktree(project: "Project") -> tuple[Path, str, str, str]:
     from .state import new_worktree_id
 
     _ensure_worktrees_gitignored(project)
+    ensure_orch_excluded(project.path)
 
     wt_id = new_worktree_id()
     # branch name strips the "wt_" prefix for aesthetics

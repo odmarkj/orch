@@ -250,7 +250,7 @@ def run_bridge(bridge: dict) -> None:
         try:
             try:
                 worktree_path, branch_name = create_worktree(
-                    target, bridge["summary"], branch_prefix="bridge",
+                    target, bridge["summary"], branch_prefix="bridge", bid=bid,
                 )
             except RuntimeError as e:
                 raise TransientBridgeError(f"worktree creation failed: {e}") from e

@@ -30,6 +30,7 @@ from watchdog.events import FileSystemEventHandler
 
 from .models import Project
 from .discovery import discover_projects
+from .gitexclude import ensure_orch_excluded
 from .iterm import notify_input_needed, notify_resumed, clear_stale_handle
 from .vm import vm_ensure_running
 from .agent import session_exists, kill_session
@@ -995,6 +996,9 @@ class OrchApp(App):
             # macOS FSEvents.
             orch_dir = p.orch_dir
             orch_dir.mkdir(parents=True, exist_ok=True)
+            # Creating .orch/ is the moment orch starts dirtying someone
+            # else's repo — keep it out of their git status from the start.
+            ensure_orch_excluded(p.path)
             orch_str = str(orch_dir)
             if orch_str not in watched:
                 self._observer.schedule(handler, orch_str, recursive=False)
