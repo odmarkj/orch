@@ -376,6 +376,41 @@ def _ensure_worktrees_gitignored(project: "Project") -> None:
         pass
 
 
+def repo_has_commits(repo_path: Path) -> bool:
+    """True if *repo_path*'s HEAD resolves to a commit.
+
+    A freshly ``git init``-ed project sits on an unborn branch: HEAD names a
+    ref that does not exist yet. None of the refs _fresh_base_ref falls back
+    through (origin/<base>, <base>, HEAD) resolve there, so ``git worktree
+    add`` dies with a bare "fatal: invalid reference: HEAD" that names neither
+    the real problem nor its fix.
+
+    Errors answer True — if we cannot tell, let git decide rather than block a
+    launch on a failed probe.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--verify", "--quiet", "HEAD"],
+            capture_output=True, text=True,
+            cwd=str(repo_path), timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    return result.returncode == 0
+
+
+def _require_commits(project: "Project") -> None:
+    """Refuse to build a worktree on a repo that has no commits."""
+    if repo_has_commits(project.path):
+        return
+    raise RuntimeError(
+        f"{project.name} has no commits yet, so there is nothing to branch "
+        f"from. Make an initial commit first: "
+        f"git -C {project.path} add -A && "
+        f"git -C {project.path} commit -m 'Initial commit'"
+    )
+
+
 def _fresh_base_ref(project: "Project", *, bid: str | None = None) -> tuple[str, str]:
     """Return (base_branch, ref to branch new worktrees from).
 
@@ -460,6 +495,7 @@ def create_worktree(
 
     Returns (worktree_path, branch_name).
     """
+    _require_commits(project)
     _ensure_worktrees_gitignored(project)
     ensure_orch_excluded(project.path)
 
@@ -527,6 +563,7 @@ def create_session_worktree(project: "Project") -> tuple[Path, str, str, str]:
     """
     from .state import new_worktree_id
 
+    _require_commits(project)
     _ensure_worktrees_gitignored(project)
     ensure_orch_excluded(project.path)
 
