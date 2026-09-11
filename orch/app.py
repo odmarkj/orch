@@ -1579,6 +1579,14 @@ class OrchApp(App):
                 severity="warning",
             )
             return
+        from .agent import repo_has_commits
+        if not repo_has_commits(p.path):
+            self.notify(
+                f"{p.name} has no commits yet — a worktree needs one to branch "
+                f"from. Commit first, or use c instead.",
+                severity="warning",
+            )
+            return
 
         pane = self.query_one("#status-pane", StatusPane)
         pane.start_spinner("Creating worktree session", p)

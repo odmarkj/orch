@@ -396,3 +396,46 @@ def test_repos_with_no_remote_stay_quiet(caplog):
             sync._log_outcome("local-only", "no-refs")
 
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+# ── Unborn HEAD: a repo with no commits must fail legibly ───────────────────
+
+@pytest.fixture
+def unborn_repo(tmp_path):
+    """A freshly `git init`-ed project: on main, but with zero commits."""
+    project_dir = tmp_path / "fresh-apps" / "fresh"
+    project_dir.mkdir(parents=True)
+    subprocess.run(
+        ["git", "init", "-b", "main", str(project_dir)],
+        check=True, capture_output=True,
+    )
+    _git(project_dir, "config", "user.email", "test@example.com")
+    _git(project_dir, "config", "user.name", "Test")
+    (project_dir / "README.md").write_text("uncommitted\n")
+    return Project(path=project_dir)
+
+
+def test_repo_has_commits_distinguishes_unborn_from_real(unborn_repo, behind_repo):
+    assert agent_mod.repo_has_commits(unborn_repo.path) is False
+    assert agent_mod.repo_has_commits(behind_repo.project.path) is True
+
+
+def test_worktree_on_unborn_repo_explains_itself(unborn_repo):
+    """Negative control: git's own message was "fatal: invalid reference: HEAD".
+
+    That named neither the project, the cause, nor the fix — the user saw it
+    as "Worktree launch failed" in the TUI with nothing to act on.
+    """
+    for build in (
+        lambda: agent_mod.create_session_worktree(unborn_repo),
+        lambda: agent_mod.create_worktree(unborn_repo, "some task"),
+    ):
+        with pytest.raises(RuntimeError) as excinfo:
+            build()
+        msg = str(excinfo.value)
+        assert "no commits yet" in msg
+        assert "commit -m" in msg
+        assert "invalid reference" not in msg
+
+    # And it refused before creating anything.
+    assert not (unborn_repo.path.parent / ".orch-worktrees").exists()
