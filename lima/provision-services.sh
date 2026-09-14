@@ -2,9 +2,9 @@
 # Idempotent provisioning for shared native services in the orch VM.
 #
 # Installs PostgreSQL 17 + pgvector and Redis, enables them, restores dumps
-# from data-dumps/ if present, and installs the local web fetch service on
-# 127.0.0.1:9876. Safe to re-run against existing VMs — each step is a no-op
-# when already satisfied.
+# from data-dumps/ if present, installs the local web fetch service on
+# 127.0.0.1:9876, and installs any missing packaging toolchain packages. Safe
+# to re-run against existing VMs — each step is a no-op when already satisfied.
 #
 # Invoked from lima/orch.yaml at VM creation. Run manually against an
 # existing VM with:
@@ -175,6 +175,28 @@ else
     PYTHONPATH="$ORCH_DIR" \
     python3 -m orch.fetchsvc adopt \
       || log "WARNING: fetch service install failed — run 'orch fetch doctor'"
+fi
+
+# ── Packaging toolchain (inkscape, ghostscript, mupdf-tools, fontconfig) ──
+# `pkgd` (~/Apps/packaging-designer) shells out to these for SVG→PDF export and
+# prepress; ghostscript also provides the CMYK ICC profile it uses
+# (/usr/share/color/icc/ghostscript/default_cmyk.icc). lima/orch.yaml installs
+# them on new VMs; this catches existing VMs up. `pkgd doctor` reports gaps.
+PACKAGING_PKGS=(inkscape ghostscript mupdf-tools fontconfig)
+MISSING_PKGS=()
+for pkg in "${PACKAGING_PKGS[@]}"; do
+  # Status-Status rather than `dpkg -s`, which also succeeds for packages
+  # removed with their config files left behind.
+  if [ "$(dpkg-query -W -f='${db:Status-Status}' "$pkg" 2>/dev/null)" != "installed" ]; then
+    MISSING_PKGS+=("$pkg")
+  fi
+done
+if [ "${#MISSING_PKGS[@]}" -gt 0 ]; then
+  log "Installing packaging toolchain: ${MISSING_PKGS[*]}"
+  apt-get update
+  apt-get install -y --no-install-recommends "${MISSING_PKGS[@]}"
+else
+  log "Packaging toolchain already installed"
 fi
 
 log "Done. PostgreSQL on :5432, Redis on :6379, fetch on :9876"

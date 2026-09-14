@@ -63,6 +63,14 @@ provision:
         git curl wget build-essential tmux xclip jq unzip \
         ca-certificates gnupg lsb-release software-properties-common unzip
 
+      # ── Packaging toolchain (pkgd, ~/Apps/packaging-designer) ──
+      # Inkscape's CLI export needs no recommends; skipping them avoids pulling
+      # in a desktop's worth of GUI packages. Ghostscript also ships the CMYK
+      # ICC profile pkgd uses. provision-services.sh installs these on existing
+      # VMs.
+      apt-get install -y --no-install-recommends \
+        inkscape ghostscript mupdf-tools fontconfig
+
       # ── direnv ──
       apt-get install -y direnv
 
