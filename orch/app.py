@@ -2344,15 +2344,32 @@ class OrchApp(App):
     def _on_dispatch_failed(
         self, project: Project, todo_text: str, error: Exception
     ) -> None:
-        self.notify(
-            f"Auto-dispatch failed for {project.name}: {error}",
-            severity="error",
-        )
-        # Unclaim: revert - [~] back to - [ ]
+        from .agent import HeadlessTimeout, resume_command
+
+        # A failed todo goes back to - [ ] and the check below re-dispatches
+        # it, so any failure is retried for as long as dispatch is on. A
+        # timeout would repeat identically — the same work, the same hour —
+        # so it is parked as - [!] instead, which neither counts as pending
+        # nor holds a slot, and its worktree is left for a person to resume.
+        timed_out = isinstance(error, HeadlessTimeout)
+        message = f"Auto-dispatch failed for {project.name}: {error}"
+        if timed_out:
+            err = error.stderr
+            if isinstance(err, bytes):
+                err = err.decode(errors="replace")
+            resume = resume_command(error.executor, err)
+            message += (
+                f". Parked as - [!], not retried. To continue: "
+                f"cd {error.workdir} && {resume}" if resume
+                else f". Parked as - [!], not retried; partial work is in "
+                     f"{error.workdir}"
+            )
+        self.notify(message, severity="error", timeout=30 if timed_out else None)
         try:
             content = project.todos_file.read_text()
             content = content.replace(
-                f"- [~] {todo_text}", f"- [ ] {todo_text}", 1
+                f"- [~] {todo_text}",
+                f"- [{'!' if timed_out else ' '}] {todo_text}", 1,
             )
             project.todos_file.write_text(content)
         except FileNotFoundError:

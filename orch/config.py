@@ -108,6 +108,22 @@ def bridge_worker_timeout_seconds() -> int:
         return 3600
 
 
+def dispatch_worker_timeout_seconds() -> int:
+    """Per-call timeout for the headless agent on an auto-dispatched todo.
+
+    `[dispatch] worker_timeout_seconds`, falling back to the bridge value: a
+    dispatched todo is the same kind of work as a fix bridge, and 31 of 88
+    bridges have run past the 600 s that dispatch used to hard-code.
+    """
+    raw = _section("dispatch").get("worker_timeout_seconds")
+    if raw is None:
+        return bridge_worker_timeout_seconds()
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return bridge_worker_timeout_seconds()
+
+
 def bridge_max_retries() -> int:
     raw = _section("bridge").get("max_retries", 3)
     try:

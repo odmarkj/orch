@@ -193,7 +193,8 @@ resubmitting the same bytes cannot help \u2014 shorten it, move the bulk into a
 file, and submit again.
 
 The daemon enforces per-target serialization (one bridge per target at a time
-by default), retries transient failures automatically, and will reject requests
+by default), retries transient failures automatically (a timeout is not
+retried; its error says how to resume), and will reject requests
 when the target project disables bridges via its `.orch/project.toml`. After
 submitting, continue your current work \u2014 you do not need to wait. Poll
 `orch bridge status <id>` only if a follow-up depends on the result.

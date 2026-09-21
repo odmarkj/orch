@@ -557,3 +557,123 @@ def test_ordinary_nonzero_exit_is_still_transient(bridge_env, monkeypatch):
     assert rec["status"] == "failed"
     assert rec["error_class"] == "transient"
     assert rec["next_retry_at"] is not None
+
+
+# ── Timeouts are stopped, not retried ───────────────────────────────────────
+#
+# A timeout used to be transient: the janitor reran the identical prompt from
+# scratch up to max_retries times — four attempts of up to an hour each, the
+# target's slot blocked throughout, usually ending as a permanent failure
+# anyway. Now it fails once, keeps the worktree, and says how to carry on.
+
+def _timing_out(*, executor="claude", stderr="", behavior=None):
+    """A run_headless stand-in that does some work, then hits the deadline
+    the way the real one reports it."""
+    def run(project, prompt, *, workdir=None, timeout=600, **kwargs):
+        if behavior:
+            behavior(Path(workdir))
+        raise agent_mod.HeadlessTimeout(
+            "timeout -k 30 ... -p", timeout, output="partial", stderr=stderr,
+            executor=executor, workdir=str(workdir), stopped=True, returncode=124,
+        )
+    return run
+
+
+def test_timeout_fails_once_and_is_not_requeued(bridge_env, monkeypatch):
+    repo = bridge_env
+    b = _make_bridge(target_name=repo.project.name)
+    monkeypatch.setattr(agent_mod, "run_headless", _timing_out())
+
+    bw.run_bridge(b)
+
+    rec = state.get_bridge(b["id"])
+    assert rec["status"] == "failed"
+    assert rec["error_class"] == "permanent"
+    assert rec["next_retry_at"] is None
+    assert rec["retry_count"] == 0
+    assert state.find_retry_eligible(max_retries=3) == []
+    assert "timed out" in rec["error"]
+    assert "Not retried automatically" in rec["error"]
+    assert f"orch bridge retry {b['id']}" in rec["error"]
+
+    out = [e for e in state.get_events(b["id"]) if e["event"] == "headless_output"]
+    assert out[0]["detail"]["timed_out"] is True
+    assert out[0]["detail"]["executor"] == "claude"
+    assert out[0]["detail"]["returncode"] == 124
+
+
+def test_timed_out_claude_session_is_resumable_in_kept_worktree(bridge_env, monkeypatch):
+    """Even with no changes on disk the worktree stays: claude's session is
+    keyed to that directory, and `claude --continue` there picks it up."""
+    repo = bridge_env
+    b = _make_bridge(target_name=repo.project.name)
+    monkeypatch.setattr(agent_mod, "run_headless", _timing_out())
+
+    bw.run_bridge(b)
+
+    rec = state.get_bridge(b["id"])
+    wt = Path(rec["worktree_path"])
+    assert wt.exists()
+    assert f"cd {wt} && claude --continue" in rec["error"]
+    kept = [e for e in state.get_events(b["id"]) if e["event"] == "worktree_preserved"]
+    assert len(kept) == 1
+    assert "resumed" in kept[0]["detail"]["reason"]
+
+
+def test_timed_out_asha_session_resumes_by_the_id_it_printed(bridge_env, monkeypatch):
+    repo = bridge_env
+    (repo.project.orch_dir).mkdir(exist_ok=True)
+    repo.project.orch_config_file.write_text('[agent]\nexecutor = "asha"\n')
+    b = _make_bridge(target_name=repo.project.name)
+
+    def behavior(workdir):
+        (workdir / "half.py").write_text("partial work\n")
+
+    monkeypatch.setattr(agent_mod, "run_headless", _timing_out(
+        executor="asha",
+        stderr="budget: $5.00\n  → Edit half.py\nresume with: asha chat --resume s-42\n",
+        behavior=behavior,
+    ))
+
+    bw.run_bridge(b)
+
+    rec = state.get_bridge(b["id"])
+    wt = Path(rec["worktree_path"])
+    assert rec["error_class"] == "permanent"
+    assert f"cd {wt} && asha chat --resume s-42" in rec["error"]
+    # The partial work survived the teardown.
+    assert (wt / "half.py").read_text() == "partial work\n"
+    out = [e for e in state.get_events(b["id"]) if e["event"] == "headless_output"]
+    assert out[0]["detail"]["executor"] == "asha"
+
+
+def test_timeout_without_resume_line_removes_a_clean_worktree(bridge_env, monkeypatch):
+    """Nothing to resume and nothing on disk: no reason to keep it."""
+    repo = bridge_env
+    (repo.project.orch_dir).mkdir(exist_ok=True)
+    repo.project.orch_config_file.write_text('[agent]\nexecutor = "asha"\n')
+    b = _make_bridge(target_name=repo.project.name)
+    monkeypatch.setattr(agent_mod, "run_headless", _timing_out(executor="asha"))
+
+    bw.run_bridge(b)
+
+    rec = state.get_bridge(b["id"])
+    assert rec["error_class"] == "permanent"
+    assert not Path(rec["worktree_path"]).exists()
+    assert "To continue" not in rec["error"]
+    assert f"orch bridge retry {b['id']}" in rec["error"]
+
+
+def test_unknown_executor_is_rejected_not_retried(bridge_env, monkeypatch):
+    repo = bridge_env
+    (repo.project.orch_dir).mkdir(exist_ok=True)
+    repo.project.orch_config_file.write_text('[agent]\nexecutor = "ahsa"\n')
+    b = _make_bridge(target_name=repo.project.name)
+    monkeypatch.setattr(agent_mod, "vm_ensure_running", lambda: None)
+
+    bw.run_bridge(b)
+
+    rec = state.get_bridge(b["id"])
+    assert rec["status"] == "rejected"
+    assert rec["error_class"] == "permanent"
+    assert "'ahsa'" in rec["error"]
