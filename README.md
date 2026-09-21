@@ -429,6 +429,9 @@ name = "orch"
 [dispatch]
 # Max Claude instances running in parallel per project (each gets a worktree)
 max_parallel = 3
+# Deadline for each headless run on a dispatched todo (default: the bridge's
+# worker_timeout_seconds, 3600)
+# worker_timeout_seconds = 3600
 
 [bridge]
 port = 7777
@@ -453,9 +456,17 @@ code_review = true
 on_first_session = "sudo systemctl start docker"
 # Run when the last session ends
 on_last_session = "sudo systemctl stop docker"
+
+[agent]
+# Agent CLI for headless runs (bridges, auto-dispatch): "claude" (default) or "asha"
+executor = "claude"
 ```
 
 Hooks run inside the VM at the project directory. Use them to start/stop services that a project needs (databases, k3s, Docker, etc.) so they only run on demand instead of consuming resources permanently.
+
+`[agent] executor` switches one project's headless runs to another agent CLI, so a new agent can be rolled out a project at a time. Interactive sessions always run Claude. An unrecognised value fails the run rather than silently falling back to Claude. `orch bridge status` shows which executor handled each run.
+
+Headless runs are stopped at their deadline inside the VM: `timeout` sends the agent's process group SIGTERM, then SIGKILL 30 s later. A timed-out bridge is not retried automatically, because a rerun from scratch would most likely time out again. Its error gives the command that resumes the stopped session from the worktree, which is kept for that purpose, and `orch bridge retry <id>` starts over. A timed-out auto-dispatched todo is marked `- [!]`, which keeps it from being dispatched again.
 
 ### Per-project toolchain (optional)
 

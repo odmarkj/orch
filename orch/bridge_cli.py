@@ -160,12 +160,14 @@ def _render_event(e: dict, *, verbose: bool) -> None:
     if name == "headless_output" and isinstance(detail, dict):
         rc = detail.get("returncode")
         phase = detail.get("phase", "?")
+        # Events written before per-project executors have no key; they ran claude.
+        executor = detail.get("executor") or "claude"
         timed_out = detail.get("timed_out")
         stdout = detail.get("stdout") or ""
         stderr = detail.get("stderr") or ""
         size = f"stdout={len(stdout)}B stderr={len(stderr)}B"
         flag = " TIMEOUT" if timed_out else (f" rc={rc}" if rc not in (0, None) else "")
-        print(f"  {ts}  {name} [{phase}{flag} {size}]")
+        print(f"  {ts}  {name} [{phase} {executor}{flag} {size}]")
         failed = bool(timed_out) or (rc not in (0, None))
         if failed or verbose:
             if stderr.strip():

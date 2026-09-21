@@ -45,11 +45,13 @@ def _record_headless_output(
     stdout: str | None,
     stderr: str | None,
     timed_out: bool = False,
+    executor: str | None = None,
 ) -> None:
     """Persist captured headless output as a bridge_event so it survives the
     worktree teardown. Always emitted — failure or success."""
     state.add_event(bid, "headless_output", {
         "phase": phase,
+        "executor": executor,
         "returncode": returncode,
         "timed_out": timed_out,
         "stdout": _tail(stdout),
@@ -60,24 +62,34 @@ def _record_headless_output(
 def _run_headless_capture(
     target: Project, prompt: str, *, bid: str, phase: str, **kwargs,
 ) -> tuple[str, str]:
-    """Run a headless Claude turn, persisting both streams to the event log
+    """Run a headless agent turn, persisting both streams to the event log
     regardless of outcome. Returns (stdout, stderr).
 
-    Raises TransientBridgeError on subprocess error, timeout, or non-zero
-    exit; the failure path includes the captured streams so callers don't
-    need to unpack again. Raises PermanentBridgeError when the command
-    never reached the VM because it was too large for the ssh control
-    channel — that outcome is a property of the payload, so every retry
-    would fail identically and calling it transient just burns the budget
-    while telling the submitter to "try again later"."""
-    from .agent import run_headless
+    Raises TransientBridgeError on subprocess error or non-zero exit; the
+    failure path includes the captured streams so callers don't need to
+    unpack again. Raises BridgeTimeoutError when the run reached its
+    deadline — not transient, see that class. Raises PermanentBridgeError
+    when the project names an unknown executor, or when the command never
+    reached the VM because it was too large for the ssh control channel —
+    that outcome is a property of the payload, so every retry would fail
+    identically and calling it transient just burns the budget while
+    telling the submitter to "try again later"."""
+    from .agent import UnknownExecutorError, resume_command, run_headless
     from .vm import CommandTooLargeError, is_ssh_undeliverable
 
+    executor = target.executor
     try:
         result = run_headless(target, prompt, **kwargs)
+    except UnknownExecutorError as e:
+        _record_headless_output(
+            bid, phase, returncode=None, stdout=None, stderr=str(e),
+            executor=executor,
+        )
+        raise PermanentBridgeError(str(e)) from e
     except CommandTooLargeError as e:
         _record_headless_output(
             bid, phase, returncode=None, stdout=None, stderr=str(e),
+            executor=executor,
         )
         raise PermanentBridgeError(
             f"headless {phase} could not be delivered ({len(prompt)}-byte "
@@ -85,19 +97,24 @@ def _run_headless_capture(
         ) from e
     except subprocess.TimeoutExpired as e:
         # TimeoutExpired carries whatever streams were collected before the
-        # timeout fired. Capture them, log, then surface as transient.
+        # timeout fired — for an in-VM stop that is everything the agent
+        # wrote, including any resume line it printed on the way down.
         out = e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
         err = e.stderr.decode(errors="replace") if isinstance(e.stderr, bytes) else (e.stderr or "")
         _record_headless_output(
-            bid, phase, returncode=None, stdout=out, stderr=err, timed_out=True,
+            bid, phase, returncode=getattr(e, "returncode", None),
+            stdout=out, stderr=err, timed_out=True, executor=executor,
         )
-        raise TransientBridgeError(
-            f"headless {phase} timed out after {e.timeout}s"
-            + (f"; stderr tail: {_tail(err, 400)}" if err.strip() else "")
+        raise BridgeTimeoutError(
+            phase=phase, seconds=e.timeout, executor=executor,
+            stopped=getattr(e, "stopped", False),
+            resume=resume_command(executor, err),
+            stderr_tail=_tail(err, 400),
         ) from e
     except Exception as e:
         _record_headless_output(
             bid, phase, returncode=None, stdout=None, stderr=repr(e),
+            executor=executor,
         )
         raise TransientBridgeError(f"headless {phase} errored: {e}") from e
 
@@ -105,6 +122,7 @@ def _run_headless_capture(
     err = result.stderr or ""
     _record_headless_output(
         bid, phase, returncode=result.returncode, stdout=out, stderr=err,
+        executor=executor,
     )
     if result.returncode != 0:
         if is_ssh_undeliverable(result.returncode, err):
@@ -136,6 +154,37 @@ class PermanentBridgeError(Exception):
 class TransientBridgeError(Exception):
     """Raised when a bridge failed but a retry might succeed (VM down,
     network blip, git push race, Claude API rate-limit, etc)."""
+
+
+class BridgeTimeoutError(Exception):
+    """The headless agent reached its deadline and was stopped.
+
+    Not transient, and not a rejection either: an identical rerun from
+    scratch redoes the work that ran out of time and most likely times out
+    again, at the same cost and with the target's slot blocked throughout.
+    So it is never auto-retried. A person can continue the session with
+    *resume*, run from the preserved worktree, or start over with
+    `orch bridge retry`.
+    """
+
+    def __init__(
+        self, *, phase: str, seconds: float, executor: str, stopped: bool,
+        resume: str | None, stderr_tail: str = "",
+    ) -> None:
+        self.phase = phase
+        self.seconds = seconds
+        self.executor = executor
+        self.stopped = stopped
+        self.resume = resume
+        self.stderr_tail = stderr_tail
+        self.worktree: Path | None = None
+        how = (
+            "and was stopped in the VM" if stopped
+            else "and orch could not confirm it stopped in the VM"
+        )
+        super().__init__(
+            f"headless {phase} ({executor}) timed out after {seconds}s {how}"
+        )
 
 
 @dataclass
@@ -216,6 +265,8 @@ def run_bridge(bridge: dict) -> None:
 
     On success: marks completed with result/pr_url/branch.
     On permanent failure: marks rejected.
+    On timeout: marks failed with error_class=permanent and no
+    next_retry_at, keeping the worktree so the session can be resumed.
     On transient failure: marks failed with error_class=transient and
     next_retry_at populated, so the janitor will requeue.
     """
@@ -247,6 +298,7 @@ def run_bridge(bridge: dict) -> None:
         worktree_path: Path | None = None
         branch_name = ""
         base_commit = ""
+        keep_reason: str | None = None
         try:
             try:
                 worktree_path, branch_name = create_worktree(
@@ -333,14 +385,21 @@ def run_bridge(bridge: dict) -> None:
             if pr_url:
                 state.add_event(bid, "pr_created", {"pr_url": pr_url})
 
+        except BridgeTimeoutError as e:
+            e.worktree = worktree_path
+            keep_reason = _timeout_keep_reason(e)
+            raise
         finally:
             if worktree_path is not None:
                 _teardown_worktree(
                     bid, target, worktree_path, branch_name, base_commit,
+                    keep_reason=keep_reason,
                 )
 
     except PermanentBridgeError as e:
         state.mark_rejected(bid, reason=str(e))
+    except BridgeTimeoutError as e:
+        _fail_timed_out(bid, e)
     except TransientBridgeError as e:
         _schedule_retry(bid, str(e))
     except Exception as e:
@@ -408,6 +467,43 @@ def _schedule_retry(bid: str, error: str) -> None:
     )
 
 
+def _timeout_keep_reason(e: BridgeTimeoutError) -> str | None:
+    """Why a timed-out bridge's worktree must outlive it even when clean.
+
+    A session is keyed to its working directory, so removing the worktree
+    strands a session that could otherwise be resumed. And if orch never
+    saw the agent exit, a forced removal could run under a live process.
+    """
+    if not e.stopped:
+        return ("the agent timed out and orch could not confirm it stopped; "
+                "kept rather than removed from under it")
+    if e.resume:
+        return "the agent timed out; kept so its session can be resumed here"
+    return None
+
+
+def _fail_timed_out(bid: str, e: BridgeTimeoutError) -> None:
+    """Record a timeout as a final failure that says how to carry on."""
+    lines = [
+        f"{e}. Not retried automatically: a rerun from scratch repeats the "
+        f"work that ran out of time and would most likely time out again."
+    ]
+    kept = e.worktree is not None and e.worktree.exists()
+    if kept and e.resume:
+        lines.append(
+            f"To continue the stopped session: cd {e.worktree} && {e.resume}"
+        )
+    elif kept:
+        lines.append(f"Its partial work is kept in {e.worktree}.")
+    lines.append(f"To start over: orch bridge retry {bid}")
+    if e.stderr_tail:
+        lines.append(f"stderr tail: {e.stderr_tail}")
+    state.mark_failed(
+        bid, error="\n".join(lines),
+        error_class=state.ERROR_PERMANENT, next_retry_at=None,
+    )
+
+
 def _run_clarification(bridge: dict, question: str) -> str:
     """Ask the source project for clarification. Best-effort: any failure
     produces "(no answer)" rather than raising — the parent run can still
@@ -427,27 +523,30 @@ def _run_clarification(bridge: dict, question: str) -> str:
         "Write your answer to stdout — it will be forwarded."
     )
     source = Project(path=Path(bridge["source_path"]))
+    executor: str | None = None
     try:
+        executor = source.executor
         result = run_headless(source, prompt, timeout=120)
     except subprocess.TimeoutExpired as e:
         out = e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
         err = e.stderr.decode(errors="replace") if isinstance(e.stderr, bytes) else (e.stderr or "")
         _record_headless_output(
             bridge["id"], "clarification_source",
-            returncode=None, stdout=out, stderr=err, timed_out=True,
+            returncode=getattr(e, "returncode", None), stdout=out, stderr=err,
+            timed_out=True, executor=executor,
         )
         return "(no answer)"
     except Exception as e:
         _record_headless_output(
             bridge["id"], "clarification_source",
-            returncode=None, stdout=None, stderr=repr(e),
+            returncode=None, stdout=None, stderr=repr(e), executor=executor,
         )
         return "(no answer)"
 
     _record_headless_output(
         bridge["id"], "clarification_source",
         returncode=result.returncode,
-        stdout=result.stdout, stderr=result.stderr,
+        stdout=result.stdout, stderr=result.stderr, executor=executor,
     )
     if result.returncode == 0:
         return (result.stdout or "").strip() or "(no answer)"
@@ -579,7 +678,7 @@ def _existing_pr_url(worktree_path: Path, branch: str) -> str | None:
 
 def _teardown_worktree(
     bid: str, target: Project, worktree_path: Path,
-    branch_name: str, base_commit: str,
+    branch_name: str, base_commit: str, *, keep_reason: str | None = None,
 ) -> None:
     """Remove the bridge worktree — unless it still holds work that never
     reached a remote, in which case leave it in place and make that loud.
@@ -587,6 +686,9 @@ def _teardown_worktree(
     This is a safety net, not a feature: if the push logic is correct it
     should almost never trigger. When it does, the work still exists and
     `orch bridge status` says where. Never raises (runs in a finally).
+
+    *keep_reason* keeps even a clean worktree, for a caller that knows
+    something git status cannot show (see _timeout_keep_reason).
     """
     from .agent import remove_worktree, worktree_branch, worktree_unpushed_reason
 
@@ -594,6 +696,8 @@ def _teardown_worktree(
         reason = worktree_unpushed_reason(worktree_path, base_commit)
     except Exception as e:
         reason = f"could not verify worktree state: {e!r}"
+    if reason is None:
+        reason = keep_reason
 
     if reason:
         try:

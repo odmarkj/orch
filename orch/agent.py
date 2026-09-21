@@ -306,7 +306,89 @@ def _maybe_update_stack_detection(project: "Project") -> None:
         pass  # Never let detection failure block a session
 
 
-# ── Headless Claude execution ────────────────────────────────────────────────
+# ── Headless agent execution ─────────────────────────────────────────────────
+
+# The agent CLI a headless run hands its prompt to, chosen per project by
+# `[agent] executor` in .orch/project.toml. Both read the prompt from stdin,
+# write only the answer to stdout and exit non-zero when the turn fails, and
+# `asha chat` accepts claude's `-p` and `--dangerously-skip-permissions` as
+# no-ops — so everything after the program name is shared.
+EXECUTORS = {
+    "claude": "claude",
+    "asha": "asha chat",
+}
+
+# The deadline is enforced inside the VM by `timeout` wrapped around the
+# agent: SIGTERM at the deadline, SIGKILL KILL_GRACE_SECONDS later, both sent
+# to the agent's whole process group. The host-side limit on the ssh client
+# sits HOST_BACKSTOP_SECONDS past the deadline and only matters if that
+# failed. It used to be the only limit, and killing the local ssh client
+# signals nothing in the VM: a timed-out `claude -p` kept running and editing
+# a worktree orch had already given up on.
+KILL_GRACE_SECONDS = 30
+HOST_BACKSTOP_SECONDS = 60
+
+# What `timeout` exits with at the deadline: 124 when the agent went down on
+# SIGTERM, 137 when it had to be SIGKILLed (taking `timeout` with it).
+_VM_TIMEOUT_CODES = (124, 137)
+
+_RESUME_LINE = re.compile(r"resume with:[ \t]*(\S.*?)[ \t]*$", re.MULTILINE)
+_ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+class UnknownExecutorError(ValueError):
+    """`[agent] executor` names an agent orch does not know how to run.
+
+    A configuration error: retrying cannot fix it, and silently falling back
+    to claude would hide that a project's opt-in never took effect.
+    """
+
+
+class HeadlessTimeout(subprocess.TimeoutExpired):
+    """A headless agent run reached its deadline.
+
+    A TimeoutExpired, so existing handlers keep working. *stopped* is True
+    when the in-VM timer ended the agent and the chain exited; False when
+    only the host backstop fired, so orch never saw the VM side exit.
+    """
+
+    def __init__(
+        self, cmd: str, timeout: float, *,
+        output: str | bytes | None = None, stderr: str | bytes | None = None,
+        executor: str, workdir: str, stopped: bool,
+        returncode: int | None = None,
+    ) -> None:
+        super().__init__(cmd, timeout, output=output, stderr=stderr)
+        self.executor = executor
+        self.workdir = workdir
+        self.stopped = stopped
+        self.returncode = returncode
+
+    def __str__(self) -> str:
+        how = (
+            "stopped in the VM" if self.stopped
+            else "only the ssh client was killed; orch could not confirm the "
+                 "agent stopped in the VM"
+        )
+        return f"{self.executor} timed out after {self.timeout}s ({how})"
+
+
+def resume_command(executor: str, stderr: str | None) -> str | None:
+    """The command that continues a stopped headless session, if known.
+
+    Run it from the session's working directory. Asha prints
+    `resume with: asha chat --resume <id>` on stderr; the last one wins.
+    `claude -p` prints no id, but its transcript is keyed to the working
+    directory and each headless task runs in its own worktree, so
+    `claude --continue` there picks up the run that was stopped.
+    """
+    matches = _RESUME_LINE.findall(_ANSI.sub("", stderr or ""))
+    if matches:
+        return matches[-1]
+    if executor == "claude":
+        return "claude --continue"
+    return None
+
 
 def run_headless(
     project: "Project",
@@ -316,10 +398,17 @@ def run_headless(
     timeout: int = 600,
     allowed_dirs: list[str] | None = None,
 ) -> subprocess.CompletedProcess:
-    """Run Claude headlessly with a prompt, capturing output.
+    """Run the project's headless agent with a prompt, capturing output.
 
     Used by auto-dispatch and bridge communication. Filesystem writes
     are sandboxed to the project directory (and any extra allowed_dirs).
+    The agent is `project.executor` — claude unless the project opts in to
+    another one in EXECUTORS.
+
+    Raises HeadlessTimeout when the run reaches *timeout* seconds; the
+    agent is stopped inside the VM at that point, not merely abandoned.
+    Raises UnknownExecutorError before touching the VM if the project names
+    an executor orch does not know.
 
     The prompt is delivered over stdin, never on the command line: ssh
     sends the whole remote command to the mux master in one control
@@ -328,12 +417,24 @@ def run_headless(
     ran. `claude -p` with no positional prompt reads it from stdin, so the
     command stays short and constant no matter how long the prompt is.
     """
+    executor = project.executor
+    program = EXECUTORS.get(executor)
+    if program is None:
+        raise UnknownExecutorError(
+            f"{project.name}: [agent] executor = {executor!r} in "
+            f"{project.orch_config_file} is not a known executor "
+            f"({', '.join(sorted(EXECUTORS))})"
+        )
+
     vm_ensure_running()
 
     if workdir is None:
         workdir = str(project.path)
 
-    parts = ["claude", "--dangerously-skip-permissions"]
+    parts = [
+        f"timeout -k {KILL_GRACE_SECONDS} {timeout}",
+        program, "--dangerously-skip-permissions",
+    ]
     if allowed_dirs:
         parts += [f"--add-dir {shlex.quote(d)}" for d in allowed_dirs]
     parts.append("-p")
@@ -343,10 +444,39 @@ def run_headless(
     if allowed_dirs:
         writable.extend(allowed_dirs)
 
-    return vm_exec_sandboxed(
-        cmd, cwd=workdir, writable_dirs=writable, timeout=timeout,
-        input=prompt,
-    )
+    started = time.monotonic()
+    try:
+        result = vm_exec_sandboxed(
+            cmd, cwd=workdir, writable_dirs=writable,
+            timeout=timeout + HOST_BACKSTOP_SECONDS, input=prompt,
+        )
+    except subprocess.TimeoutExpired as e:
+        log.error(
+            "%s: headless %s in %s outlived its in-VM deadline (%ss) by %ss; "
+            "killed the ssh client, but anything the agent left outside its "
+            "process group may still be running in the VM",
+            project.name, executor, workdir, timeout, HOST_BACKSTOP_SECONDS,
+        )
+        raise HeadlessTimeout(
+            cmd, timeout, output=e.stdout, stderr=e.stderr,
+            executor=executor, workdir=str(workdir), stopped=False,
+        ) from e
+
+    if (
+        result.returncode in _VM_TIMEOUT_CODES
+        and time.monotonic() - started >= timeout
+    ):
+        log.warning(
+            "%s: headless %s in %s reached its %ss deadline and was stopped "
+            "in the VM (rc=%s)",
+            project.name, executor, workdir, timeout, result.returncode,
+        )
+        raise HeadlessTimeout(
+            cmd, timeout, output=result.stdout, stderr=result.stderr,
+            executor=executor, workdir=str(workdir), stopped=True,
+            returncode=result.returncode,
+        )
+    return result
 
 
 # ── Worktree management ─────────────────────────────────────────────────────
@@ -842,6 +972,9 @@ def run_task_in_worktree(project: "Project", todo_text: str) -> dict:
     test_cmd = project.test_cmd
     max_fix = project.max_fix_attempts if test_cmd else 0
 
+    from .config import dispatch_worker_timeout_seconds
+    work_timeout = dispatch_worker_timeout_seconds()
+
     try:
         vm_ensure_running()
 
@@ -850,7 +983,7 @@ def run_task_in_worktree(project: "Project", todo_text: str) -> dict:
             f"Work on this task: {todo_text}\n\n"
             f"When done, make sure all changes are saved. Do not commit or push."
         )
-        run_headless(project, task_prompt, workdir=worktree_path, timeout=600)
+        run_headless(project, task_prompt, workdir=worktree_path, timeout=work_timeout)
 
         # ── Test-fix loop ──
         if test_cmd:
@@ -873,7 +1006,9 @@ def run_task_in_worktree(project: "Project", todo_text: str) -> dict:
                     f"Test command: {test_cmd}\n\n"
                     f"Test output:\n```\n{test_output}\n```"
                 )
-                run_headless(project, fix_prompt, workdir=worktree_path, timeout=600)
+                run_headless(
+                    project, fix_prompt, workdir=worktree_path, timeout=work_timeout,
+                )
 
         # ── Code review (if enabled) ──
         if project.code_review_enabled:
@@ -916,13 +1051,17 @@ def run_task_in_worktree(project: "Project", todo_text: str) -> dict:
         )
         results["pr_url"] = pr_url
 
-    except Exception:
+    except Exception as e:
         # Never force-remove a worktree still holding work that isn't on a
         # remote — commits and uncommitted changes would be destroyed with
         # no record. A preserved worktree can be inspected or cleaned by
-        # hand; destroyed work cannot.
+        # hand; destroyed work cannot. Nor one whose agent timed out: the
+        # session is keyed to the worktree, so keeping it keeps it resumable.
         try:
-            if worktree_unpushed_reason(worktree_path, base_commit) is None:
+            if (
+                not isinstance(e, HeadlessTimeout)
+                and worktree_unpushed_reason(worktree_path, base_commit) is None
+            ):
                 remove_worktree(project, worktree_path, branch_name)
         except Exception:
             pass

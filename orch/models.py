@@ -228,6 +228,21 @@ class Project:
         return None
 
     @property
+    def executor(self) -> str:
+        """Agent CLI that headless runs use: `[agent] executor` in
+        .orch/project.toml, default "claude".
+
+        Returned as written (lower-cased, inline comment dropped) rather than
+        coerced to a known name, so a typo fails loudly in run_headless
+        instead of silently running the incumbent.
+        """
+        raw = self._read_orch_config_section_str("agent", "executor")
+        if raw is None:
+            return "claude"
+        value = raw.split("#", 1)[0].strip().strip('"').strip("'").strip()
+        return value.lower() or "claude"
+
+    @property
     def max_fix_attempts(self) -> int:
         """Max times Claude will retry fixing failed tests (default 3)."""
         val = self._read_orch_config_str("max_fix_attempts")
