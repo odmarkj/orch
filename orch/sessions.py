@@ -2,7 +2,9 @@
 
 A *session* is one ``.jsonl`` conversation log that Claude Code writes under::
 
-    ~/.claude/projects/<cwd-with-slashes-as-dashes>/<session-uuid>.jsonl
+    ~/.claude/projects/<cwd-with-non-alphanumerics-as-dashes>/<session-uuid>.jsonl
+
+(see ``claude_paths`` for how that dir is located).
 
 Claude keys ``--resume`` on the working directory, so to resume a session we
 relaunch ``claude --resume <session_id>`` from that session's original cwd —
@@ -31,6 +33,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from . import state
+from .claude_paths import JsonlDirResolver
 
 if TYPE_CHECKING:
     from .models import Project
@@ -58,19 +61,6 @@ class SessionEntry:
     branch: str | None = None
     base_branch: str | None = None
     wt_status: str | None = None
-
-
-def _projects_base() -> Path:
-    return Path.home() / ".claude" / "projects"
-
-
-def _dash(path: Path | str) -> str:
-    """Encode a cwd the way Claude Code names its project dir: / → -."""
-    return str(path).replace("/", "-")
-
-
-def _jsonl_dir_for(cwd: Path | str) -> Path:
-    return _projects_base() / _dash(cwd)
 
 
 def _first_user_preview(jsonl_path: Path) -> str:
@@ -155,7 +145,8 @@ def list_resumable_sessions(project: "Project") -> list[SessionEntry]:
     seen: set[str] = set()
 
     # ── Root (`c`) sessions ────────────────────────────────────────────────
-    root_dir = _jsonl_dir_for(project.path)
+    resolve = JsonlDirResolver()
+    root_dir = resolve(project.path)
     for sid, path, mtime, preview in _scan_dir(root_dir):
         if sid in seen:
             continue
@@ -170,7 +161,9 @@ def list_resumable_sessions(project: "Project") -> list[SessionEntry]:
         wt_path = row.get("worktree_path")
         if not wt_path or not Path(wt_path).is_dir():
             continue  # dir removed → cwd gone → not resumable
-        jsonl_dir = Path(row.get("jsonl_dir") or _jsonl_dir_for(wt_path))
+        # Resolve from the cwd, not the row's stored jsonl_dir: rows written
+        # before the encoding fix hold a dir Claude never writes to.
+        jsonl_dir = resolve(wt_path)
         for sid, path, mtime, preview in _scan_dir(jsonl_dir):
             if sid in seen:
                 continue

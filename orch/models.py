@@ -158,8 +158,8 @@ class Project:
         With Lima VM, paths are identical to host paths, so we only need
         the host-style encoding.
         """
-        base = Path.home() / ".claude" / "projects"
-        host_dir = base / str(self.path).replace("/", "-")
+        from .claude_paths import jsonl_dir_for
+        host_dir = jsonl_dir_for(self.path)
         dirs = []
         if host_dir.is_dir():
             dirs.append(host_dir)
