@@ -29,6 +29,7 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
 from .models import Project
+from .claude_paths import JsonlDirResolver, encoded_jsonl_dir
 from .discovery import discover_projects
 from .gitexclude import ensure_orch_excluded
 from .iterm import notify_input_needed, notify_resumed, clear_stale_handle
@@ -737,6 +738,7 @@ class OrchApp(App):
         # observer Watch handles so we can unschedule on cleanup.
         self._worktree_path_to_project: dict[str, Project] = {}
         self._worktree_watches: dict[str, list] = {}  # wt_path -> [Watch, ...]
+        self._worktree_jsonl_dir: dict[str, str] = {}  # wt_path -> watched jsonl dir
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -1025,12 +1027,16 @@ class OrchApp(App):
             from . import state
             state.init_db()
             project_by_path = {str(p.path): p for p in self.projects}
+            # Resolve from the worktree path rather than trusting the row's
+            # jsonl_dir: rows from before the encoding fix hold a dir Claude
+            # never writes to.
+            resolve = JsonlDirResolver()
             for row in state.list_active_worktrees():
                 project = project_by_path.get(row["project_path"])
                 if project is None:
                     continue
                 self._add_worktree_watch(
-                    row["worktree_path"], row["jsonl_dir"], project,
+                    row["worktree_path"], str(resolve(row["worktree_path"])), project,
                 )
         except Exception:
             pass  # best-effort — daemon is the source of truth
@@ -1616,8 +1622,10 @@ class OrchApp(App):
                         pass
 
                 # Pre-create the JSONL log dir so the watcher can schedule it
-                # before Claude lazily creates it on first turn.
-                jsonl_dir = Path.home() / ".claude" / "projects" / str(wt_path).replace("/", "-")
+                # before Claude lazily creates it on first turn. Resume doesn't
+                # rely on this: if the encoding ever drifts from Claude's, the
+                # dir stays empty and resolution falls back to the cwd index.
+                jsonl_dir = encoded_jsonl_dir(wt_path)
                 jsonl_dir.mkdir(parents=True, exist_ok=True)
 
                 state.insert_worktree(
@@ -1688,6 +1696,7 @@ class OrchApp(App):
             )
             self._worktree_watches[wt_path] = handles
             self._worktree_path_to_project[wt_path] = project
+            self._worktree_jsonl_dir[wt_path] = jsonl_dir
             self._jsonl_dir_to_project[jsonl_dir] = project
         except Exception:
             # Best-effort: a watch failure shouldn't block session launch
@@ -1701,9 +1710,11 @@ class OrchApp(App):
         """Unschedule watchers for a worktree (called during cleanup)."""
         handles = self._worktree_watches.pop(wt_path, None)
         project = self._worktree_path_to_project.pop(wt_path, None)
-        # Remove jsonl_dir mapping too
-        jsonl_dir = str(Path.home() / ".claude" / "projects" / wt_path.replace("/", "-"))
-        self._jsonl_dir_to_project.pop(jsonl_dir, None)
+        # Remove jsonl_dir mapping too — by the dir it was scheduled on,
+        # rather than recomputing it.
+        jsonl_dir = self._worktree_jsonl_dir.pop(wt_path, None)
+        if jsonl_dir is not None:
+            self._jsonl_dir_to_project.pop(jsonl_dir, None)
         if self._observer is None or not handles:
             return
         for h in handles:
@@ -1807,7 +1818,8 @@ class OrchApp(App):
                         if row:
                             self.call_from_thread(
                                 self._add_worktree_watch,
-                                row["worktree_path"], row["jsonl_dir"], project,
+                                row["worktree_path"],
+                                str(entry.jsonl_path.parent), project,
                             )
                     except Exception:
                         pass
