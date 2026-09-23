@@ -318,6 +318,16 @@ EXECUTORS = {
     "asha": "asha chat",
 }
 
+# The same choice for the interactive session orch opens in an iTerm2 tab.
+# `asha shell` execs the real claude TUI with Asha's configuration applied and
+# passes through the flags it does not handle itself, so the tab's arguments
+# (--dangerously-skip-permissions, --resume, --append-system-prompt-file) are
+# shared too.
+INTERACTIVE_EXECUTORS = {
+    "claude": "claude",
+    "asha": "asha shell",
+}
+
 # The deadline is enforced inside the VM by `timeout` wrapped around the
 # agent: SIGTERM at the deadline, SIGKILL KILL_GRACE_SECONDS later, both sent
 # to the agent's whole process group. The host-side limit on the ssh client
@@ -342,6 +352,55 @@ class UnknownExecutorError(ValueError):
     A configuration error: retrying cannot fix it, and silently falling back
     to claude would hide that a project's opt-in never took effect.
     """
+
+
+class ExecutorUnavailableError(RuntimeError):
+    """The project's executor is known but cannot be run inside the VM."""
+
+
+def _unknown_executor(project: "Project", known: dict[str, str]) -> UnknownExecutorError:
+    return UnknownExecutorError(
+        f"{project.name}: [agent] executor = {project.executor!r} in "
+        f"{project.orch_config_file} is not a known executor "
+        f"({', '.join(sorted(known))})"
+    )
+
+
+def interactive_program(project: "Project") -> str:
+    """The command an interactive iTerm2 session starts for *project*.
+
+    Chosen by `project.executor`, the same setting run_headless honours.
+    Raises UnknownExecutorError for an executor orch does not know, rather
+    than opening a claude tab for a project that asked for something else.
+
+    A non-default executor is probed with `<executor> --version` first and
+    raises ExecutorUnavailableError if that fails, so a missing binary is
+    reported by orch instead of as "command not found" in a tab that closes.
+    The default, claude, is not probed: its launch is exactly what it was.
+    """
+    executor = project.executor
+    program = INTERACTIVE_EXECUTORS.get(executor)
+    if program is None:
+        raise _unknown_executor(project, INTERACTIVE_EXECUTORS)
+    if executor == "claude":
+        return program
+
+    try:
+        probe = vm_exec(f"{shlex.quote(executor)} --version", timeout=30)
+    except subprocess.TimeoutExpired:
+        raise ExecutorUnavailableError(
+            f"{project.name}: `{executor} --version` did not answer in the VM "
+            f"within 30s"
+        ) from None
+    if probe.returncode != 0:
+        detail = (probe.stderr or probe.stdout or "").strip().splitlines()
+        why = detail[-1] if detail else f"exit {probe.returncode}"
+        raise ExecutorUnavailableError(
+            f"{project.name}: [agent] executor = {executor!r}, but "
+            f"`{executor} --version` failed in the VM ({why}). Is {executor} "
+            f"on the VM's PATH (e.g. ~/.local/bin/{executor})?"
+        )
+    return program
 
 
 class HeadlessTimeout(subprocess.TimeoutExpired):
@@ -420,11 +479,7 @@ def run_headless(
     executor = project.executor
     program = EXECUTORS.get(executor)
     if program is None:
-        raise UnknownExecutorError(
-            f"{project.name}: [agent] executor = {executor!r} in "
-            f"{project.orch_config_file} is not a known executor "
-            f"({', '.join(sorted(EXECUTORS))})"
-        )
+        raise _unknown_executor(project, EXECUTORS)
 
     vm_ensure_running()
 
