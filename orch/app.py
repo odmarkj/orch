@@ -1594,10 +1594,13 @@ class OrchApp(App):
         def _launch():
             try:
                 vm_ensure_running()
-                from .agent import create_session_worktree
+                from .agent import create_session_worktree, interactive_program
                 from .iterm import open_vm_session_in_worktree
                 from . import state
 
+                # Resolve the executor first so an unknown or missing one
+                # fails before a worktree is created for it.
+                program = interactive_program(p)
                 wt_path, branch, base_branch, wt_id = create_session_worktree(p)
 
                 # If the project has a pending_task queued, move it into the
@@ -1633,6 +1636,7 @@ class OrchApp(App):
 
                 open_vm_session_in_worktree(
                     p, wt_path, wt_id, branch=branch, base_branch=base_branch,
+                    program=program,
                 )
                 self.call_from_thread(
                     self._stop_spinner_and_refresh, p,
@@ -1786,8 +1790,13 @@ class OrchApp(App):
         def _launch():
             try:
                 vm_ensure_running()
+                from .agent import interactive_program
                 from .iterm import open_vm_resume_session
                 from . import state
+
+                # Before reactivating anything: an unknown or missing
+                # executor fails here.
+                program = interactive_program(project)
 
                 # Reactivate the worktree row + re-arm its watchers so the
                 # resumed session shows live status and is tracked on close.
@@ -1810,6 +1819,7 @@ class OrchApp(App):
                     wt_id=entry.wt_id,
                     branch=entry.branch,
                     base_branch=entry.base_branch,
+                    program=program,
                 )
                 self.call_from_thread(
                     self._stop_spinner_and_refresh, project,

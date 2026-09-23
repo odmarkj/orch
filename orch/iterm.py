@@ -99,6 +99,16 @@ def _iterm_badge_cmd(text: str) -> str:
     return f"printf '\\033]1337;SetBadgeFormat={encoded}\\007'"
 
 
+def _agent_label(project: Project, text: str) -> str:
+    """*text* for a tab name or badge, naming the executor unless it is claude.
+
+    Projects on the default keep exactly the label they had; one that opted
+    in to another agent says so at a glance.
+    """
+    executor = project.executor
+    return text if executor == "claude" else f"{text} · {executor}"
+
+
 # ── Notifications ─────────────────────────────────────────────────────────────
 
 
@@ -157,8 +167,6 @@ def open_input_tab(project: Project) -> None:
     - Never closes tabs — user owns that.
     """
     handle_file = project.orch_dir / "iterm_handle"
-    project_name  = project.name
-
     # Focus existing tab if still alive — don't open duplicates
     if handle_file.exists():
         existing_tty = handle_file.read_text().strip()
@@ -175,8 +183,9 @@ def open_input_tab(project: Project) -> None:
     profile       = cfg["iterm"].get("profile", "orch")
     dedicated     = cfg["iterm"].get("dedicated_window", True)
     window_title  = cfg["iterm"].get("window_title", "orch sessions")
-    badge         = _iterm_badge_cmd(project_name)
     vm_cmd        = _build_vm_claude_cmd(project)
+    project_name  = _agent_label(project, project.name)
+    badge         = _iterm_badge_cmd(project_name)
     shell_cmd     = _applescript_quote(
         f"{badge} && {vm_cmd}"
     )
@@ -430,7 +439,9 @@ def _build_vm_claude_cmd(project: Project) -> str:
     """
     import shlex
     from .vm import vm_ssh_cmd
+    from .agent import interactive_program
 
+    program = interactive_program(project)
     project_dir = str(project.path)
     claude_args = "--dangerously-skip-permissions"
 
@@ -452,7 +463,7 @@ def _build_vm_claude_cmd(project: Project) -> str:
         f'PIDFILE={shlex.quote(pid_prefix)}-$$.pid; '
         f'trap "rm -f $PIDFILE" EXIT HUP; '
         f'echo $$ > "$PIDFILE"; '
-        f"clear; claude {claude_args} {_orch_prompt_arg()}"
+        f"clear; {program} {claude_args} {_orch_prompt_arg()}"
     )
     return vm_ssh_cmd(extra_cmd=inner)
 
@@ -467,7 +478,10 @@ def open_vm_session(project: Project, with_shell: bool = False) -> None:
     """
     import shlex
     from .vm import sandbox_cmd, vm_ssh_cmd
-    from .agent import session_exists, fire_first_session_hook
+    from .agent import session_exists, fire_first_session_hook, interactive_program
+
+    # Before any side effect: an unknown or missing executor fails here.
+    program = interactive_program(project)
 
     # Fire on_first_session hook if no existing session
     if not session_exists(project):
@@ -487,7 +501,8 @@ def open_vm_session(project: Project, with_shell: bool = False) -> None:
     profile = cfg["iterm"].get("profile", "orch")
     project_dir = str(project.path)
 
-    tab_name = f"{project.name}"
+    tab_name = _agent_label(project, project.name)
+    agent_badge = _agent_label(project, project.name)
     badge = _iterm_badge_cmd(project.name)
     claude_args = "--dangerously-skip-permissions"
 
@@ -513,10 +528,12 @@ def open_vm_session(project: Project, with_shell: bool = False) -> None:
         f'PIDFILE={shlex.quote(pid_prefix)}-$$.pid; '
         f'trap "rm -f $PIDFILE" EXIT HUP; '
         f'echo $$ > "$PIDFILE"; '
-        f"clear; claude {claude_args} {_orch_prompt_arg()}"
+        f"clear; {program} {claude_args} {_orch_prompt_arg()}"
     )
     vm_cmd = vm_ssh_cmd(extra_cmd=inner_cmd)
-    claude_cmd = _applescript_quote(f"{badge} && {vm_cmd}")
+    claude_cmd = _applescript_quote(
+        f"{_iterm_badge_cmd(agent_badge)} && {vm_cmd}"
+    )
 
     if with_shell:
         shell_tab_name = f"{project.name} (shell)"
@@ -534,7 +551,7 @@ def open_vm_session(project: Project, with_shell: bool = False) -> None:
             tell newWindow
                 tell current session
                     set name to "{tab_name}"
-                    set badge to "{project.name}"
+                    set badge to "{agent_badge}"
                     write text {claude_cmd}
                     set claudeTty to tty
                 end tell
@@ -576,7 +593,7 @@ def open_vm_session(project: Project, with_shell: bool = False) -> None:
             tell newWindow
                 tell current session
                     set name to "{tab_name}"
-                    set badge to "{project.name}"
+                    set badge to "{agent_badge}"
                     write text {claude_cmd}
                 end tell
             end tell
@@ -594,6 +611,7 @@ def open_vm_session_in_worktree(
     branch: str,
     base_branch: str,
     with_shell: bool = True,
+    program: str | None = None,
 ) -> None:
     """Open a NEW iTerm2 window with Claude running in a worktree.
 
@@ -603,10 +621,17 @@ def open_vm_session_in_worktree(
       - does NOT pass --resume (each worktree session is fresh)
       - exports ORCH_WORKTREE=1, ORCH_BRANCH, ORCH_BASE_BRANCH so Claude
         can push the branch by name without surfacing it to the user
+
+    *program* is interactive_program(project), for a caller that resolved it
+    before creating the worktree; resolved here when omitted.
     """
     import shlex
     from .vm import vm_ssh_cmd
-    from .agent import session_exists, fire_first_session_hook
+    from .agent import session_exists, fire_first_session_hook, interactive_program
+
+    # Before any side effect: an unknown or missing executor fails here.
+    if program is None:
+        program = interactive_program(project)
 
     if not session_exists(project):
         fire_first_session_hook(project)
@@ -626,7 +651,8 @@ def open_vm_session_in_worktree(
     profile = cfg["iterm"].get("profile", "orch")
     wt_dir = str(worktree_path)
 
-    tab_name = f"{project.name} [w]"
+    tab_name = _agent_label(project, f"{project.name} [w]")
+    agent_badge = _agent_label(project, project.name)
     badge = _iterm_badge_cmd(project.name)
     claude_args = "--dangerously-skip-permissions"
 
@@ -645,10 +671,12 @@ def open_vm_session_in_worktree(
         f'trap "rm -f $PIDFILE $WTFILE" EXIT HUP; '
         f'echo $$ > "$PIDFILE"; '
         f'echo {shlex.quote(wt_id)} > "$WTFILE"; '
-        f"clear; claude {claude_args} {_orch_prompt_arg()}"
+        f"clear; {program} {claude_args} {_orch_prompt_arg()}"
     )
     vm_cmd = vm_ssh_cmd(extra_cmd=inner_cmd)
-    claude_cmd = _applescript_quote(f"{badge} && {vm_cmd}")
+    claude_cmd = _applescript_quote(
+        f"{_iterm_badge_cmd(agent_badge)} && {vm_cmd}"
+    )
 
     if with_shell:
         shell_tab_name = f"{project.name} [w] (shell)"
@@ -666,7 +694,7 @@ def open_vm_session_in_worktree(
             tell newWindow
                 tell current session
                     set name to "{tab_name}"
-                    set badge to "{project.name}"
+                    set badge to "{agent_badge}"
                     write text {claude_cmd}
                     set claudeTty to tty
                 end tell
@@ -708,7 +736,7 @@ def open_vm_session_in_worktree(
             tell newWindow
                 tell current session
                     set name to "{tab_name}"
-                    set badge to "{project.name}"
+                    set badge to "{agent_badge}"
                     write text {claude_cmd}
                 end tell
             end tell
@@ -727,6 +755,7 @@ def open_vm_resume_session(
     branch: str | None = None,
     base_branch: str | None = None,
     with_shell: bool = True,
+    program: str | None = None,
 ) -> None:
     """Open a NEW iTerm2 window resuming an existing Claude session.
 
@@ -739,10 +768,17 @@ def open_vm_resume_session(
     ``/tmp/orch-{project}-{pid}.worktree`` correlation file. That lets
     ``list_sessions`` pair the live pid back to its worktree row and lets the
     close-cleanup re-evaluate the worktree when the window is closed again.
+
+    *program* is interactive_program(project) if the caller already
+    resolved it; resolved here when omitted.
     """
     import shlex
     from .vm import vm_ssh_cmd
-    from .agent import session_exists, fire_first_session_hook
+    from .agent import session_exists, fire_first_session_hook, interactive_program
+
+    # Before any side effect: an unknown or missing executor fails here.
+    if program is None:
+        program = interactive_program(project)
 
     if not session_exists(project):
         fire_first_session_hook(project)
@@ -763,7 +799,8 @@ def open_vm_resume_session(
     work_dir = str(cwd)
 
     suffix = " [w]" if is_worktree else ""
-    tab_name = f"{project.name}{suffix}"
+    tab_name = _agent_label(project, f"{project.name}{suffix}")
+    agent_badge = _agent_label(project, project.name)
     badge = _iterm_badge_cmd(project.name)
     claude_args = f"--dangerously-skip-permissions --resume {shlex.quote(session_id)}"
 
@@ -789,10 +826,12 @@ def open_vm_resume_session(
         f'{wt_lines}'
         f'trap "rm -f {trap_targets}" EXIT HUP; '
         f'echo $$ > "$PIDFILE"; '
-        f"clear; claude {claude_args} {_orch_prompt_arg()}"
+        f"clear; {program} {claude_args} {_orch_prompt_arg()}"
     )
     vm_cmd = vm_ssh_cmd(extra_cmd=inner_cmd)
-    claude_cmd = _applescript_quote(f"{badge} && {vm_cmd}")
+    claude_cmd = _applescript_quote(
+        f"{_iterm_badge_cmd(agent_badge)} && {vm_cmd}"
+    )
 
     if with_shell:
         shell_tab_name = f"{project.name}{suffix} (shell)"
@@ -810,7 +849,7 @@ def open_vm_resume_session(
             tell newWindow
                 tell current session
                     set name to "{tab_name}"
-                    set badge to "{project.name}"
+                    set badge to "{agent_badge}"
                     write text {claude_cmd}
                     set claudeTty to tty
                 end tell
@@ -852,7 +891,7 @@ def open_vm_resume_session(
             tell newWindow
                 tell current session
                     set name to "{tab_name}"
-                    set badge to "{project.name}"
+                    set badge to "{agent_badge}"
                     write text {claude_cmd}
                 end tell
             end tell

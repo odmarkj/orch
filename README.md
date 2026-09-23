@@ -458,13 +458,13 @@ on_first_session = "sudo systemctl start docker"
 on_last_session = "sudo systemctl stop docker"
 
 [agent]
-# Agent CLI for headless runs (bridges, auto-dispatch): "claude" (default) or "asha"
+# Agent CLI for headless runs and iTerm2 sessions: "claude" (default) or "asha"
 executor = "claude"
 ```
 
 Hooks run inside the VM at the project directory. Use them to start/stop services that a project needs (databases, k3s, Docker, etc.) so they only run on demand instead of consuming resources permanently.
 
-`[agent] executor` switches one project's headless runs to another agent CLI, so a new agent can be rolled out a project at a time. Interactive sessions always run Claude. An unrecognised value fails the run rather than silently falling back to Claude. `orch bridge status` shows which executor handled each run.
+`[agent] executor` switches one project's agent CLI, so a new agent can be rolled out a project at a time. Headless runs use `asha chat`; the iTerm2 agent tab uses `asha shell`, which is the Claude Code TUI with Asha's configuration applied and takes the same arguments (`--resume`, `--append-system-prompt-file`). Tabs for an opted-in project carry the executor in their name and badge (`myproj · asha`). An unrecognised value fails the run or the launch rather than silently falling back to Claude, and before opening a tab orch checks `asha --version` in the VM so a missing binary is reported in the TUI rather than as a tab that flashes "command not found". `orch bridge status` shows which executor handled each run.
 
 Headless runs are stopped at their deadline inside the VM: `timeout` sends the agent's process group SIGTERM, then SIGKILL 30 s later. A timed-out bridge is not retried automatically, because a rerun from scratch would most likely time out again. Its error gives the command that resumes the stopped session from the worktree, which is kept for that purpose, and `orch bridge retry <id>` starts over. A timed-out auto-dispatched todo is marked `- [!]`, which keeps it from being dispatched again.
 
