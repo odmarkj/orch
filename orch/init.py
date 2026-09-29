@@ -83,6 +83,28 @@ def _ensure_git(target: Path) -> None:
     _ok("Git repository initialized")
 
 
+def _ensure_initial_commit(target: Path) -> None:
+    """Commit the scaffold so `w` has something to branch a worktree from.
+
+    Runs last, after every file init writes. A repo that already has commits
+    is left alone.
+    """
+    from .agent import make_initial_commit, repo_has_commits
+    from .gitexclude import ensure_orch_excluded
+
+    if repo_has_commits(target):
+        _skip("Repository already has commits")
+        return
+    ensure_orch_excluded(target)
+    try:
+        sha = make_initial_commit(target)
+    except (RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
+        _err(f"Initial commit skipped: {exc}")
+        _err("Worktree sessions (w) need at least one commit to branch from.")
+        return
+    _ok(f"Initial commit {sha[:7]}")
+
+
 def _write_claude_md(target: Path, name: str, description: str) -> None:
     claude_md = target / "CLAUDE.md"
     if claude_md.exists():
@@ -463,6 +485,8 @@ def cmd_init(argv: list[str]) -> None:
     _write_reference_docs(target_path)
     _generate_sibling_summaries(target_path, project_name)
     _write_lifecycle(target_path, project_name, stage, description)
+
+    _ensure_initial_commit(target_path)
 
     if do_plugins:
         print()

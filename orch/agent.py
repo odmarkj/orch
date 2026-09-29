@@ -584,16 +584,110 @@ def repo_has_commits(repo_path: Path) -> bool:
     return result.returncode == 0
 
 
-def _require_commits(project: "Project") -> None:
-    """Refuse to build a worktree on a repo that has no commits."""
+# GitHub rejects pushes containing a file over 100MB; anything near that in
+# an auto-made first commit is almost certainly data that should not be there.
+_INITIAL_COMMIT_MAX_FILE_BYTES = 50 * 1024 * 1024
+_SECRET_NAMES = {"id_rsa", "id_ed25519", "credentials.json"}
+_SECRET_SUFFIXES = (".pem", ".key", ".p12")
+_ENV_TEMPLATES = {".env.example", ".env.sample", ".env.template"}
+# Installed dependencies: never source, and thousands of files that would bury
+# the real first commit. Their presence means the .gitignore needs work.
+_DEPENDENCY_DIRS = {"node_modules", ".venv", "venv", "__pycache__", "site-packages"}
+
+
+def _looks_secret(rel: str) -> bool:
+    name = rel.rsplit("/", 1)[-1]
+    if name in _ENV_TEMPLATES:
+        return False
+    return (
+        name == ".env" or name.startswith(".env.")
+        or name in _SECRET_NAMES or name.endswith(_SECRET_SUFFIXES)
+    )
+
+
+def make_initial_commit(repo_path: Path) -> str:
+    """Commit everything not ignored in an unborn repo; return the new sha.
+
+    ``orch init`` runs ``git init`` on the project directory, and every
+    worktree needs a commit to branch from, so without this every new project
+    failed its first ``w`` launch until someone committed by hand.
+
+    The commit is local only. It refuses (RuntimeError, nothing committed,
+    index restored) rather than commit something that is hard to take back
+    once pushed: installed dependency directories (node_modules/, .venv/),
+    secret-looking files, files over 50MB, or LFS-tracked paths
+    on a machine without git-lfs, where they would be committed as raw bytes.
+    """
+    def git(*args: str, check: bool = True) -> subprocess.CompletedProcess:
+        result = subprocess.run(
+            ["git", *args], capture_output=True, text=True,
+            cwd=str(repo_path), timeout=60,
+        )
+        if check and result.returncode != 0:
+            raise RuntimeError(
+                f"git {args[0]} failed: {(result.stderr or result.stdout).strip()}"
+            )
+        return result
+
+    gitattributes = repo_path / ".gitattributes"
+    try:
+        uses_lfs = "filter=lfs" in gitattributes.read_text()
+    except OSError:
+        uses_lfs = False
+    if uses_lfs and git("lfs", "version", check=False).returncode != 0:
+        raise RuntimeError(
+            ".gitattributes routes files through Git LFS but git-lfs is not "
+            "installed; install it (brew install git-lfs && git lfs install) "
+            "so large files are not committed as raw bytes"
+        )
+
+    git("add", "-A")
+    staged = [p for p in git("diff", "--cached", "--name-only", "-z").stdout.split("\0") if p]
+    dep_dirs = sorted({
+        part for p in staged for part in p.split("/")[:-1] if part in _DEPENDENCY_DIRS
+    })
+    problems = [f"{d}/ (installed dependencies)" for d in dep_dirs]
+    own = [p for p in staged if not set(p.split("/")) & _DEPENDENCY_DIRS]
+    problems += [f"{p} (looks like a secret)" for p in own if _looks_secret(p)]
+    for rel in own:
+        try:
+            size = (repo_path / rel).stat().st_size
+        except OSError:
+            continue
+        if size > _INITIAL_COMMIT_MAX_FILE_BYTES:
+            problems.append(f"{rel} ({size // (1024 * 1024)}MB)")
+    if problems:
+        # Unborn HEAD: there is nothing to reset to, so just empty the index.
+        git("rm", "-r", "--cached", "--quiet", "--ignore-unmatch", ".", check=False)
+        shown = ", ".join(problems[:5]) + (" …" if len(problems) > 5 else "")
+        raise RuntimeError(
+            f"not auto-committing because it would include {shown}. "
+            f"Add them to .gitignore (or commit by hand)"
+        )
+
+    # A fresh VM or machine may have no git identity; don't let that be the
+    # thing that blocks the launch. A configured identity always wins.
+    identity: list[str] = []
+    if not git("config", "user.email", check=False).stdout.strip():
+        identity = ["-c", "user.name=orch", "-c", "user.email=orch@localhost"]
+    git(*identity, "commit", "--allow-empty", "-m", "Initial commit")
+    return git("rev-parse", "HEAD").stdout.strip()
+
+
+def _ensure_commits(project: "Project") -> None:
+    """Give an unborn repo its first commit so a worktree can branch from it."""
     if repo_has_commits(project.path):
         return
-    raise RuntimeError(
-        f"{project.name} has no commits yet, so there is nothing to branch "
-        f"from. Make an initial commit first: "
-        f"git -C {project.path} add -A && "
-        f"git -C {project.path} commit -m 'Initial commit'"
-    )
+    try:
+        sha = make_initial_commit(project.path)
+    except (RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(
+            f"{project.name} has no commits yet, so there is nothing to branch "
+            f"from, and orch could not make one: {exc}. Once that is fixed: "
+            f"git -C {project.path} add -A && "
+            f"git -C {project.path} commit -m 'Initial commit'"
+        ) from exc
+    log.info("%s: had no commits; made initial commit %s", project.name, sha[:12])
 
 
 def _fresh_base_ref(project: "Project", *, bid: str | None = None) -> tuple[str, str]:
@@ -680,9 +774,10 @@ def create_worktree(
 
     Returns (worktree_path, branch_name).
     """
-    _require_commits(project)
+    # Ignore rules first, so a first commit made here leaves .orch/ out.
     _ensure_worktrees_gitignored(project)
     ensure_orch_excluded(project.path)
+    _ensure_commits(project)
 
     slug = _slugify(todo_text)
     suffix = random.randint(1000, 9999)
@@ -748,9 +843,10 @@ def create_session_worktree(project: "Project") -> tuple[Path, str, str, str]:
     """
     from .state import new_worktree_id
 
-    _require_commits(project)
+    # Ignore rules first, so a first commit made here leaves .orch/ out.
     _ensure_worktrees_gitignored(project)
     ensure_orch_excluded(project.path)
+    _ensure_commits(project)
 
     wt_id = new_worktree_id()
     # branch name strips the "wt_" prefix for aesthetics
