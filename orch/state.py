@@ -249,6 +249,56 @@ def ping() -> None:
     _probe(_get_conn())
 
 
+# (st_dev, st_ino) of the -wal/-shm this process opened, keyed by suffix.
+_journal_pins: dict[str, tuple[int, int]] = {}
+
+
+def _journal_path(suffix: str) -> Path:
+    return DB_PATH.with_name(DB_PATH.name + suffix)
+
+
+def pin_journal_files() -> None:
+    """Remember which -wal/-shm files this process has open.
+
+    Call once after init_db(), while a connection is open (so both exist).
+    While any connection in this process stays open, SQLite never deletes or
+    replaces them itself — so if they later vanish or change inode, some
+    other process unlinked them (typically the VM opening this database over
+    virtiofs, where POSIX locks don't reach us, and deleting the WAL on close
+    because it thinks it was the last connection). Every write after that
+    goes into a dead inode and is lost; see journal_files_replaced().
+    """
+    _journal_pins.clear()
+    for suffix in ("-wal", "-shm"):
+        try:
+            st = _journal_path(suffix).stat()
+        except FileNotFoundError:
+            log.warning("cannot pin %s: not on disk", _journal_path(suffix))
+            continue
+        _journal_pins[suffix] = (st.st_dev, st.st_ino)
+
+
+def journal_files_replaced() -> str | None:
+    """Describe how a pinned -wal/-shm no longer matches disk, or None.
+
+    Non-None means this process's connections are writing to unlinked files
+    and nothing in-process can recover: reopening still binds to the dead
+    shm mapping held by long-lived threads. Only a process restart fixes it.
+    """
+    for suffix, pinned in _journal_pins.items():
+        path = _journal_path(suffix)
+        try:
+            st = path.stat()
+        except FileNotFoundError:
+            return f"{path} was deleted out from under this process"
+        if (st.st_dev, st.st_ino) != pinned:
+            return (
+                f"{path} was replaced (inode {pinned[1]} -> {st.st_ino}) "
+                "out from under this process"
+            )
+    return None
+
+
 def init_db() -> None:
     """Create schema and stamp version. Idempotent."""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
