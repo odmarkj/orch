@@ -251,6 +251,13 @@ def _build_prompt(b: dict, branch_name: str = "") -> str:
     }
     lines += ["## Instructions", *intent_instructions.get(b["intent"], []), ""]
     lines += [
+        f"Never open `{state.DB_PATH}` (sqlite3, Python, or anything else). It is",
+        "the orch daemon's live database; opening it from the VM deletes its WAL",
+        "and silently breaks every bridge. To read another bridge's result, run",
+        "`orch bridge status <id>`.",
+        "",
+    ]
+    lines += [
         f"If you cannot complete the request without more information from the",
         f"source project, start your final output with {CLARIFICATION_MARKER}",
         "followed by your specific question on the next line.",

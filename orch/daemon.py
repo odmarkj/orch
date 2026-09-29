@@ -34,7 +34,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Empty, Queue
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, urlparse
 
 from . import gitexclude, state
@@ -209,13 +209,14 @@ class _Dispatcher:
 # ── Janitor ───────────────────────────────────────────────────────────────
 
 class _Janitor:
-    """Runs every 60s: stale-inflight reset, transient-failure requeue,
-    record retention."""
+    """Runs every 60s: journal-file watchdog, stale-inflight reset,
+    transient-failure requeue, record retention."""
 
     INTERVAL_SECONDS = 60
 
-    def __init__(self) -> None:
+    def __init__(self, on_poisoned: Callable[[str], None] | None = None) -> None:
         self._stop = threading.Event()
+        self._on_poisoned = on_poisoned
 
     def stop(self) -> None:
         self._stop.set()
@@ -236,6 +237,18 @@ class _Janitor:
                     state.close_conn()
 
     def _tick(self) -> None:
+        # 0. Is our WAL still the one on disk? If another process unlinked it,
+        # every write from here on is silently lost and no reconnect can fix
+        # it. Exit so launchd (KeepAlive) restarts us on the live files —
+        # before touching the DB, since that is what would raise.
+        replaced = state.journal_files_replaced()
+        if replaced:
+            log.error("sqlite journal poisoned: %s; restarting daemon", replaced)
+            if self._on_poisoned is not None:
+                self._on_poisoned(replaced)
+            self._stop.set()
+            return
+
         # 1. Recover stale-inflight (claimed but worker is dead/timed-out).
         timeout_s = daemon_worker_timeout_seconds()
         for stale in state.find_stale_inflight(older_than_seconds=timeout_s):
@@ -570,6 +583,9 @@ class _Handler(BaseHTTPRequestHandler):
             # exhaustion -> "unable to open database file"). Probe the DB so an
             # unhealthy daemon reports unhealthy.
             try:
+                replaced = state.journal_files_replaced()
+                if replaced:
+                    raise RuntimeError(replaced)
                 state.ping()
             except Exception as exc:
                 self._send_json(
@@ -797,6 +813,7 @@ def run_daemon(verbose: bool = False) -> int:
     _write_pidfile()
 
     state.init_db()
+    state.pin_journal_files()
 
     # Recover stale-inflight from a previous crash before accepting new work.
     for stale in state.find_stale_inflight(older_than_seconds=0):
@@ -807,8 +824,18 @@ def run_daemon(verbose: bool = False) -> int:
     server = _bind_server(port)
     log.info("orch daemon listening on port %d (pid %d)", port, os.getpid())
 
+    stop_evt = threading.Event()
+    exit_code = 0
+
+    def _poisoned(_reason: str) -> None:
+        # Non-zero so the log and launchd both record an abnormal exit;
+        # KeepAlive restarts us either way.
+        nonlocal exit_code
+        exit_code = 75  # EX_TEMPFAIL
+        stop_evt.set()
+
     dispatcher = _Dispatcher()
-    janitor = _Janitor()
+    janitor = _Janitor(on_poisoned=_poisoned)
     main_sync = _MainSync()
 
     threads = [
@@ -819,8 +846,6 @@ def run_daemon(verbose: bool = False) -> int:
     ]
     for t in threads:
         t.start()
-
-    stop_evt = threading.Event()
 
     def _shutdown(*_: Any) -> None:
         log.info("shutdown signal received")
@@ -844,7 +869,7 @@ def run_daemon(verbose: bool = False) -> int:
             t.join(timeout=10)
         _clear_pidfile()
         log.info("stopped")
-    return 0
+    return exit_code
 
 
 # ── launchd integration ────────────────────────────────────────────────────
