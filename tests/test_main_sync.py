@@ -398,7 +398,7 @@ def test_repos_with_no_remote_stay_quiet(caplog):
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
 
-# ── Unborn HEAD: a repo with no commits must fail legibly ───────────────────
+# ── Unborn HEAD: a repo with no commits gets its first commit ───────────────
 
 @pytest.fixture
 def unborn_repo(tmp_path):
@@ -420,22 +420,87 @@ def test_repo_has_commits_distinguishes_unborn_from_real(unborn_repo, behind_rep
     assert agent_mod.repo_has_commits(behind_repo.project.path) is True
 
 
-def test_worktree_on_unborn_repo_explains_itself(unborn_repo):
-    """Negative control: git's own message was "fatal: invalid reference: HEAD".
+def test_worktree_on_unborn_repo_makes_the_first_commit(unborn_repo):
+    """Every `orch init` project starts unborn; `w` used to refuse all of them.
 
-    That named neither the project, the cause, nor the fix — the user saw it
-    as "Worktree launch failed" in the TUI with nothing to act on.
+    Both builders now commit what is there and branch from it, so the session
+    sees the project's files instead of an error.
     """
-    for build in (
-        lambda: agent_mod.create_session_worktree(unborn_repo),
-        lambda: agent_mod.create_worktree(unborn_repo, "some task"),
-    ):
-        with pytest.raises(RuntimeError) as excinfo:
-            build()
-        msg = str(excinfo.value)
-        assert "no commits yet" in msg
-        assert "commit -m" in msg
-        assert "invalid reference" not in msg
+    wt_path, _branch, _base, _wt_id = agent_mod.create_session_worktree(unborn_repo)
 
-    # And it refused before creating anything.
+    assert agent_mod.repo_has_commits(unborn_repo.path)
+    assert (wt_path / "README.md").read_text() == "uncommitted\n"
+    tracked = _git(unborn_repo.path, "ls-files").stdout.split()
+    assert "README.md" in tracked
+    assert not any(t.startswith(".orch") for t in tracked)
+
+    bridge_wt, _ = agent_mod.create_worktree(unborn_repo, "some task")
+    assert (bridge_wt / "README.md").exists()
+
+
+def test_initial_commit_works_without_a_git_identity(unborn_repo, monkeypatch):
+    _git(unborn_repo.path, "config", "--unset", "user.email")
+    _git(unborn_repo.path, "config", "--unset", "user.name")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+
+    agent_mod.make_initial_commit(unborn_repo.path)
+
+    assert _git(unborn_repo.path, "log", "-1", "--format=%ae").stdout.strip() == "orch@localhost"
+
+
+@pytest.mark.parametrize("name", [".env", ".env.local", "deploy.pem"])
+def test_initial_commit_refuses_secrets_and_leaves_index_empty(unborn_repo, name):
+    (unborn_repo.path / name).write_text("SECRET=1\n")
+    (unborn_repo.path / ".env.example").write_text("SECRET=\n")
+
+    with pytest.raises(RuntimeError) as excinfo:
+        agent_mod.create_session_worktree(unborn_repo)
+
+    msg = str(excinfo.value)
+    assert name in msg and "looks like a secret" in msg
+    assert ".env.example" not in msg
+    assert "commit -m" in msg
+    assert not agent_mod.repo_has_commits(unborn_repo.path)
+    assert _git(unborn_repo.path, "diff", "--cached", "--name-only").stdout == ""
     assert not (unborn_repo.path.parent / ".orch-worktrees").exists()
+
+
+def test_initial_commit_refuses_unignored_dependencies(unborn_repo):
+    dep = unborn_repo.path / "node_modules" / "left-pad"
+    dep.mkdir(parents=True)
+    (dep / "index.js").write_text("module.exports = 1\n")
+    (dep / "test.pem").write_text("fixture\n")
+
+    with pytest.raises(RuntimeError) as excinfo:
+        agent_mod.make_initial_commit(unborn_repo.path)
+    msg = str(excinfo.value)
+    assert "node_modules/ (installed dependencies)" in msg
+    assert "test.pem" not in msg  # one line for the dir, not one per file in it
+
+
+def test_initial_commit_refuses_huge_files(unborn_repo, monkeypatch):
+    monkeypatch.setattr(agent_mod, "_INITIAL_COMMIT_MAX_FILE_BYTES", 10)
+    (unborn_repo.path / "dump.jsonl").write_text("x" * 100)
+
+    with pytest.raises(RuntimeError, match="dump.jsonl"):
+        agent_mod.make_initial_commit(unborn_repo.path)
+    assert not agent_mod.repo_has_commits(unborn_repo.path)
+
+
+def test_orch_init_leaves_a_repo_worktrees_can_branch_from(tmp_path, monkeypatch):
+    import orch.init as init_mod
+
+    monkeypatch.setattr(init_mod, "_generate_sibling_summaries", lambda *a: None)
+    monkeypatch.setenv("GIT_AUTHOR_NAME", "Test")
+    monkeypatch.setenv("GIT_AUTHOR_EMAIL", "test@example.com")
+    monkeypatch.setenv("GIT_COMMITTER_NAME", "Test")
+    monkeypatch.setenv("GIT_COMMITTER_EMAIL", "test@example.com")
+    target = tmp_path / "brand-new"
+
+    init_mod.cmd_init([str(target)])
+
+    assert agent_mod.repo_has_commits(target)
+    tracked = _git(target, "ls-files").stdout.split()
+    assert "CLAUDE.md" in tracked
+    assert _git(target, "status", "--porcelain").stdout == ""
