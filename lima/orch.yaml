@@ -30,8 +30,15 @@ mounts:
   # ~/.claude/.claude.json instead — that IS mounted, so host and VM share state.
   - location: "~/.ssh"
     writable: false
+  # Read-only: ~/.orch/state.db is the host daemon's live SQLite database, and
+  # POSIX locks don't cross virtiofs. A VM process that opened it believed it
+  # was the last connection and deleted the daemon's WAL on close, breaking
+  # every bridge for 21h (2026-09-28). Nothing in the VM needs to write here —
+  # the daemon and credbroker run on the host, and in-VM Path.home() is the
+  # guest home. Editing this template does not change an existing VM: Lima
+  # reads ~/.lima/orch/lima.yaml on the host, so change that too, then restart.
   - location: "~/.orch"
-    writable: true
+    writable: false
   - location: "~/Screenshots"
     writable: false
 
