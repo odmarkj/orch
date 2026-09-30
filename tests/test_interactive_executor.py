@@ -172,3 +172,31 @@ def test_bad_executor_opens_nothing_and_changes_nothing(project, probe, launched
 
     assert launched == []
     assert not project.status_file.exists()
+
+
+# ── Remote Control ─────────────────────────────────────────────────────────
+
+def test_every_launch_enables_remote_control(project, probe, launched, tmp_path, monkeypatch):
+    monkeypatch.setattr(iterm.Path, "home", lambda: tmp_path)  # no ~/.orch/config.toml
+
+    iterm.open_vm_session(project)
+    iterm.open_vm_session_in_worktree(
+        project, tmp_path / "wt", "wt_1", branch="b", base_branch="main",
+    )
+    iterm.open_vm_resume_session(project, cwd=tmp_path, session_id="s-1")
+
+    assert f"--remote-control {project.name}" in launched[0]
+    # Worktree name has a space, so it arrives shell-quoted (inside ssh + AppleScript quoting).
+    assert "--remote-control " in launched[1] and f"{project.name} [w]" in launched[1]
+    assert f"--remote-control {project.name}" in launched[2]
+    assert f"--remote-control {project.name}" in iterm._build_vm_claude_cmd(project)
+
+
+def test_remote_control_can_be_disabled(project, probe, launched, tmp_path, monkeypatch):
+    monkeypatch.setattr(iterm.Path, "home", lambda: tmp_path)
+    (tmp_path / ".orch").mkdir()
+    (tmp_path / ".orch" / "config.toml").write_text("[claude]\nremote_control = false\n")
+
+    iterm.open_vm_session(project)
+
+    assert "--remote-control" not in launched[0]
