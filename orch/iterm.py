@@ -46,6 +46,11 @@ _DEFAULTS = {
         "dedicated_window": True,
         "window_title":     "orch sessions",
     },
+    "claude": {
+        # Pass --remote-control so every interactive session can be driven
+        # from the Claude iPhone app / claude.ai/code.
+        "remote_control":   True,
+    },
     "notifications": {
         "sound_input_needed": "Glass",
         "sound_resumed":      "Pop",
@@ -83,6 +88,18 @@ def _load_config() -> dict:
             cfg[section][key] = val
 
     return cfg
+
+
+def _remote_control_arg(name: str) -> str:
+    """Return the --remote-control flag naming the session *name*, or "".
+
+    The name is what the session is listed as in the Claude mobile app, so
+    it matches the iTerm2 tab. Disable with ``[claude] remote_control = false``
+    in ~/.orch/config.toml.
+    """
+    if not _load_config()["claude"].get("remote_control", True):
+        return ""
+    return f" --remote-control {shlex.quote(name)}"
 
 
 # ── iTerm2 badge ──────────────────────────────────────────────────────────────
@@ -464,6 +481,7 @@ def _build_vm_claude_cmd(project: Project) -> str:
         f'trap "rm -f $PIDFILE" EXIT HUP; '
         f'echo $$ > "$PIDFILE"; '
         f"clear; {program} {claude_args} {_orch_prompt_arg()}"
+        f"{_remote_control_arg(_agent_label(project, project.name))}"
     )
     return vm_ssh_cmd(extra_cmd=inner)
 
@@ -529,6 +547,7 @@ def open_vm_session(project: Project, with_shell: bool = False) -> None:
         f'trap "rm -f $PIDFILE" EXIT HUP; '
         f'echo $$ > "$PIDFILE"; '
         f"clear; {program} {claude_args} {_orch_prompt_arg()}"
+        f"{_remote_control_arg(tab_name)}"
     )
     vm_cmd = vm_ssh_cmd(extra_cmd=inner_cmd)
     claude_cmd = _applescript_quote(
@@ -672,6 +691,7 @@ def open_vm_session_in_worktree(
         f'echo $$ > "$PIDFILE"; '
         f'echo {shlex.quote(wt_id)} > "$WTFILE"; '
         f"clear; {program} {claude_args} {_orch_prompt_arg()}"
+        f"{_remote_control_arg(tab_name)}"
     )
     vm_cmd = vm_ssh_cmd(extra_cmd=inner_cmd)
     claude_cmd = _applescript_quote(
@@ -827,6 +847,7 @@ def open_vm_resume_session(
         f'trap "rm -f {trap_targets}" EXIT HUP; '
         f'echo $$ > "$PIDFILE"; '
         f"clear; {program} {claude_args} {_orch_prompt_arg()}"
+        f"{_remote_control_arg(tab_name)}"
     )
     vm_cmd = vm_ssh_cmd(extra_cmd=inner_cmd)
     claude_cmd = _applescript_quote(
