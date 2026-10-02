@@ -17,5 +17,14 @@ date  = "2026-04-27"
 stage = "building"
 note  = "Project registered with orch"
 
+[[ledger]]
+date  = "2026-10-01"
+stage = "building"
+note  = "Agent executor switched to asha (portfolio-wide rollout)."
+
 [bridge]
 max_concurrent_as_target = 3
+
+[agent]
+# Agent CLI for headless runs and iTerm2 sessions: "claude" (default) or "asha"
+executor = "asha"
