@@ -35,6 +35,13 @@ orch CLI
   orch fetch start | stop | restart  Control the fetch service
   orch fetch status | logs          systemd state / journal
   orch fetch sync-credentials       Rewrite ~/.config/orch/fetch.env
+  orch serial install               Provision venv + load launchd agent
+  orch serial status | doctor       Service, device and reset-budget state
+  orch serial devices               List attached serial devices
+  orch serial monitor [--baud N]    Stream device output (works in the VM)
+  orch serial flash <img> [--addr]  Flash firmware (works in the VM)
+  orch serial backup <dest.bin>     Read flash to a file
+  orch serial reset [--bootloader]  Reset, or enter download mode
   orch init [dir]                   Bootstrap project for Claude Code
   orch ignore <project>              Hide project from orch
   orch ignore <project> --undo      Un-hide project
@@ -377,6 +384,9 @@ def main() -> None:
         cmd_credbroker(argv[1:])
     elif sub in ("daemon",):
         cmd_daemon(argv[1:])
+    elif sub in ("serial",):
+        from .serialsvc.__main__ import main as serial_main
+        sys.exit(serial_main(argv[1:]))
     elif sub in ("setup",):
         from .setup import main as setup_main
         setup_main()

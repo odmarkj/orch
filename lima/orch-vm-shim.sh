@@ -29,7 +29,10 @@ Keychain, none of which exist inside the Lima VM.
 
 Run it in a terminal on the macOS host instead.
 
-VM-side commands that DO work here: bridge, logs, plan, stage, init, ignore.
+VM-side commands that DO work here: bridge, logs, plan, stage, init, ignore,
+and serial (the USB device is host-owned, but every verb that drives it --
+status, devices, monitor, flash, backup, reset -- is an HTTP call to the
+host's control plane and is meant to be run from in here).
 EOF
   exit 2
 }
