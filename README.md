@@ -120,12 +120,75 @@ owns their lifecycle; projects consume them.
 | PostgreSQL 17 + pgvector | `:5432` | orch |
 | Redis 8 | `:6379` | orch |
 | Web fetch | `127.0.0.1:9876` | orch, backed by `~/Apps/web-fetch` |
+| USB serial device | host `127.0.0.1:4700` / `:4701` | orch (`orch serialsvc`, runs on the **host**) |
 
 **A project must not install a systemd unit for a shared port.** The fetch
 service spent four months being served by an untracked snapshot of an
 unrelated project, because that project shipped its own unit files and won the
 race for the port. Nothing recorded which implementation was live. Ownership
 lives in one place now.
+
+### USB serial devices
+
+A USB-serial device plugged into the Mac **cannot** be passed into the VM.
+The VM is `vmType: vz`, and Virtualization.framework exposes no generic USB
+passthrough — its USB API covers mass storage only. Lima has no USB stanza
+either. This is architectural, not a missing setting; switching to QEMU to
+get `usb-host` would mean rebuilding the VM and taking a large Apple Silicon
+performance hit.
+
+So `orch serialsvc` runs on the **host**, owns the tty, and hands the VM
+everything over loopback. Every verb works from inside the VM:
+
+```bash
+orch serial status          # service, device, reset budget
+orch serial devices         # what's attached (matched by VID/PID)
+orch serial monitor --baud 9600 --seconds 30
+orch serial flash build/firmware.bin --addr 0x10000
+orch serial flash 0x1000:bootloader.bin 0x10000:app.bin
+orch serial backup flash-backup.bin --size 0x400000
+orch serial reset [--bootloader]
+orch serial doctor          # checks every link, names the broken one
+```
+
+Install once on the host: `orch serial install`. It provisions its own venv
+(pyserial + esptool, so orch keeps no new dependency), installs a launchd
+agent with `RunAtLoad`/`KeepAlive`, and comes back by itself after a reboot
+or a replug. The VM side needs nothing installed — the client is stdlib-only.
+
+Two non-obvious constraints are handled by the service rather than left to
+callers:
+
+**Bootloader entry cannot happen from the VM.** ESP32 auto-reset circuits are
+interlocked: asserting both DTR and RTS pulls neither EN nor IO0 low, so
+entering download mode requires changing both lines in a *single*
+`ioctl(TIOCMSET)`. RFC 2217 carries one control line per subnegotiation,
+which makes the invalid intermediate state ~50 ms wide — long enough that the
+chip leaves reset with IO0 still high and boots the application. The symptom
+is esptool reporting `No serial data received` while the data path is
+demonstrably fine. `POST /download-mode` performs the atomic pulse train on
+the host; the guest then runs esptool with `--before no-reset`. A `socat PTY`
+bridge cannot do this at all: Linux PTYs have no modem-control lines, so such
+a bridge monitors perfectly and fails every upload silently.
+
+**Resets are rate-limited (default 60 s).** On a board driving a cellular
+modem, each reset restarts the modem's attach sequence, and repeated failed
+attaches walk it into multi-minute 3GPP backoff. esptool's default strategy
+re-runs its reset on *every* connect attempt, so one failed flash can mean
+seven modem restarts. Every reset here is deliberate and counted; the service
+answers `429` with a `retry_after_s` inside the cooldown. Pass `--force` when
+you mean it. Flashing a batch of images costs one reset, not one per image.
+
+Firmware paths must resolve under `~/Apps`, which is virtiofs-mounted at the
+*same absolute path* on both sides — so a VM build is flashed with no copying,
+and a path that resolves outside the shared root is refused because it would
+not mean the same thing in both places. Validation happens before the budget,
+so a bad path costs no reset.
+
+Host-side esptool runs roughly 2× faster than in-VM esptool over the RFC 2217
+data plane (~10.6 KB/s vs ~5.8 KB/s measured at 230400), because pyserial's
+RFC 2217 client queues a byte at a time. `flash`/`backup`/`chip` therefore run
+on the host; `monitor` uses the data plane, where latency is irrelevant.
 
 ### Web fetch service
 

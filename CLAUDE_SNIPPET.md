@@ -56,6 +56,41 @@ If the daemon is down, fall back to WebFetch. Bring it back with
 Do not install a systemd unit for port 9876 from a project. orch provisions
 the service; projects call it.
 
+## USB serial / firmware devices
+
+A USB device plugged into the Mac cannot appear inside the VM — `vmType: vz`
+has no generic USB passthrough, and Lima has no USB stanza. Do not go looking
+for `/dev/ttyUSB*`, do not try to install a CH340/CP210x driver in the guest,
+and do not build a `socat` PTY bridge: a PTY has no modem-control lines, so it
+monitors fine and fails every firmware upload silently.
+
+Use `orch serial` instead. It works from inside the VM and needs nothing
+installed here:
+
+```bash
+orch serial status                              # device + reset budget
+orch serial devices                             # what's attached
+orch serial monitor --baud 9600 --seconds 30    # stream output
+orch serial flash build/firmware.bin --addr 0x10000
+orch serial backup flash-backup.bin --size 0x400000
+orch serial reset [--bootloader]
+orch serial doctor                              # names the broken link
+```
+
+Rules that matter:
+
+- **Resets are rate-limited (60 s) on purpose.** A reset can cost a cellular
+  re-attach and minutes of 3GPP backoff. A `429` with `retry_after_s` is the
+  service protecting the hardware — wait, do not loop, and do not reach for
+  `--force` unless you know why you need it.
+- **Firmware paths must be under `~/Apps`**, which is mounted at the same
+  absolute path on the host and here, so a build needs no copying. A path
+  outside it is refused.
+- **Back up before writing**: `orch serial backup` first. Flash writes erase.
+- Flashing several images in one call costs one reset, not one per image.
+- If it is unreachable, say so and stop — the fix is `orch serial install` on
+  the macOS **host**, which is not something you can do from here.
+
 ## Reference projects
 
 All projects under `~/Apps/` are accessible at their original paths inside the
