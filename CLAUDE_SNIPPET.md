@@ -90,6 +90,12 @@ Rules that matter:
 - Flashing several images in one call costs one reset, not one per image.
 - If it is unreachable, say so and stop — the fix is `orch serial install` on
   the macOS **host**, which is not something you can do from here.
+- A merged serialsvc source fix is not live until someone, on the host,
+  pulls it into their checkout of this repo and runs `orch serial restart`.
+  `orch serial install --upgrade` does not do this — it only upgrades the
+  service's own pyserial/esptool venv. If `doctor`/`status` still shows the
+  pre-fix symptom right after a merge, that merge likely hasn't been shipped
+  yet; say so rather than assuming the fix didn't work.
 
 ## Reference projects
 

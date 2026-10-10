@@ -156,6 +156,15 @@ Install once on the host: `orch serial install`. It provisions its own venv
 agent with `RunAtLoad`/`KeepAlive`, and comes back by itself after a reboot
 or a replug. The VM side needs nothing installed — the client is stdlib-only.
 
+**Shipping a merged serialsvc source fix is not `orch serial install
+--upgrade`.** That flag only upgrades the pyserial/esptool packages inside
+the service's own venv. The launchd agent re-imports `orch.serialsvc` fresh
+from the host's checkout of this repo every time it (re)starts, so landing a
+fix in `orch/serialsvc/*.py` on `main` does nothing to the live process by
+itself — pull the merge into the host's checkout, then run `orch serial
+restart` (which kills and respawns the agent) on the host. Skipping the pull
+and only restarting just re-execs the same old code.
+
 Two non-obvious constraints are handled by the service rather than left to
 callers:
 

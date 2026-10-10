@@ -19,6 +19,12 @@ orch serial — host-owned USB serial device, driven from anywhere
     orch serial restart | stop        Kickstart / unload the agent
     orch serial logs [-f]             Tail the service log
 
+  Shipping a merged serialsvc source fix to the live process is: pull the
+  merge into the host's checkout of this repo, then `orch serial restart`.
+  `install --upgrade` only upgrades the service's own pyserial/esptool venv
+  -- it does not redeploy this project's code, and restarting without first
+  pulling just re-runs the same old source.
+
   Works on the host and inside the VM:
     orch serial status                Service + device + reset budget
     orch serial doctor                Check every link in the chain

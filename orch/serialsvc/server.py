@@ -25,6 +25,21 @@ while every ioctl on it fails with ``OSError(6, 'Device not configured')``.
 and reopens fresh rather than trusting the cache; ``live_check()`` exposes
 the same screen, read-only, for ``doctor``/``status`` to report it instead of
 staying green.
+
+A second, nastier flavour of staleness has no errno at all. A device's own
+reset (e.g. the one esptool issues at the end of a flash) can detach and
+re-present its USB-CDC interface without ever changing the macOS node name,
+the same way a physical swap behind a USB-serial adapter does not. Unlike
+the swap case, though, an fd opened against the pre-reset instance does not
+reliably start raising on ioctls afterward -- ``in_waiting`` can keep
+answering 0, cleanly, forever. There is no exception for ``_handle_is_live()``
+to catch, because nothing is wrong with the fd by any check that does not
+involve time: it is just no longer connected to anything that will ever send
+another byte. ``Redirector._try_heal()`` is the time-based check that
+catches this instead: a fresh monitor session that relays zero bytes within
+``stale_read_grace()`` seconds of connecting is suspect -- a real boot prints
+its first lines within a couple of seconds -- and gets exactly one forced
+reopen before anyone concludes the device itself is silent.
 """
 
 from __future__ import annotations
@@ -61,6 +76,7 @@ from . import (
     reset_cooldown,
     service_python,
     shared_roots,
+    stale_read_grace,
 )
 
 log = logging.getLogger("serialsvc")
@@ -221,6 +237,21 @@ class DeviceOwner:
         """Borrow the open port under the lock."""
         with self._lock:
             yield self._open()
+
+    def reopen_for_session(self) -> serial.Serial:
+        """Force a fresh handle, bypassing the cache's own live-looking
+        verdict.
+
+        ``_open()`` only reopens when ``_handle_is_live()`` catches an
+        exception, which the no-errno staleness flavour never produces. A
+        session's own stale-read watchdog (``Redirector._try_heal``) has
+        evidence ``_handle_is_live()`` cannot see -- zero bytes delivered in
+        the window right after a reset, when a real device would already be
+        chattering -- so it calls this instead of relying on the cache.
+        """
+        with self._lock:
+            self._close()
+            return self._open()
 
     def set_baud(self, baud: int) -> None:
         """Retune the line rate. Costs no reset.
@@ -497,6 +528,13 @@ class Redirector:
             self.serial, self, logger=logging.getLogger("rfc2217")
         )
         self.alive = False
+        # Stale-read watchdog state (see ``_try_heal``): set once the first
+        # byte lands, and once ``_try_heal`` has been attempted, so the
+        # check fires at most once per session rather than fighting a truly
+        # silent device in a reopen loop.
+        self._started = time.monotonic()
+        self._first_byte_at: float | None = None
+        self._heal_attempted = False
 
     def run(self) -> None:
         self.alive = True
@@ -524,10 +562,14 @@ class Redirector:
             try:
                 data = self.serial.read(1)
                 if not data:
-                    continue
+                    if self._maybe_stale():
+                        continue
+                    break
                 # Block for the first byte, then sweep up whatever else has
                 # landed. PortManager.escape() yields a byte at a time, so
                 # chunking here is what keeps bulk transfers moving.
+                if self._first_byte_at is None:
+                    self._first_byte_at = time.monotonic()
                 extra = self.serial.in_waiting
                 if extra:
                     data += self.serial.read(extra)
@@ -538,6 +580,53 @@ class Redirector:
             except Exception:
                 break
         self.alive = False
+
+    def _maybe_stale(self) -> bool:
+        """Called on every empty read; decides whether this is ordinary
+        silence or grounds for ``_try_heal``.
+
+        Only fires once, and only in the opening window: a device that has
+        already said something is trusted for the rest of the session no
+        matter how long it later goes quiet (waiting on a sentinel line can
+        legitimately take minutes). Returns True to keep the read loop
+        going, False if healing was attempted and failed -- at which point
+        the session is no better off staying up against a handle that is
+        now confirmed bad.
+        """
+        if (self._first_byte_at is not None or self._heal_attempted
+                or time.monotonic() - self._started < stale_read_grace()):
+            return True
+        self._heal_attempted = True
+        return self._try_heal()
+
+    def _try_heal(self) -> bool:
+        """One-shot recovery for a handle that looks open but has relayed
+        nothing: drop it and ask the owner for a fresh one, on the same TCP
+        connection, instead of leaving the client to sit against silence
+        until its own timeout. If the device really is quiet, this costs an
+        extra close/open and nothing else -- a fresh handle is just as quiet
+        as the old one. If the handle was the problem, real bytes start
+        flowing. If reopening itself fails, that is surfaced as a session
+        teardown (a dropped connection) rather than more silence, so a
+        caller can tell "I tried and it broke" apart from "nothing came
+        back yet".
+        """
+        path = self.owner.device_path()
+        log.warning(
+            "no bytes from %s within %.0fs of connecting; handle looked "
+            "open but may be stale after a reset -- reopening",
+            path, stale_read_grace(),
+        )
+        try:
+            fresh = self.owner.reopen_for_session()
+        except (OSError, serial.SerialException, FileNotFoundError) as e:
+            log.error("reopen during stale-read heal failed: %s", e)
+            return False
+        self.serial = fresh
+        self.rfc2217 = serial.rfc2217.PortManager(
+            self.serial, self, logger=logging.getLogger("rfc2217")
+        )
+        return True
 
     def _send(self, data: bytes) -> None:
         with self._write_lock:
