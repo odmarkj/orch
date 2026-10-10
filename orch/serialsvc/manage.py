@@ -78,6 +78,17 @@ def _usable_interpreter() -> str | None:
 
 
 def provision_venv(upgrade: bool = False) -> int:
+    """Create/refresh the service's own venv.
+
+    ``upgrade`` only reaches ``VENV_PACKAGES`` (pyserial, esptool) -- it is
+    not how a fix to this project's own source code (server.py, client.py,
+    this file, ...) reaches the live process. The launchd agent imports
+    ``orch.serialsvc`` fresh from ``orch_pythonpath()`` (the host's checkout
+    of this repo) every time it starts, so a source fix needs the host
+    checkout updated (e.g. ``git pull``) and then the agent restarted --
+    ``orch serial restart`` (or ``install`` again) on the host -- not
+    ``install --upgrade``. See ``restart()`` below.
+    """
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     if not service_python().exists():
         interpreter = _usable_interpreter()
@@ -133,6 +144,7 @@ def install(argv: list[str]) -> int:
         "ORCH_SERIAL_DEVICE", "ORCH_SERIAL_VIDPID", "ORCH_SERIAL_BAUD",
         "ORCH_SERIAL_HOST", "ORCH_SERIAL_DATA_PORT",
         "ORCH_SERIAL_CONTROL_PORT", "ORCH_SERIAL_RESET_COOLDOWN",
+        "ORCH_SERIAL_STALE_READ_GRACE",
         "ORCH_SERIAL_IMAGE_ROOTS", "ORCH_SITES_ROOT",
     ):
         value = os.environ.get(var, "").strip()
@@ -224,6 +236,15 @@ def status(argv: list[str]) -> int:
 
 
 def restart(argv: list[str]) -> int:
+    """Kickstart the launchd agent so it re-execs and re-imports fresh.
+
+    This -- not ``install --upgrade`` -- is what ships a merged source fix:
+    ``launchctl kickstart -k`` kills and respawns the process, which
+    re-imports ``orch.serialsvc`` from disk. That only picks up a fix if the
+    host's checkout of this repo already has it (``git pull`` on the host
+    first); ``--upgrade`` governs the service's own pyserial/esptool venv,
+    a separate thing entirely.
+    """
     require_macos("restart")
     if not LAUNCHD_PLIST.exists():
         return install(argv)

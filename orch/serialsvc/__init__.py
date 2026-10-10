@@ -80,6 +80,17 @@ DEFAULT_BAUD = 115200
 # reset costs a cellular re-attach, not for how fast the chip can reboot.
 DEFAULT_RESET_COOLDOWN = 60.0
 
+# Seconds a fresh monitor session gives a handle to produce its first byte
+# before treating it as suspect. Not a general idle timeout -- a monitor
+# legitimately sits quiet for minutes waiting on a sentinel log line. This
+# only fires in the opening window right after connecting, which is exactly
+# where a handle can look open (``is_open`` true, ``in_waiting`` raising
+# nothing) while actually belonging to a device that reset and moved on: a
+# real boot prints its first lines within a couple of seconds, so silence
+# past this grace period is the signal, not the data itself. See
+# ``Redirector._try_heal`` in server.py.
+DEFAULT_STALE_READ_GRACE = 5.0
+
 # USB-serial bridges worth claiming, by (vid, pid). Matching on identity
 # rather than on a /dev path matters: the macOS node name embeds the USB
 # location ID (/dev/cu.usbserial-11240), so it changes the moment the cable
@@ -162,6 +173,14 @@ def reset_cooldown() -> float:
         return float(raw) if raw else DEFAULT_RESET_COOLDOWN
     except ValueError:
         return DEFAULT_RESET_COOLDOWN
+
+
+def stale_read_grace() -> float:
+    raw = os.environ.get("ORCH_SERIAL_STALE_READ_GRACE", "").strip()
+    try:
+        return float(raw) if raw else DEFAULT_STALE_READ_GRACE
+    except ValueError:
+        return DEFAULT_STALE_READ_GRACE
 
 
 def control_host() -> str:
