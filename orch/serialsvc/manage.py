@@ -208,6 +208,8 @@ def status(argv: list[str]) -> int:
 
     _echo(f"serialsvc: up at {control_url()}")
     _echo(f"device:    {probe.get('device') or '(none attached)'}")
+    if probe.get("uf2_volumes"):
+        _echo(f"uf2 drive: {probe['uf2_volumes']}  (board in its bootloader)")
     if probe.get("device") and not probe.get("port_live"):
         _echo(f"           ! {probe.get('port_detail')}")
         _echo("           try: orch serial restart")
@@ -307,6 +309,13 @@ def doctor(argv: list[str]) -> int:
             # errno 6. This is the actual open/close check that catches it.
             check("port opens (not a stale handle from a device swap)",
                   bool(probe.get("port_live")), probe.get("port_detail") or "")
+        volumes = probe.get("uf2_volumes")
+        if isinstance(volumes, str):
+            check("UF2 bootloader drives readable", False,
+                  f"{volumes} -- grant the serialsvc python Removable Volumes "
+                  f"access in Privacy & Security")
+        elif volumes:
+            _echo(f"         UF2 bootloader drive mounted: {', '.join(volumes)}")
         check("accepting monitor clients",
               bool(probe.get("data_client_accepted")),
               "busy with a flash" if not probe.get("data_client_accepted") else "")

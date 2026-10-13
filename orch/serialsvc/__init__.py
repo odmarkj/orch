@@ -93,6 +93,17 @@ KNOWN_ADAPTERS: dict[tuple[int, int], str] = {
     (0x303A, 0x1001): "Espressif USB-Serial-JTAG",
 }
 
+# Boards whose MCU *is* the USB device (RP2040, SAMD, ESP32-S2/S3 under
+# CircuitPython/Arduino), matched by vendor alone: the PID changes with the
+# firmware -- CircuitPython, Arduino and MicroPython each enumerate the same
+# Feather RP2040 differently. These are a different animal from the bridges
+# above: DTR/RTS reach no reset pins, bootloader entry is a 1200-baud touch,
+# and firmware goes on as a UF2 file copied to a drive, not through esptool.
+NATIVE_USB_VENDORS: dict[int, str] = {
+    0x239A: "Adafruit",
+    0x2E8A: "Raspberry Pi",
+}
+
 
 def is_macos() -> bool:
     return platform.system() == "Darwin"

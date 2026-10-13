@@ -27,12 +27,14 @@ orch serial — host-owned USB serial device, driven from anywhere
     orch serial monitor [--baud N] [--seconds N]
     orch serial flash <img> [--addr 0x10000] [--baud N] [--erase] [--force]
     orch serial flash 0x1000:boot.bin 0x10000:app.bin
+    orch serial flash firmware.uf2 [--volume RPI-RP2]   (RP2040 & other UF2 boards)
     orch serial backup <dest.bin> [--addr 0x0] [--size 0x400000]
     orch serial reset [--bootloader] [--force]
 
 Firmware paths must live under the shared root (~/Apps), which is mounted at
 the same absolute path on the host and in the VM — so a VM build is flashed
-with no copying.
+with no copying. A .uf2 is copied by the host onto the board's bootloader
+drive; a running CircuitPython/Arduino board is rebooted into it first.
 
 Every reset is rate-limited (default 60s); on hardware that attaches to a
 cellular network a reset is expensive. --force overrides.

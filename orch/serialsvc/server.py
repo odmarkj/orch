@@ -56,11 +56,13 @@ from . import (
     DEFAULT_BAUD,
     KNOWN_ADAPTERS,
     LOG_FILE,
+    NATIVE_USB_VENDORS,
     STATE_DIR,
     bind,
     reset_cooldown,
     service_python,
     shared_roots,
+    uf2,
 )
 
 log = logging.getLogger("serialsvc")
@@ -112,11 +114,15 @@ def list_devices() -> list[dict]:
             continue
         vid, pid = p.vid, p.pid
         known = KNOWN_ADAPTERS.get((vid, pid)) if vid is not None else None
+        native = known is None and vid in NATIVE_USB_VENDORS
+        if native:
+            known = f"{NATIVE_USB_VENDORS[vid]} native USB ({p.description})"
         found.append({
             "device": p.device,
             "vid": f"{vid:04x}" if vid is not None else None,
             "pid": f"{pid:04x}" if pid is not None else None,
             "adapter": known,
+            "native_usb": native,
             "serial_number": p.serial_number,
             "location": p.location,
             "description": p.description,
@@ -146,6 +152,46 @@ def resolve_device(preferred: str | None = None) -> str | None:
         if dev["recognised"]:
             return dev["device"]
     return None
+
+
+def is_native_usb(path: str | None) -> bool:
+    return any(d["device"] == path and d["native_usb"] for d in list_devices())
+
+
+def native_usb_device() -> str | None:
+    """The board a 1200-baud touch may be aimed at.
+
+    Never ``resolve_device()``: with an ESP32 on a CH340 also attached, that
+    can name the bridge, and opening a bridge toggles DTR -- a reset of the
+    wrong board, and on this rig a cellular re-attach.
+    """
+    for dev in list_devices():
+        if dev["native_usb"]:
+            return dev["device"]
+    return None
+
+
+def touch_1200(path: str) -> None:
+    """Ask a running CircuitPython/Arduino/TinyUSB firmware to reboot into
+    its UF2 bootloader.
+
+    The convention is the line coding, not the bytes: the firmware watches
+    for the host setting 1200 baud and then dropping DTR. The device
+    disconnects as it reboots, so errors on the way out are expected.
+    """
+    ser = serial.Serial()
+    ser.port = path
+    ser.baudrate = 1200
+    ser.open()
+    try:
+        ser.dtr = False
+    except (OSError, serial.SerialException):
+        pass
+    try:
+        ser.close()
+    except (OSError, serial.SerialException):
+        pass
+    log.info("1200-baud touch sent to %s", path)
 
 
 # ── the one owner of the tty ───────────────────────────────────────────────
@@ -201,7 +247,11 @@ class DeviceOwner:
         ser.timeout = 0.5
         # Deasserted on open so merely starting the daemon, or reconnecting
         # after a flash, does not pulse EN and restart the application.
-        ser.dtr = False
+        # A native-USB board is the opposite case: DTR reaches no reset pin,
+        # and TinyUSB firmware (CircuitPython, Arduino-Pico, Pico SDK stdio)
+        # treats it as "a terminal is listening" and discards console output
+        # until it is asserted -- a monitor would connect and see nothing.
+        ser.dtr = is_native_usb(path)
         ser.rts = False
         ser.open()
         self._serial = ser
@@ -269,11 +319,15 @@ class DeviceOwner:
             log.info("baud set to %d", baud)
 
     @contextmanager
-    def exclusive(self):
-        """Hand the raw device path to a subprocess, port fully released."""
+    def exclusive(self, require_device: bool = True):
+        """Hand the raw device path to a subprocess, port fully released.
+
+        A UF2 flash passes ``require_device=False``: a board already sitting
+        in its bootloader has no serial port at all, only a drive.
+        """
         with self._lock:
             path = self.device_path()
-            if path is None:
+            if path is None and require_device:
                 raise FileNotFoundError("no recognised serial device attached")
             self._blocked = True
             session, self._session = self._session, None
@@ -389,13 +443,105 @@ class DeviceOwner:
                 f"orch serial restart (on the macOS host)"
             ) from e
 
-    def enter_download_mode(self) -> None:
+    def enter_download_mode(self) -> str:
+        """Put the owned board in its bootloader; returns the state reached.
+
+        A native-USB board has no EN/IO0 wiring for the ESP pulse train to
+        drive -- it would be a silent no-op reported as success -- so it gets
+        the 1200-baud touch, and its "download mode" is a UF2 drive.
+        """
+        if is_native_usb(self.device_path()):
+            with self.exclusive() as path:
+                touch_1200(path)
+            volume = uf2.wait_for_volume(None)
+            if volume is None:
+                raise RuntimeError(
+                    "1200-baud touch sent but no UF2 drive mounted; the "
+                    "running firmware does not honour it (bare Pico SDK "
+                    "builds don't). Hold BOOT while plugging in instead.")
+            log.info("UF2 bootloader entered (%s)", volume["name"])
+            return f"uf2 bootloader ({volume['name']})"
         self._run_with_reopen_retry(unix_tight_bootloader_reset)
         log.info("download mode entered (ROM loader waiting)")
+        return "download"
 
     def hard_reset(self) -> None:
+        if is_native_usb(self.device_path()):
+            # Same trap as above: the pulse train would "succeed" and the
+            # board would keep running untouched.
+            raise ValueError(
+                "native-USB boards have no reset line on the serial port; "
+                "press RESET, or flash a UF2 (the board reboots after)")
         self._run_with_reopen_retry(esp_hard_reset)
         log.info("hard reset issued (application firmware running)")
+
+    def flash_uf2(self, image: Path, info: dict, volume_name: str | None,
+                  force: bool) -> tuple[int, dict]:
+        """Copy a UF2 image onto the board's bootloader drive.
+
+        If no drive is mounted, a running native-USB board is touched into
+        its bootloader first -- the only part of this that costs a reset,
+        since a board already in the bootloader is running nothing.
+        """
+        with self.exclusive(require_device=False):
+            touched = None
+            volume = uf2.pick_volume(uf2.find_volumes(), volume_name)
+            if volume is None:
+                touched = native_usb_device()
+                if touched is None:
+                    return 503, {
+                        "error": "no UF2 bootloader drive mounted and no "
+                                 "native-USB board attached to reboot into one",
+                        "hint": "hold the button labelled BOOT (BOOTSEL) "
+                                "while plugging the board in -- not RESET",
+                    }
+                wait = self.spend_reset(force)
+                if wait:
+                    return 429, {
+                        "error": "reset cooldown active",
+                        "retry_after_s": round(wait, 1),
+                        "hint": "rebooting into the bootloader is a reset; "
+                                "pass force=true to override",
+                    }
+                touch_1200(touched)
+                volume = uf2.wait_for_volume(volume_name)
+                if volume is None:
+                    return 504, {
+                        "error": f"1200-baud touch sent to {touched} but no "
+                                 f"UF2 drive mounted",
+                        "hint": "the running firmware does not honour the "
+                                "touch; hold BOOT while plugging in instead",
+                    }
+
+            mismatch = uf2.check_compatible(info, volume)
+            if mismatch:
+                return 400, {"error": mismatch, "volume": volume}
+
+            log.info("uf2: %s -> %s", image, volume["volume"])
+            result = uf2.copy_to_volume(image, volume)
+
+        result.update({
+            "image": str(image),
+            "volume": volume["name"],
+            "board_id": volume.get("board_id"),
+            "families": [uf2.family_name(f) for f in info["families"]],
+            "touched": touched,
+        })
+        if not result["ok"]:
+            log.error("uf2 flash failed: %s", result["error"])
+            return 500, result
+        if result.get("write_error"):
+            log.info("uf2: write ended with %s (normal: the drive "
+                     "unmounts under the final flush)", result["write_error"])
+        # Report the serial port the new firmware brings up, if it brings
+        # one up -- that is what a caller's next step (monitor) needs.
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            result["serial"] = native_usb_device()
+            if result["serial"]:
+                break
+            time.sleep(0.5)
+        return 200, result
 
     def run_esptool(self, args: list[str], baud: int, bootloader: bool,
                     after: str = "hard-reset") -> dict:
@@ -617,6 +763,14 @@ def _validate_image(raw: str) -> Path:
     return resolved
 
 
+def _volume_names() -> list[str] | str:
+    """For status: a missing privacy grant must not take status down too."""
+    try:
+        return [v["name"] for v in uf2.find_volumes()]
+    except PermissionError as e:
+        return f"unreadable: {e}"
+
+
 def make_control_handler(owner: DeviceOwner):
     class Control(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -665,6 +819,7 @@ def make_control_handler(owner: DeviceOwner):
                 "cooldown_remaining_s": round(owner.cooldown_remaining(), 1),
                 "data_client_accepted": owner.accepting_data_clients(),
                 "last_flash": owner.last_flash,
+                "uf2_volumes": _volume_names(),
                 "log": str(LOG_FILE),
             }
 
@@ -675,6 +830,10 @@ def make_control_handler(owner: DeviceOwner):
                     return 400, {"error": "need 'images': [{addr, path}] or 'image'"}
                 images = [{"addr": body.get("addr", "0x10000"),
                            "path": body["image"]}]
+            if any(str(e.get("path", "")).lower().endswith(".uf2") for e in images):
+                # esptool would write the UF2 container bytes verbatim to
+                # flash -- a bricked app partition, not an error.
+                return 400, {"error": "UF2 images go to POST /uf2, not esptool"}
             args: list[str] = []
             if body.get("erase"):
                 args.append("--erase-all")
@@ -736,6 +895,25 @@ def make_control_handler(owner: DeviceOwner):
             result["path"] = str(dest_path)
             return (200 if result["ok"] else 500), result
 
+        def _uf2(self, body: dict) -> tuple[int, dict]:
+            if not body.get("image"):
+                return 400, {"error": "need 'image': an absolute path to a .uf2"}
+            try:
+                image = _validate_image(body["image"])
+                info = uf2.parse_image(image)
+            except (ValueError, OSError) as e:
+                return 400, {"error": str(e)}
+            code, result = owner.flash_uf2(
+                image, info, body.get("volume"), bool(body.get("force")))
+            if code in (200, 500):
+                owner.last_flash = {
+                    "when": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                    "images": [{"uf2": result.get("volume"), "path": str(image)}],
+                    "ok": result["ok"],
+                    "elapsed_s": result["elapsed_s"],
+                }
+            return code, result
+
         def _chip(self, body: dict) -> tuple[int, dict]:
             wait = self._budget(body)
             if wait:
@@ -758,7 +936,13 @@ def make_control_handler(owner: DeviceOwner):
                 if route in ("/", "/status", "/healthz"):
                     return self._reply(200, self._status())
                 if route == "/devices":
-                    return self._reply(200, {"ok": True, "devices": list_devices()})
+                    return self._reply(200, {
+                        "ok": True,
+                        "devices": list_devices(),
+                        # A board in its UF2 bootloader has no serial port;
+                        # this is the only place it shows up.
+                        "uf2_volumes": uf2.find_volumes(),
+                    })
                 if route == "/data-url":
                     from . import data_url
                     return self._reply(200, {"ok": True, "url": data_url()})
@@ -781,10 +965,18 @@ def make_control_handler(owner: DeviceOwner):
                             "error": "reset cooldown active",
                             "retry_after_s": round(wait, 1),
                         })
-                    owner.enter_download_mode()
-                    return self._reply(200, {"ok": True, "state": "download"})
+                    state = owner.enter_download_mode()
+                    return self._reply(200, {"ok": True, "state": state})
 
                 if route == "/hard-reset":
+                    if is_native_usb(owner.device_path()):
+                        # Refused before the budget: there is no reset to
+                        # spend it on.
+                        return self._reply(400, {
+                            "error": "native-USB boards have no reset line on "
+                                     "the serial port; press RESET, or flash "
+                                     "a UF2 (the board reboots after)",
+                        })
                     wait = self._budget(body)
                     if wait:
                         return self._reply(429, {
@@ -800,9 +992,21 @@ def make_control_handler(owner: DeviceOwner):
                     return self._reply(*self._backup(body))
                 if route == "/chip":
                     return self._reply(*self._chip(body))
+                if route == "/uf2":
+                    return self._reply(*self._uf2(body))
 
             except FileNotFoundError as e:
                 return self._reply(503, {"error": str(e)})
+            except PermissionError as e:
+                # Reading /Volumes from a launchd agent needs macOS's
+                # Removable Volumes grant; without it this is all you get.
+                return self._reply(403, {
+                    "error": str(e),
+                    "hint": "on the macOS host, allow the serialsvc python "
+                            f"({service_python()}) under System Settings > "
+                            "Privacy & Security > Files and Folders > "
+                            "Removable Volumes, then: orch serial restart",
+                })
             except subprocess.TimeoutExpired:
                 return self._reply(504, {"error": "esptool timed out"})
             except Exception as e:
@@ -812,7 +1016,7 @@ def make_control_handler(owner: DeviceOwner):
             self._reply(404, {
                 "error": "unknown route",
                 "routes": ["/status", "/devices", "/data-url", "/download-mode",
-                           "/hard-reset", "/flash", "/backup", "/chip"],
+                           "/hard-reset", "/flash", "/backup", "/chip", "/uf2"],
             })
 
         do_GET = _dispatch
