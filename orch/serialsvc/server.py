@@ -492,9 +492,8 @@ class DeviceOwner:
                     return 503, {
                         "error": "no UF2 bootloader drive mounted and no "
                                  "native-USB board attached to reboot into one",
-                        "hint": "hold the BOOT button while plugging the "
-                                "board in (on a Feather RP2040 it is the "
-                                "one next to RESET, not the user button)",
+                        "hint": "hold the button labelled BOOT (BOOTSEL) "
+                                "while plugging the board in -- not RESET",
                     }
                 wait = self.spend_reset(force)
                 if wait:
