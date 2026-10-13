@@ -105,14 +105,20 @@ def cmd_devices(argv: list[str]) -> int:
     if rc:
         return rc
     devices = body.get("devices") or []
-    if not devices:
+    volumes = body.get("uf2_volumes") or []
+    if not devices and not volumes:
         print("  no serial devices attached")
         return 1
     for d in devices:
         tag = d.get("adapter") or d.get("description") or "unknown"
         mark = "*" if d.get("recognised") else " "
         print(f"  {mark} {d['device']}  {d.get('vid')}:{d.get('pid')}  {tag}")
-    print("\n  * = recognised USB-serial bridge (the one serialsvc will claim)")
+    for v in volumes:
+        print(f"  ^ {v['volume']}  UF2 bootloader  "
+              f"{v.get('board_id') or v.get('model') or ''}")
+    print("\n  * = recognised device (the first one is what serialsvc claims)")
+    if volumes:
+        print("  ^ = board in its UF2 bootloader: orch serial flash <image.uf2>")
     return 0
 
 
@@ -144,7 +150,7 @@ def cmd_flash(argv: list[str]) -> int:
     """
     positional = [a for a in argv if not a.startswith("-")]
     # Drop values consumed by flags so they are not mistaken for images.
-    for name in ("--addr", "--baud", "--after"):
+    for name in ("--addr", "--baud", "--after", "--volume"):
         value = _opt(argv, name)
         if value in positional:
             positional.remove(value)
@@ -154,6 +160,14 @@ def cmd_flash(argv: list[str]) -> int:
               "         orch serial flash 0x1000:boot.bin 0x10000:app.bin",
               file=sys.stderr)
         return 2
+
+    uf2_images = [p for p in positional if p.lower().endswith(".uf2")]
+    if uf2_images:
+        if len(positional) != 1:
+            print("  a .uf2 is flashed on its own (it carries its own "
+                  "addresses)", file=sys.stderr)
+            return 2
+        return _flash_uf2(argv, uf2_images[0])
 
     images = []
     for item in positional:
@@ -180,6 +194,32 @@ def cmd_flash(argv: list[str]) -> int:
         return rc
     print(f"  flashed in {body.get('elapsed_s')}s "
           f"(wall {time.time() - started:.1f}s)")
+    return 0
+
+
+def _flash_uf2(argv: list[str], image: str) -> int:
+    """UF2 boards (RP2040 etc.): the host copies the image to the bootloader
+    drive, touching a running board into its bootloader first if needed."""
+    payload = {
+        "image": image,
+        "volume": _opt(argv, "--volume"),
+        "force": _flag(argv, "--force"),
+    }
+    print(f"  writing {image} to the UF2 bootloader drive (host-side copy)")
+    started = time.time()
+    status, body = _call("/uf2", payload, timeout=180)
+    rc = _print(status, body)
+    if rc:
+        return rc
+    how = (f" after rebooting {body['touched']} into it"
+           if body.get("touched") else "")
+    print(f"  flashed {body.get('volume')} ({body.get('board_id')}){how} "
+          f"in {body.get('elapsed_s')}s (wall {time.time() - started:.1f}s)")
+    if body.get("serial"):
+        print(f"  firmware is up on {body['serial']}: orch serial monitor")
+    else:
+        print("  no serial port came up in 10s (fine if the firmware has no "
+              "USB console)")
     return 0
 
 

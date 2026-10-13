@@ -72,6 +72,7 @@ orch serial status                              # device + reset budget
 orch serial devices                             # what's attached
 orch serial monitor --baud 9600 --seconds 30    # stream output
 orch serial flash build/firmware.bin --addr 0x10000
+orch serial flash build/firmware.uf2             # RP2040 & other UF2 boards
 orch serial backup flash-backup.bin --size 0x400000
 orch serial reset [--bootloader]
 orch serial doctor                              # names the broken link
@@ -86,6 +87,13 @@ Rules that matter:
 - **Firmware paths must be under `~/Apps`**, which is mounted at the same
   absolute path on the host and here, so a build needs no copying. A path
   outside it is refused.
+- **UF2 boards (RP2040, Adafruit SAMD/ESP32-S2/S3)** flash by copying a
+  `.uf2` onto the bootloader drive, which only the host can see. `flash` does
+  that for any `.uf2`, rebooting a running CircuitPython/Arduino board into
+  its bootloader first (a 1200-baud touch). A board with no USB firmware
+  needs a human to hold **BOOT** while plugging it in; `orch serial devices`
+  shows the drive (`^`) once it is there. `reset --bootloader` works on these
+  boards; plain `reset` does not (no reset line), and there is no `backup`.
 - **Back up before writing**: `orch serial backup` first. Flash writes erase.
 - Flashing several images in one call costs one reset, not one per image.
 - If it is unreachable, say so and stop — the fix is `orch serial install` on

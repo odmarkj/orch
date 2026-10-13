@@ -146,6 +146,7 @@ orch serial devices         # what's attached (matched by VID/PID)
 orch serial monitor --baud 9600 --seconds 30
 orch serial flash build/firmware.bin --addr 0x10000
 orch serial flash 0x1000:bootloader.bin 0x10000:app.bin
+orch serial flash build/firmware.uf2   # RP2040 and other UF2 boards
 orch serial backup flash-backup.bin --size 0x400000
 orch serial reset [--bootloader]
 orch serial doctor          # checks every link, names the broken one
@@ -184,6 +185,23 @@ Firmware paths must resolve under `~/Apps`, which is virtiofs-mounted at the
 and a path that resolves outside the shared root is refused because it would
 not mean the same thing in both places. Validation happens before the budget,
 so a bad path costs no reset.
+
+**UF2 boards** (RP2040, and Adafruit's SAMD and ESP32-S2/S3) take no
+serial protocol at all: the bootloader mounts as a drive (`RPI-RP2`), and
+copying a `.uf2` onto it is the flash. That drive appears only under the
+host's `/Volumes`, which is deliberately not shared into the VM, so `flash`
+hands any `.uf2` to `POST /uf2` and the host does the copy. If no drive is
+mounted it first sends a 1200-baud touch to a running native-USB board
+(Adafruit `0x239A` / Raspberry Pi `0x2E8A`), which CircuitPython and Arduino
+firmware answer by rebooting into the bootloader; that touch is the only part
+that spends a reset. Two silent failures are made loud: an image built for
+another chip family (the RP2040 ROM ignores every block and the board just
+sits there) is refused before writing, and success is judged by the drive
+unmounting, because the bootloader reboots under the final write and the
+copy's own return code means nothing. Native-USB boards are also opened with
+DTR asserted, since TinyUSB firmware discards console output until a
+terminal raises it. If the drive is unreadable from the launchd agent, grant
+the service's python Removable Volumes access in Privacy & Security.
 
 Host-side esptool runs roughly 2× faster than in-VM esptool over the RFC 2217
 data plane (~10.6 KB/s vs ~5.8 KB/s measured at 230400), because pyserial's
