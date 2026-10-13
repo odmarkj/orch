@@ -26,6 +26,7 @@ already owns a state connection.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -64,13 +65,21 @@ def _projects_base() -> Path:
     return Path.home() / ".claude" / "projects"
 
 
-def _dash(path: Path | str) -> str:
-    """Encode a cwd the way Claude Code names its project dir: / → -."""
-    return str(path).replace("/", "-")
+def claude_project_dirname(path: Path | str) -> str:
+    """Encode a cwd the way Claude Code names its project dir.
+
+    Claude Code replaces every character that isn't `[A-Za-z0-9]` with `-`
+    — not just `/`. A worktree cwd like
+    `/Users/j/Apps/.orch-worktrees/foo/wt_abc123` has a `.` (in
+    `.orch-worktrees`) and a `_` (in `wt_abc123`), both of which must become
+    `-` too, or the computed dir never matches the one Claude actually
+    writes to (verified against `~/.claude/projects/` on disk).
+    """
+    return re.sub(r"[^A-Za-z0-9]", "-", str(path))
 
 
 def _jsonl_dir_for(cwd: Path | str) -> Path:
-    return _projects_base() / _dash(cwd)
+    return _projects_base() / claude_project_dirname(cwd)
 
 
 def _first_user_preview(jsonl_path: Path) -> str:

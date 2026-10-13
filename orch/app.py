@@ -1612,7 +1612,8 @@ class OrchApp(App):
 
                 # Pre-create the JSONL log dir so the watcher can schedule it
                 # before Claude lazily creates it on first turn.
-                jsonl_dir = Path.home() / ".claude" / "projects" / str(wt_path).replace("/", "-")
+                from .sessions import claude_project_dirname
+                jsonl_dir = Path.home() / ".claude" / "projects" / claude_project_dirname(wt_path)
                 jsonl_dir.mkdir(parents=True, exist_ok=True)
 
                 state.insert_worktree(
@@ -1697,7 +1698,8 @@ class OrchApp(App):
         handles = self._worktree_watches.pop(wt_path, None)
         project = self._worktree_path_to_project.pop(wt_path, None)
         # Remove jsonl_dir mapping too
-        jsonl_dir = str(Path.home() / ".claude" / "projects" / wt_path.replace("/", "-"))
+        from .sessions import claude_project_dirname
+        jsonl_dir = str(Path.home() / ".claude" / "projects" / claude_project_dirname(wt_path))
         self._jsonl_dir_to_project.pop(jsonl_dir, None)
         if self._observer is None or not handles:
             return
