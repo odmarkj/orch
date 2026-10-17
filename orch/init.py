@@ -389,6 +389,62 @@ def _write_lifecycle(target: Path, name: str, stage: str, description: str) -> N
     _ok(f".orch/project.toml \u2014 stage: {stage}")
 
 
+def _parse_owner_repo(target: Path) -> tuple[str, str] | None:
+    """Best-effort owner/repo from `git remote get-url origin`."""
+    result = subprocess.run(
+        ["git", "remote", "get-url", "origin"],
+        cwd=target, capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return None
+    url = result.stdout.strip()
+    # Handles git@github.com:owner/repo.git and https://github.com/owner/repo.git
+    import re
+    m = re.search(r"github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?$", url)
+    if not m:
+        return None
+    return m.group(1), m.group(2)
+
+
+def _check_ci_runner_pattern(target: Path, setup_runner: bool) -> None:
+    """Point at the self-hosted CI runner pattern when a Dockerfile exists.
+
+    Self-hosted runners on this VM are the account's default for anything
+    that builds/pushes a Docker image (see
+    .claude-docs/patterns/self-hosted-ci-runners.md, scaffolded above by
+    _write_reference_docs) — this just makes sure a project that would
+    benefit doesn't default to ubuntu-latest out of not knowing the pattern
+    exists.
+    """
+    dockerfiles = [p for p in target.rglob("Dockerfile*") if ".git" not in p.parts][:1]
+    if not dockerfiles:
+        return
+
+    print()
+    print("  Dockerfile found — this project can use the self-hosted CI")
+    print("  runner pattern (faster + cheaper than ubuntu-latest for image")
+    print("  builds). See .claude-docs/patterns/self-hosted-ci-runners.md")
+    print("  for the pick-runner workflow snippet.")
+
+    if not setup_runner:
+        print("  Run with --setup-runner to register a runner for this repo now,")
+        print("  or later: orch runner setup <owner>/<repo>")
+        return
+
+    owner_repo = _parse_owner_repo(target)
+    if not owner_repo:
+        _err("--setup-runner: could not resolve owner/repo from `git remote origin`")
+        _err("Run manually once a remote exists: orch runner setup <owner>/<repo>")
+        return
+
+    owner, repo = owner_repo
+    from .runner import setup_runner as do_setup_runner
+    try:
+        do_setup_runner(owner, repo)
+    except RuntimeError as exc:
+        _err(f"Runner setup failed: {exc}")
+
+
 def _install_plugins(target: Path) -> None:
     # curated-context
     cc_dir = target / ".curated-context"
@@ -438,6 +494,7 @@ def cmd_init(argv: list[str]) -> None:
     stage = "building"
     description = ""
     do_plugins = False
+    do_setup_runner = False
 
     i = 0
     while i < len(argv):
@@ -453,8 +510,10 @@ def cmd_init(argv: list[str]) -> None:
             description = argv[i]
         elif arg == "--plugins":
             do_plugins = True
+        elif arg == "--setup-runner":
+            do_setup_runner = True
         elif arg in ("-h", "--help"):
-            print("Usage: orch init [dir] [--name NAME] [--stage STAGE] [--description DESC] [--plugins]")
+            print("Usage: orch init [dir] [--name NAME] [--stage STAGE] [--description DESC] [--plugins] [--setup-runner]")
             print()
             print("  Bootstrap a project for Claude Code + orch.")
             print("  Additive only — never overwrites existing files.")
@@ -465,6 +524,9 @@ def cmd_init(argv: list[str]) -> None:
             print("  --stage STAGE    Initial lifecycle stage (default: building)")
             print("  --description D  One-line project description")
             print("  --plugins        Also install claude-mem and curated-context")
+            print("  --setup-runner   If a Dockerfile is found, register a self-hosted")
+            print("                   CI runner for this repo now (needs a git remote")
+            print("                   origin on github.com; see `orch runner setup`)")
             return
         elif not arg.startswith("-"):
             target = arg
@@ -487,6 +549,7 @@ def cmd_init(argv: list[str]) -> None:
     _write_lifecycle(target_path, project_name, stage, description)
 
     _ensure_initial_commit(target_path)
+    _check_ci_runner_pattern(target_path, do_setup_runner)
 
     if do_plugins:
         print()

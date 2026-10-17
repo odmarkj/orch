@@ -96,6 +96,8 @@ Best practices and templates drawn from the Claude Code ecosystem.
 
 - `patterns/workflow-patterns.md` -- Claude Code workflow patterns: agent skills, hooks, slash commands, status lines, orchestration, and automation. Covers the major categories of Claude Code extensibility.
 
+- `patterns/self-hosted-ci-runners.md` -- This account's default CI pattern: self-hosted GitHub Actions runners on the orch VM with a fail-safe `pick-runner` probe-and-route job that falls back to `ubuntu-latest` when the runner is offline. Includes the copy-paste workflow snippet and the `orch runner setup` command. Consult before defaulting a new project's workflow to `ubuntu-latest`, especially for anything that builds/pushes a Docker image.
+
 ---
 
 ## Best Practices (Universal)
@@ -112,7 +114,7 @@ design patterns that apply regardless of technology stack.
 
 - `best-practices/universal/observability.md` -- Production observability patterns: four golden signals (latency, traffic, errors, saturation), distributed tracing with Jaeger/Tempo, SLO/SLI implementation, Prometheus configuration, Grafana dashboards, structured logging, alerting rules, correlation IDs. Consult when adding monitoring, building dashboards, or defining service level objectives.
 
-- `best-practices/universal/cicd.md` -- CI/CD pipeline design: multi-stage pipelines, deployment strategies (rolling, blue-green, canary), approval gates, GitHub Actions and GitLab CI templates, secrets management with Vault and cloud providers, rollback strategies, DORA metrics, health checks. Consult when setting up deployment pipelines or choosing deployment strategies.
+- `best-practices/universal/cicd.md` -- CI/CD pipeline design: multi-stage pipelines, deployment strategies (rolling, blue-green, canary), approval gates, GitHub Actions and GitLab CI templates, secrets management with Vault and cloud providers, rollback strategies, DORA metrics, health checks, and this account's self-hosted-runner default (see `patterns/self-hosted-ci-runners.md`). Consult when setting up deployment pipelines or choosing deployment strategies.
 
 - `best-practices/universal/code-quality.md` -- Code quality and refactoring patterns: clean code principles, SOLID, function size guidelines, refactoring strategies, code review checklist, legacy modernization approaches, complexity management, performance profiling. Consult when refactoring, reviewing code, or modernizing legacy codebases.
 
