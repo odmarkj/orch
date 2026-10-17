@@ -68,6 +68,37 @@ The pipeline is the last line of defense before production. Every stage should h
 - **Minimal permissions** -- set `permissions` at the job level; grant only `contents: read` and `packages: write` as needed
 - **Environment secrets** -- use environment-scoped secrets so production credentials are only available in the production deployment job
 
+## Self-Hosted Runners (this account's default)
+
+This account runs GitHub Actions self-hosted runners on its own orch VM for
+projects that build/push a Docker image or otherwise have CI heavy enough
+to benefit from a local, always-warm machine — faster than a freshly
+provisioned hosted runner and avoids per-minute billing. **Default to this
+pattern for a new project's CI** rather than `runs-on: ubuntu-latest`.
+
+- **Fail-safe probe-and-route, never a hard dependency** -- a `pick-runner`
+  job (itself on `ubuntu-latest`) checks via the GitHub API whether an
+  online self-hosted runner carrying the project's `<repo>-vm` label
+  exists, and routes the real job to `["self-hosted", "<repo>-vm"]` if so,
+  falling back to `ubuntu-latest` otherwise. Any probe failure (API down,
+  token rotated) also falls back — a broken probe degrades CI, it never
+  removes it.
+- **Full pattern + copy-paste snippet** -- see
+  `patterns/self-hosted-ci-runners.md` in this reference library (every
+  `orch init`-scaffolded project gets a copy at
+  `.claude-docs/patterns/self-hosted-ci-runners.md`). Reference
+  implementations: `asha-core-eval/.github/workflows/test-asha-core.yaml`
+  (original, runners `asha-vm-1`/`asha-vm-2`) and
+  `racepace/.github/workflows/web-image.yaml` (second instance, runner
+  `racepace-vm-1`).
+- **Setup is one command** -- `orch runner setup <owner>/<repo>` registers
+  the runner, installs it as a systemd service on the VM, and sets the
+  `RUNNER_PROBE_TOKEN` repo secret the probe job needs. See `orch runner
+  setup --help`.
+- **One runner registration per repo, always** -- self-hosted runners on a
+  personal-account repo can't be shared across repos, even though every
+  runner for every project is just another process on the same VM.
+
 ## GitLab CI Patterns
 
 - **Stage-based pipeline** -- define stages (build, test, deploy) with jobs in each; jobs in the same stage run in parallel by default

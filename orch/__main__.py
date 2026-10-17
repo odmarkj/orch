@@ -43,6 +43,7 @@ orch CLI
   orch serial backup <dest.bin>     Read flash to a file
   orch serial reset [--bootloader]  Reset, or enter download mode
   orch init [dir]                   Bootstrap project for Claude Code
+  orch runner setup <owner>/<repo>  Register + install a self-hosted CI runner
   orch ignore <project>              Hide project from orch
   orch ignore <project> --undo      Un-hide project
   orch setup                        First-time setup
@@ -376,6 +377,9 @@ def main() -> None:
     elif sub in ("init",):
         from .init import cmd_init
         cmd_init(argv[1:])
+    elif sub in ("runner",):
+        from .runner import cmd_runner
+        cmd_runner(argv[1:])
     elif sub in ("ignore",):
         cmd_ignore(argv[1:])
     elif sub in ("fetch",):
