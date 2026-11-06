@@ -18,6 +18,7 @@ import base64
 import json
 import shlex
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -196,11 +197,16 @@ def open_input_tab(project: Project) -> None:
         # Handle is stale (tab was closed manually) — clean it up
         handle_file.unlink(missing_ok=True)
 
+    from .agent import interactive_program
+
+    # Before any side effect: an unknown or missing executor fails here.
+    program       = interactive_program(project)
+
     cfg = _load_config()
     profile       = cfg["iterm"].get("profile", "orch")
     dedicated     = cfg["iterm"].get("dedicated_window", True)
     window_title  = cfg["iterm"].get("window_title", "orch sessions")
-    vm_cmd        = _build_vm_claude_cmd(project)
+    vm_cmd        = _build_vm_claude_cmd(project, program=program)
     project_name  = _agent_label(project, project.name)
     badge         = _iterm_badge_cmd(project_name)
     shell_cmd     = _applescript_quote(
@@ -292,6 +298,7 @@ def open_input_tab(project: Project) -> None:
     tty = _run_iterm_script(script)
     if tty:
         handle_file.write_text(tty)
+    _watch_and_confirm_dev_channels_dialog(program, tty)
 
 
 def _tab_exists(tty: str) -> bool | None:
@@ -383,6 +390,149 @@ def _bring_tab_to_front(tty: str, expected_name: str | None = None) -> bool:
     return result.stdout.strip().lower() == "true"
 
 
+# ── Dev-channels dialog auto-confirm (D102) ────────────────────────────────────
+#
+# `asha shell` always shows a "WARNING: Loading development channels" dialog
+# before its TUI starts: Asha's inbox channel is a raw `server:` MCP channel,
+# which refuses to connect at all without
+# --dangerously-load-development-channels, and that flag has no persisted
+# "don't ask again" setting anywhere in the installed binary. asha-v3's
+# plan/02-decisions.md D102 calls this out explicitly: "A person clicks
+# through it; a launcher that starts sessions unattended (orch) sends the
+# keypress." This is that keypress. (Compare D184, merged in asha-v3, which
+# fixed the other two startup dialogs — workspace trust and Bypass
+# Permissions mode — with persisted settings; this dialog has no such fix
+# available so orch has to answer it itself on every launch.)
+#
+# Only `asha shell` launches ever show it — a bare `claude` session never
+# loads the channel that triggers it — so this is skipped for the "claude"
+# executor. Verified live (pty harness against the real binary): the
+# dialog's default-focused option is already "I am using this for local
+# development", so a single Return accepts it, and it is always the first
+# thing rendered. Measured time-to-dialog after `asha shell` starts is
+# roughly 0.6s-3.5s.
+
+_DEV_CHANNELS_MARKER = "Loading development channels"
+_DEV_CHANNELS_POLL_TIMEOUT = 15.0   # generous vs. the measured 0.6s-3.5s
+_DEV_CHANNELS_POLL_INTERVAL = 0.4
+
+
+def _session_contents(tty: str) -> str | None:
+    """Return the visible contents of the iTerm2 session with this tty.
+
+    None if the AppleScript itself failed (iTerm2 not scriptable, session
+    reference went stale, etc.) — distinct from "" (script ran fine, no
+    matching session or it's blank), so callers can tell "couldn't check"
+    from "checked, not there yet".
+    """
+    script = f"""
+    set found to false
+    set theContents to ""
+    tell application "iTerm2"
+        repeat with aWindow in windows
+            try
+                repeat with aTab in tabs of aWindow
+                    repeat with aSession in sessions of aTab
+                        try
+                            if tty of aSession is "{tty}" then
+                                set theContents to contents of aSession
+                                set found to true
+                                exit repeat
+                            end if
+                        on error
+                            -- Session property access failed — skip
+                        end try
+                    end repeat
+                    if found then exit repeat
+                end repeat
+            on error
+                -- Window/tab reference went stale — skip
+            end try
+            if found then exit repeat
+        end repeat
+    end tell
+    return theContents
+    """
+    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
+def _send_return(tty: str) -> bool:
+    """Send a lone confirming Return to the iTerm2 session with this tty.
+
+    Same `write text ""` pattern already used for launch commands elsewhere
+    in this file — the default `write text` behaviour appends the newline.
+    """
+    script = f"""
+    set found to false
+    tell application "iTerm2"
+        repeat with aWindow in windows
+            try
+                repeat with aTab in tabs of aWindow
+                    repeat with aSession in sessions of aTab
+                        try
+                            if tty of aSession is "{tty}" then
+                                tell aSession to write text ""
+                                set found to true
+                                exit repeat
+                            end if
+                        on error
+                        end try
+                    end repeat
+                    if found then exit repeat
+                end repeat
+            on error
+            end try
+            if found then exit repeat
+        end repeat
+    end tell
+    return found
+    """
+    result = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
+    return result.returncode == 0 and result.stdout.strip().lower() == "true"
+
+
+def _confirm_dev_channels_dialog(tty: str) -> None:
+    """Poll the session for the dev-channels warning and confirm it once seen.
+
+    Fails safe: if the marker text never shows up within the timeout (a
+    slower-than-usual launch, a session that closed, an AppleScript hiccup),
+    nothing is sent and the dialog — if it's even there — is left for the
+    person to answer by hand, exactly as before this existed. Never sends a
+    blind keystroke on a guess.
+    """
+    try:
+        deadline = time.monotonic() + _DEV_CHANNELS_POLL_TIMEOUT
+        while time.monotonic() < deadline:
+            contents = _session_contents(tty)
+            if contents is not None and _DEV_CHANNELS_MARKER in contents:
+                _send_return(tty)
+                return
+            time.sleep(_DEV_CHANNELS_POLL_INTERVAL)
+    except Exception:
+        pass  # Fire-and-forget: never let this surface as a launch failure
+
+
+def _watch_and_confirm_dev_channels_dialog(program: str, tty: str | None) -> None:
+    """Fire-and-forget: arrange to confirm asha shell's dev-channels dialog.
+
+    No-op for anything but an `asha shell` launch (bare `claude` never loads
+    the channel that triggers this dialog) or when *tty* wasn't captured.
+    Runs the poll in a background thread so the launch function that calls
+    this returns immediately — the iTerm2 tab is already open and usable;
+    this only saves the person a click a few seconds later.
+    """
+    from .agent import INTERACTIVE_EXECUTORS
+
+    if not tty or program != INTERACTIVE_EXECUTORS.get("asha"):
+        return
+    threading.Thread(
+        target=_confirm_dev_channels_dialog, args=(tty,), daemon=True,
+    ).start()
+
+
 def clear_stale_handle(project: Project) -> None:
     """
     Called on orch startup. If any handle file exists but the tab is gone
@@ -447,18 +597,24 @@ def _run_iterm_script(script: str) -> str:
     return result.stdout.strip()
 
 
-def _build_vm_claude_cmd(project: Project) -> str:
+def _build_vm_claude_cmd(project: Project, *, program: str | None = None) -> str:
     """Build the command to run Claude inside the Lima VM.
 
     Uses ssh -t for proper PTY allocation so terminal resize works.
     Claude runs directly — no sandbox, no tmux — to preserve the PTY
     foreground process group for SIGWINCH delivery.
+
+    *program* is interactive_program(project) if the caller already resolved
+    it (so it can also decide whether to watch for the dev-channels dialog
+    without probing a non-default executor's `--version` twice); resolved
+    here when omitted.
     """
     import shlex
     from .vm import vm_ssh_cmd
     from .agent import interactive_program
 
-    program = interactive_program(project)
+    if program is None:
+        program = interactive_program(project)
     project_dir = str(project.path)
     claude_args = "--dangerously-skip-permissions"
 
@@ -599,6 +755,7 @@ def open_vm_session(project: Project, with_shell: bool = False) -> None:
                     end try
                 end repeat
             end tell
+            return claudeTty
         end tell
         """
     else:
@@ -614,12 +771,15 @@ def open_vm_session(project: Project, with_shell: bool = False) -> None:
                     set name to "{tab_name}"
                     set badge to "{agent_badge}"
                     write text {claude_cmd}
+                    set claudeTty to tty
                 end tell
             end tell
+            return claudeTty
         end tell
         """
 
-    _run_iterm_script(script)
+    claude_tty = _run_iterm_script(script)
+    _watch_and_confirm_dev_channels_dialog(program, claude_tty)
 
 
 def open_vm_session_in_worktree(
@@ -743,6 +903,7 @@ def open_vm_session_in_worktree(
                     end try
                 end repeat
             end tell
+            return claudeTty
         end tell
         """
     else:
@@ -758,12 +919,15 @@ def open_vm_session_in_worktree(
                     set name to "{tab_name}"
                     set badge to "{agent_badge}"
                     write text {claude_cmd}
+                    set claudeTty to tty
                 end tell
             end tell
+            return claudeTty
         end tell
         """
 
-    _run_iterm_script(script)
+    claude_tty = _run_iterm_script(script)
+    _watch_and_confirm_dev_channels_dialog(program, claude_tty)
 
 
 def open_vm_resume_session(
@@ -899,6 +1063,7 @@ def open_vm_resume_session(
                     end try
                 end repeat
             end tell
+            return claudeTty
         end tell
         """
     else:
@@ -914,12 +1079,15 @@ def open_vm_resume_session(
                     set name to "{tab_name}"
                     set badge to "{agent_badge}"
                     write text {claude_cmd}
+                    set claudeTty to tty
                 end tell
             end tell
+            return claudeTty
         end tell
         """
 
-    _run_iterm_script(script)
+    claude_tty = _run_iterm_script(script)
+    _watch_and_confirm_dev_channels_dialog(program, claude_tty)
 
 
 def open_vm_shell(project: Project) -> None:
